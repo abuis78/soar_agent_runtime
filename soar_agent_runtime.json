@@ -1,0 +1,292 @@
+{
+    "appid": "a7f3c2e1-84b0-4d5e-9f6a-2c1b0e3d7f8a",
+    "name": "SOAR Agent Runtime",
+    "description": "ReAct-Loop Agent Runtime for autonomous LLM-driven SOC automation with multi-provider LLM support",
+    "publisher": "Andreas Buis",
+    "package_name": "phantom_soar_agent_runtime",
+    "type": "generic",
+    "license": "Copyright 2026 Andreas Buis",
+    "app_version": "1.0.0",
+    "product_vendor": "OpenClaw SOC",
+    "product_name": "SOAR Agent Runtime",
+    "product_version_regex": ".*",
+    "min_phantom_version": "6.0.0",
+    "python_version": "3",
+    "main_module": "soar_agent_runtime_connector.py",
+    "logo": "soar_agent_runtime.svg",
+    "logo_dark": "soar_agent_runtime_dark.svg",
+    "contributors": [
+        {"name": "Andreas Buis"},
+        {"name": "Created with Claude, model claude-sonnet-4-6"}
+    ],
+    "pip3_dependencies": {
+        "pypi": [
+            {"module": "requests"},
+            {"module": "openai"},
+            {"module": "anthropic"},
+            {"module": "google-generativeai"}
+        ]
+    },
+    "configuration": {
+        "anthropic_api_key": {
+            "description": "Anthropic API Key (for Claude models)",
+            "data_type": "password",
+            "required": false,
+            "order": 0
+        },
+        "anthropic_api_url": {
+            "description": "Anthropic API URL (default: https://api.anthropic.com)",
+            "data_type": "string",
+            "required": false,
+            "default": "https://api.anthropic.com",
+            "order": 1
+        },
+        "openai_api_key": {
+            "description": "OpenAI API Key (for GPT models)",
+            "data_type": "password",
+            "required": false,
+            "order": 2
+        },
+        "openai_api_url": {
+            "description": "OpenAI API URL (default: https://api.openai.com/v1)",
+            "data_type": "string",
+            "required": false,
+            "default": "https://api.openai.com/v1",
+            "order": 3
+        },
+        "gemini_api_key": {
+            "description": "Google Gemini API Key",
+            "data_type": "password",
+            "required": false,
+            "order": 4
+        },
+        "local_llm_url": {
+            "description": "Local LLM base URL (Ollama: http://localhost:11434/v1)",
+            "data_type": "string",
+            "required": false,
+            "default": "http://localhost:11434/v1",
+            "order": 5
+        },
+        "local_llm_api_key": {
+            "description": "Local LLM API Key (use 'ollama' for Ollama, or leave empty)",
+            "data_type": "password",
+            "required": false,
+            "order": 6
+        },
+        "default_provider": {
+            "description": "Default LLM provider if not specified in agent definition (anthropic | openai | gemini | local)",
+            "data_type": "string",
+            "required": false,
+            "default": "anthropic",
+            "order": 7
+        },
+        "default_max_steps": {
+            "description": "Default maximum ReAct loop steps per agent run",
+            "data_type": "numeric",
+            "required": false,
+            "default": 25,
+            "order": 8
+        },
+        "agent_list_name": {
+            "description": "SOAR Custom List name containing agent definitions",
+            "data_type": "string",
+            "required": false,
+            "default": "agent_definitions",
+            "order": 9
+        }
+    },
+    "actions": [
+        {
+            "action": "test connectivity",
+            "identifier": "test_connectivity",
+            "description": "Validates connectivity to all configured LLM providers",
+            "type": "test",
+            "read_only": true,
+            "parameters": {},
+            "output": [],
+            "versions": "EQ(*)"
+        },
+        {
+            "action": "run agent",
+            "identifier": "run_agent",
+            "description": "Runs a named agent using the ReAct loop against a given task and container",
+            "type": "generic",
+            "read_only": false,
+            "parameters": {
+                "agent_id": {
+                    "description": "Agent identifier as defined in the agent_definitions Custom List",
+                    "data_type": "string",
+                    "required": true,
+                    "order": 0
+                },
+                "task": {
+                    "description": "Natural language task description for the agent",
+                    "data_type": "string",
+                    "required": true,
+                    "order": 1
+                },
+                "container_id": {
+                    "description": "SOAR Container ID the agent operates on",
+                    "data_type": "numeric",
+                    "required": true,
+                    "order": 2
+                },
+                "max_steps": {
+                    "description": "Override default max ReAct loop steps (0 = use app default)",
+                    "data_type": "numeric",
+                    "required": false,
+                    "default": 0,
+                    "order": 3
+                },
+                "extra_context": {
+                    "description": "Optional JSON string with additional context passed to the agent",
+                    "data_type": "string",
+                    "required": false,
+                    "order": 4
+                }
+            },
+            "output": [
+                {
+                    "data_path": "action_result.data.*.agent_id",
+                    "data_type": "string",
+                    "column_name": "Agent ID",
+                    "column_order": 0
+                },
+                {
+                    "data_path": "action_result.data.*.final_answer",
+                    "data_type": "string",
+                    "column_name": "Final Answer",
+                    "column_order": 1
+                },
+                {
+                    "data_path": "action_result.data.*.steps_taken",
+                    "data_type": "numeric",
+                    "column_name": "Steps",
+                    "column_order": 2
+                },
+                {
+                    "data_path": "action_result.data.*.provider",
+                    "data_type": "string",
+                    "column_name": "Provider",
+                    "column_order": 3
+                },
+                {
+                    "data_path": "action_result.data.*.model",
+                    "data_type": "string",
+                    "column_name": "Model",
+                    "column_order": 4
+                },
+                {
+                    "data_path": "action_result.data.*.step_log",
+                    "data_type": "string",
+                    "column_name": "Step Log",
+                    "column_order": 5
+                }
+            ],
+            "versions": "EQ(*)"
+        },
+        {
+            "action": "create agent",
+            "identifier": "create_agent",
+            "description": "Creates or updates an agent definition in the agent_definitions Custom List",
+            "type": "generic",
+            "read_only": false,
+            "parameters": {
+                "agent_id": {
+                    "description": "Unique agent identifier",
+                    "data_type": "string",
+                    "required": true,
+                    "order": 0
+                },
+                "system_prompt": {
+                    "description": "System prompt defining the agent's role and behaviour",
+                    "data_type": "string",
+                    "required": true,
+                    "order": 1
+                },
+                "provider": {
+                    "description": "LLM provider: anthropic | openai | gemini | local",
+                    "data_type": "string",
+                    "required": true,
+                    "order": 2
+                },
+                "model": {
+                    "description": "Model name (e.g. claude-sonnet-4-5, gpt-4o, gemini-2.0-flash, llama3)",
+                    "data_type": "string",
+                    "required": true,
+                    "order": 3
+                },
+                "allowed_tools": {
+                    "description": "Comma-separated list of allowed tools (e.g. splunk_search,add_note,update_severity)",
+                    "data_type": "string",
+                    "required": false,
+                    "default": "splunk_search,add_note",
+                    "order": 4
+                },
+                "max_steps": {
+                    "description": "Maximum ReAct loop steps for this agent (0 = use app default)",
+                    "data_type": "numeric",
+                    "required": false,
+                    "default": 0,
+                    "order": 5
+                }
+            },
+            "output": [
+                {
+                    "data_path": "action_result.data.*.agent_id",
+                    "data_type": "string",
+                    "column_name": "Agent ID",
+                    "column_order": 0
+                },
+                {
+                    "data_path": "action_result.data.*.status",
+                    "data_type": "string",
+                    "column_name": "Status",
+                    "column_order": 1
+                }
+            ],
+            "versions": "EQ(*)"
+        },
+        {
+            "action": "list agents",
+            "identifier": "list_agents",
+            "description": "Lists all agent definitions from the agent_definitions Custom List",
+            "type": "investigate",
+            "read_only": true,
+            "parameters": {},
+            "output": [
+                {
+                    "data_path": "action_result.data.*.agent_id",
+                    "data_type": "string",
+                    "column_name": "Agent ID",
+                    "column_order": 0
+                },
+                {
+                    "data_path": "action_result.data.*.provider",
+                    "data_type": "string",
+                    "column_name": "Provider",
+                    "column_order": 1
+                },
+                {
+                    "data_path": "action_result.data.*.model",
+                    "data_type": "string",
+                    "column_name": "Model",
+                    "column_order": 2
+                },
+                {
+                    "data_path": "action_result.data.*.allowed_tools",
+                    "data_type": "string",
+                    "column_name": "Allowed Tools",
+                    "column_order": 3
+                },
+                {
+                    "data_path": "action_result.data.*.max_steps",
+                    "data_type": "numeric",
+                    "column_name": "Max Steps",
+                    "column_order": 4
+                }
+            ],
+            "versions": "EQ(*)"
+        }
+    ]
+}
