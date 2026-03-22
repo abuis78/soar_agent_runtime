@@ -12,6 +12,7 @@ from soar_agent_runtime_utils import (
     LLMProvider,
     ToolRegistry,
     AgentDefinitionStore,
+    SkillStore,
     ReActLoop
 )
 
@@ -24,6 +25,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
         self._config = {}
         self._default_max_steps = 25
         self._agent_list_name = "agent_definitions"
+        self._skill_list_name = "agent_skills"
         self._default_provider = "anthropic"
 
     def initialize(self):
@@ -31,6 +33,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
         self._state = self.load_state()
         self._default_max_steps = int(self._config.get("default_max_steps", 25))
         self._agent_list_name = self._config.get("agent_list_name", "agent_definitions")
+        self._skill_list_name = self._config.get("skill_list_name", "agent_skills")
         self._default_provider = self._config.get("default_provider", "anthropic")
         return phantom.APP_SUCCESS
 
@@ -82,26 +85,21 @@ class SoarAgentRuntimeConnector(BaseConnector):
     def _handle_test_connectivity(self, param):
         action_result = self.add_action_result(ActionResult(dict(param)))
         self.save_progress("Testing LLM provider connectivity...")
-
         results = {}
         providers = [
             ("anthropic", "claude-haiku-4-5-20251001"),
             ("openai",    "gpt-4o-mini"),
             ("gemini",    "gemini-2.0-flash"),
-            ("local",     self._config.get("local_llm_model", "llama3"))
+            ("local",     "llama3")
         ]
-
         any_success = False
         for provider_name, default_model in providers:
             key_field = f"{provider_name}_api_key" if provider_name != "local" else "local_llm_api_key"
             url_field = f"{provider_name}_api_url" if provider_name != "local" else "local_llm_url"
-            has_key = bool(self._config.get(key_field) or self._config.get(url_field))
-
-            if not has_key and provider_name != "local":
+            has_config = bool(self._config.get(key_field) or self._config.get(url_field))
+            if not has_config and provider_name != "local":
                 results[provider_name] = "SKIPPED (no credentials configured)"
-                self.save_progress(f"{provider_name}: skipped (no credentials)")
                 continue
-
             self.save_progress(f"Testing {provider_name}...")
             try:
                 llm = self._build_llm_provider(provider_name, default_model)
@@ -109,19 +107,12 @@ class SoarAgentRuntimeConnector(BaseConnector):
                 results[provider_name] = message
                 if success:
                     any_success = True
-                    self.save_progress(f"{provider_name}: OK")
-                else:
-                    self.save_progress(f"{provider_name}: FAILED - {message}")
             except Exception as e:
                 results[provider_name] = f"ERROR: {str(e)}"
-                self.save_progress(f"{provider_name}: ERROR - {str(e)}")
-
-        self.save_progress(f"Results: {json.dumps(results)}")
 
         if any_success:
-            return action_result.set_status(phantom.APP_SUCCESS, f"Connectivity test completed. Results: {json.dumps(results)}")
-        else:
-            return action_result.set_status(phantom.APP_ERROR, f"All providers failed or skipped. Results: {json.dumps(results)}")
+            return action_result.set_status(phantom.APP_SUCCESS, f"Connectivity OK. Results: {json.dumps(results)}")
+        return action_result.set_status(phantom.APP_ERROR, f"All providers failed. Results: {json.dumps(results)}")
 
     # -----------------------------------------------------------------------
     # Action: run agent
@@ -144,7 +135,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
             return action_result.set_status(phantom.APP_ERROR, "container_id is required.")
 
         # Load agent definition
-        self.save_progress(f"Loading agent definition for: {agent_id}")
+        self.save_progress(f"Loading agent: {agent_id}")
         store = AgentDefinitionStore(self, self._agent_list_name)
         try:
             agent_def = store.load(agent_id)
@@ -159,7 +150,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
         # Build LLM provider
         provider = agent_def.get("provider", self._default_provider)
         model = agent_def.get("model", "")
-        self.save_progress(f"Using provider: {provider}, model: {model}")
+        self.save_progress(f"Provider: {provider} / {model}")
         try:
             llm = self._build_llm_provider(provider, model)
         except ValueError as e:
@@ -171,11 +162,22 @@ class SoarAgentRuntimeConnector(BaseConnector):
             allowed_tools = [t.strip() for t in allowed_tools_raw.split(",")]
         else:
             allowed_tools = allowed_tools_raw
-
         tools = ToolRegistry(self, container_id, allowed_tools)
-        system_prompt = agent_def.get("system_prompt", "You are a SOC analyst agent.")
+
+        # Load and inject skills
+        skill_ids = agent_def.get("skills", [])
+        if isinstance(skill_ids, str):
+            skill_ids = [s.strip() for s in skill_ids.split(",") if s.strip()]
+        skill_injection = ""
+        if skill_ids:
+            self.save_progress(f"Loading skills: {skill_ids}")
+            skill_store = SkillStore(self, self._skill_list_name)
+            loaded_skills = skill_store.load_many(skill_ids)
+            skill_injection = SkillStore.build_injection(loaded_skills)
+            self.save_progress(f"Injected {len(loaded_skills)} skill(s).")
 
         # Run ReAct loop
+        system_prompt = agent_def.get("system_prompt", "You are a SOC analyst agent.")
         loop = ReActLoop(
             connector=self,
             llm=llm,
@@ -184,31 +186,30 @@ class SoarAgentRuntimeConnector(BaseConnector):
             system_prompt=system_prompt,
             max_steps=max_steps,
             container_id=container_id,
-            extra_context=extra_context_str
+            extra_context=extra_context_str,
+            skill_injection=skill_injection
         )
-
         result = loop.run(task)
         action_result.add_data(result)
 
-        # Add note to container with agent result
+        # Add summary note
         try:
             import phantom.rules as ph_rules
             ph_rules.add_note(
                 container=container_id,
                 note_type="general",
                 title=f"[Agent: {agent_id}] {task[:60]}",
-                content=f"**Final Answer:**\n{result['final_answer']}\n\n**Steps taken:** {result['steps_taken']}\n\n**Provider:** {result['provider']} / {result['model']}"
+                content=f"**Final Answer:**\n{result['final_answer']}\n\n**Steps:** {result['steps_taken']} | **Provider:** {result['provider']} / {result['model']}"
             )
         except Exception:
             pass
 
-        summary = {
+        action_result.update_summary({
             "agent_id": agent_id,
             "steps_taken": result["steps_taken"],
             "provider": result["provider"],
             "model": result["model"]
-        }
-        action_result.update_summary(summary)
+        })
 
         if result["final_answer"].startswith("ERROR"):
             return action_result.set_status(phantom.APP_ERROR, result["final_answer"])
@@ -220,10 +221,12 @@ class SoarAgentRuntimeConnector(BaseConnector):
 
     def _handle_create_agent(self, param):
         action_result = self.add_action_result(ActionResult(dict(param)))
-
         agent_id = param.get("agent_id", "")
         if not agent_id:
             return action_result.set_status(phantom.APP_ERROR, "agent_id is required.")
+
+        skills_raw = param.get("skills", "")
+        skills = [s.strip() for s in skills_raw.split(",") if s.strip()] if skills_raw else []
 
         config = {
             "agent_id": agent_id,
@@ -231,19 +234,17 @@ class SoarAgentRuntimeConnector(BaseConnector):
             "model": param.get("model", ""),
             "system_prompt": param.get("system_prompt", ""),
             "allowed_tools": param.get("allowed_tools", "splunk_search,add_note"),
-            "max_steps": int(param.get("max_steps", 0)) or self._default_max_steps
+            "max_steps": int(param.get("max_steps", 0)) or self._default_max_steps,
+            "skills": skills
         }
 
-        self.save_progress(f"Saving agent definition: {agent_id}")
         store = AgentDefinitionStore(self, self._agent_list_name)
-        success = store.save(agent_id, config)
+        if not store.save(agent_id, config):
+            return action_result.set_status(phantom.APP_ERROR, f"Failed to save agent '{agent_id}'.")
 
-        if not success:
-            return action_result.set_status(phantom.APP_ERROR, f"Failed to save agent '{agent_id}' to Custom List.")
-
-        action_result.add_data({"agent_id": agent_id, "status": "created"})
+        action_result.add_data({"agent_id": agent_id, "status": "created", "skills": skills})
         action_result.update_summary({"agent_id": agent_id})
-        return action_result.set_status(phantom.APP_SUCCESS, f"Agent '{agent_id}' saved successfully.")
+        return action_result.set_status(phantom.APP_SUCCESS, f"Agent '{agent_id}' saved.")
 
     # -----------------------------------------------------------------------
     # Action: list agents
@@ -251,38 +252,89 @@ class SoarAgentRuntimeConnector(BaseConnector):
 
     def _handle_list_agents(self, param):
         action_result = self.add_action_result(ActionResult(dict(param)))
-
-        self.save_progress(f"Loading agents from Custom List: {self._agent_list_name}")
         store = AgentDefinitionStore(self, self._agent_list_name)
         agents = store.list_all()
-
         if not agents:
-            return action_result.set_status(phantom.APP_SUCCESS, "No agents found in Custom List.")
-
+            return action_result.set_status(phantom.APP_SUCCESS, "No agents found.")
         for agent in agents:
             action_result.add_data({
                 "agent_id": agent.get("agent_id", ""),
                 "provider": agent.get("provider", ""),
                 "model": agent.get("model", ""),
                 "allowed_tools": agent.get("allowed_tools", ""),
-                "max_steps": agent.get("max_steps", self._default_max_steps)
+                "max_steps": agent.get("max_steps", self._default_max_steps),
+                "skills": ", ".join(agent.get("skills", []))
             })
-
         action_result.update_summary({"total_agents": len(agents)})
         return action_result.set_status(phantom.APP_SUCCESS, f"Found {len(agents)} agent(s).")
+
+    # -----------------------------------------------------------------------
+    # Action: create skill
+    # -----------------------------------------------------------------------
+
+    def _handle_create_skill(self, param):
+        action_result = self.add_action_result(ActionResult(dict(param)))
+        skill_id = param.get("skill_id", "")
+        if not skill_id:
+            return action_result.set_status(phantom.APP_ERROR, "skill_id is required.")
+
+        output_schema_str = param.get("output_schema", "")
+        output_schema = None
+        if output_schema_str:
+            try:
+                output_schema = json.loads(output_schema_str)
+            except Exception:
+                return action_result.set_status(phantom.APP_ERROR, "output_schema must be valid JSON.")
+
+        config = {
+            "description": param.get("description", ""),
+            "inject": param.get("inject", ""),
+        }
+        if output_schema:
+            config["output_schema"] = output_schema
+
+        skill_store = SkillStore(self, self._skill_list_name)
+        if not skill_store.save(skill_id, config):
+            return action_result.set_status(phantom.APP_ERROR, f"Failed to save skill '{skill_id}'.")
+
+        action_result.add_data({"skill_id": skill_id, "status": "created"})
+        action_result.update_summary({"skill_id": skill_id})
+        return action_result.set_status(phantom.APP_SUCCESS, f"Skill '{skill_id}' saved.")
+
+    # -----------------------------------------------------------------------
+    # Action: list skills
+    # -----------------------------------------------------------------------
+
+    def _handle_list_skills(self, param):
+        action_result = self.add_action_result(ActionResult(dict(param)))
+        skill_store = SkillStore(self, self._skill_list_name)
+        skills = skill_store.list_all()
+        if not skills:
+            return action_result.set_status(phantom.APP_SUCCESS, "No skills found.")
+        for skill in skills:
+            action_result.add_data({
+                "skill_id": skill.get("skill_id", ""),
+                "description": skill.get("description", ""),
+                "has_inject": bool(skill.get("inject", "")),
+                "has_output_schema": bool(skill.get("output_schema"))
+            })
+        action_result.update_summary({"total_skills": len(skills)})
+        return action_result.set_status(phantom.APP_SUCCESS, f"Found {len(skills)} skill(s).")
 
     # -----------------------------------------------------------------------
     # Action dispatcher
     # -----------------------------------------------------------------------
 
     def handle_action(self, param):
-        action_id = self.get_action_identifier()
         handlers = {
             "test_connectivity": self._handle_test_connectivity,
             "run_agent":         self._handle_run_agent,
             "create_agent":      self._handle_create_agent,
             "list_agents":       self._handle_list_agents,
+            "create_skill":      self._handle_create_skill,
+            "list_skills":       self._handle_list_skills,
         }
+        action_id = self.get_action_identifier()
         if action_id in handlers:
             return handlers[action_id](param)
         return phantom.APP_SUCCESS

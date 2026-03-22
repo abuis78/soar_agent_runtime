@@ -1,30 +1,42 @@
 {
     "appid": "a7f3c2e1-84b0-4d5e-9f6a-2c1b0e3d7f8a",
     "name": "SOAR Agent Runtime",
-    "description": "ReAct-Loop Agent Runtime for autonomous LLM-driven SOC automation with multi-provider LLM support",
+    "description": "ReAct-Loop Agent Runtime for autonomous LLM-driven SOC automation with multi-provider LLM support (Python 3.13)",
     "publisher": "Andreas Buis",
     "package_name": "phantom_soar_agent_runtime",
     "type": "generic",
     "license": "Copyright 2026 Andreas Buis",
-    "app_version": "1.0.0",
+    "app_version": "1.3.0",
     "product_vendor": "OpenClaw SOC",
     "product_name": "SOAR Agent Runtime",
     "product_version_regex": ".*",
-    "min_phantom_version": "6.0.0",
+    "min_phantom_version": "6.3.0",
     "python_version": "3",
     "main_module": "soar_agent_runtime_connector.py",
     "logo": "soar_agent_runtime.svg",
     "logo_dark": "soar_agent_runtime_dark.svg",
     "contributors": [
-        {"name": "Andreas Buis"},
-        {"name": "Created with Claude, model claude-sonnet-4-6"}
+        {
+            "name": "Andreas Buis"
+        },
+        {
+            "name": "Created with Claude, model claude-sonnet-4-6"
+        }
     ],
     "pip3_dependencies": {
         "pypi": [
-            {"module": "requests"},
-            {"module": "openai"},
-            {"module": "anthropic"},
-            {"module": "google-generativeai"}
+            {
+                "module": "requests"
+            },
+            {
+                "module": "openai"
+            },
+            {
+                "module": "anthropic"
+            },
+            {
+                "module": "google-generativeai"
+            }
         ]
     },
     "configuration": {
@@ -229,6 +241,13 @@
                     "required": false,
                     "default": 0,
                     "order": 5
+                },
+                "skills": {
+                    "description": "Comma-separated skill IDs to attach (e.g. mitre_mapping,german_output)",
+                    "data_type": "string",
+                    "required": false,
+                    "default": "",
+                    "order": 6
                 }
             },
             "output": [
@@ -284,6 +303,95 @@
                     "data_type": "numeric",
                     "column_name": "Max Steps",
                     "column_order": 4
+                },
+                {
+                    "data_path": "action_result.data.*.skills",
+                    "data_type": "string",
+                    "column_name": "Skills",
+                    "column_order": 5
+                }
+            ],
+            "versions": "EQ(*)"
+        },
+        {
+            "action": "create skill",
+            "identifier": "create_skill",
+            "description": "Creates or updates a skill in the agent_skills Custom List",
+            "type": "generic",
+            "read_only": false,
+            "parameters": {
+                "skill_id": {
+                    "description": "Unique skill identifier",
+                    "data_type": "string",
+                    "required": true,
+                    "order": 0
+                },
+                "description": {
+                    "description": "Human-readable description",
+                    "data_type": "string",
+                    "required": false,
+                    "order": 1
+                },
+                "inject": {
+                    "description": "Text injected verbatim into the agent system prompt",
+                    "data_type": "string",
+                    "required": false,
+                    "order": 2
+                },
+                "output_schema": {
+                    "description": "JSON schema string enforced in FINAL_ANSWER",
+                    "data_type": "string",
+                    "required": false,
+                    "order": 3
+                }
+            },
+            "output": [
+                {
+                    "data_path": "action_result.data.*.skill_id",
+                    "data_type": "string",
+                    "column_name": "Skill ID",
+                    "column_order": 0
+                },
+                {
+                    "data_path": "action_result.data.*.status",
+                    "data_type": "string",
+                    "column_name": "Status",
+                    "column_order": 1
+                }
+            ],
+            "versions": "EQ(*)"
+        },
+        {
+            "action": "list skills",
+            "identifier": "list_skills",
+            "description": "Lists all skill definitions from the agent_skills Custom List",
+            "type": "investigate",
+            "read_only": true,
+            "parameters": {},
+            "output": [
+                {
+                    "data_path": "action_result.data.*.skill_id",
+                    "data_type": "string",
+                    "column_name": "Skill ID",
+                    "column_order": 0
+                },
+                {
+                    "data_path": "action_result.data.*.description",
+                    "data_type": "string",
+                    "column_name": "Description",
+                    "column_order": 1
+                },
+                {
+                    "data_path": "action_result.data.*.has_inject",
+                    "data_type": "boolean",
+                    "column_name": "Has Inject",
+                    "column_order": 2
+                },
+                {
+                    "data_path": "action_result.data.*.has_output_schema",
+                    "data_type": "boolean",
+                    "column_name": "Has Schema",
+                    "column_order": 3
                 }
             ],
             "versions": "EQ(*)"
