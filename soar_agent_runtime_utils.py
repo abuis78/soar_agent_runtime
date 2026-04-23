@@ -6,7 +6,9 @@ Python 3.13 compatible.
 
 from __future__ import annotations
 import json
+import re
 import requests
+from urllib.parse import urlparse
 
 try:
     import anthropic
@@ -28,6 +30,59 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# Security constants
+# ---------------------------------------------------------------------------
+
+# Issue #2 (Prompt Injection): ReAct control keywords must not appear in
+# external data (artifacts, SPL results) fed back into the LLM conversation.
+_REACT_KEYWORDS = ("THOUGHT:", "ACTION:", "PARAMS:", "FINAL_ANSWER:", "OBSERVATION:")
+
+# Issue #5 (SPL Injection): Destructive/exfiltrating SPL pipe commands.
+_BLOCKED_SPL_RE = re.compile(
+    r'\|\s*(delete|drop|truncate|map\s|outputlookup\b|rest\s+/services)',
+    re.IGNORECASE
+)
+
+# Issue #3 (SSRF): Allowed URL schemes per provider.
+_HTTPS_ONLY_PROVIDERS = {"anthropic", "openai", "gemini"}
+_PRIVATE_IP_RE = re.compile(
+    r'^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|127\.|169\.254\.|::1|fc|fd)',
+    re.IGNORECASE
+)
+
+# Issue #4 (DoS): Absolute maximum ReAct steps regardless of config.
+MAX_STEPS_HARD_LIMIT = 50
+
+
+def _sanitize_observation(text: str) -> str:
+    """Escape ReAct control keywords in external data before injecting into LLM."""
+    for kw in _REACT_KEYWORDS:
+        text = text.replace(kw, f"[{kw.rstrip(':')}]")
+    return text
+
+
+def _validate_api_url(url: str, provider: str) -> str:
+    """Raise ValueError if the URL could be used for SSRF."""
+    if not url:
+        return url
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").lower()
+
+    if provider in _HTTPS_ONLY_PROVIDERS and scheme != "https":
+        raise ValueError(
+            f"Provider '{provider}' requires HTTPS. Got scheme: '{scheme}'"
+        )
+    if provider == "local" and scheme not in ("http", "https"):
+        raise ValueError(f"Local LLM URL must use http or https. Got: '{scheme}'")
+    if _PRIVATE_IP_RE.match(hostname) and provider != "local":
+        raise ValueError(
+            f"API URL for '{provider}' must not point to a private/loopback address: {hostname}"
+        )
+    return url
+
+
+# ---------------------------------------------------------------------------
 # LLM Provider Abstraction
 # ---------------------------------------------------------------------------
 
@@ -37,7 +92,7 @@ class LLMProvider:
     def __init__(self, provider: str, api_key: str, api_url: str, model: str) -> None:
         self.provider = provider.lower()
         self.api_key = api_key
-        self.api_url = api_url
+        self.api_url = _validate_api_url(api_url, self.provider)  # Issue #3: SSRF guard
         self.model = model
 
     def chat(self, system_prompt: str, messages: list[dict]) -> str:
@@ -190,13 +245,17 @@ class ToolRegistry:
         latest   = params.get("latest", "now")
         if not spl:
             return "ERROR: spl_query parameter is required."
+        # Issue #5: Block destructive/exfiltrating SPL commands
+        if _BLOCKED_SPL_RE.search(spl):
+            return "ERROR: Query contains blocked SPL commands (delete/drop/outputlookup/rest)."
         self.connector.save_progress(f"Executing SPL: {spl[:80]}...")
         try:
             import phantom.rules as ph_rules
             results = ph_rules.run_query(query=spl, start_time=earliest, end_time=latest)
             if not results:
                 return "SPL search returned 0 results."
-            return f"SPL results ({len(results)} rows):\n{json.dumps(results[:20], indent=2)}"
+            raw = f"SPL results ({len(results)} rows):\n{json.dumps(results[:20], indent=2)}"
+            return _sanitize_observation(raw)  # Issue #2: sanitize before LLM injection
         except Exception as e:
             return f"SPL search error: {e}"
 
@@ -232,12 +291,13 @@ class ToolRegistry:
             import phantom.rules as ph_rules
             container = ph_rules.get_container(self.container_id)
             artifacts = ph_rules.get_artifacts(container_id=self.container_id)
-            return json.dumps(
+            raw = json.dumps(
                 {"container": container,
                  "artifact_count": len(artifacts) if artifacts else 0,
                  "artifacts": (artifacts or [])[:5]},
                 indent=2, default=str
             )
+            return _sanitize_observation(raw)  # Issue #2: sanitize artifact data before LLM injection
         except Exception as e:
             return f"Failed to get container info: {e}"
 
