@@ -4,6 +4,7 @@ Main BaseConnector subclass for SOAR Agent Runtime.
 """
 
 import json
+import re
 import phantom.app as phantom
 from phantom.base_connector import BaseConnector
 from phantom.action_result import ActionResult
@@ -16,6 +17,10 @@ from soar_agent_runtime_utils import (
     ReActLoop,
     MAX_STEPS_HARD_LIMIT,
 )
+
+# Open item #5: identifiers are used verbatim as SOAR Custom-List keys, so they
+# must be restricted to a safe charset to prevent list-key injection.
+_ID_RE = re.compile(r'^[A-Za-z0-9_.\-]{1,64}$')
 
 
 class SoarAgentRuntimeConnector(BaseConnector):
@@ -57,6 +62,11 @@ class SoarAgentRuntimeConnector(BaseConnector):
         except (ValueError, TypeError):
             self.save_progress(f"Warning: {name} must be numeric, got {value!r}.")
             return None
+
+    @staticmethod
+    def _valid_id(value: str) -> bool:
+        """Open item #5: validate identifiers used as Custom-List keys."""
+        return bool(_ID_RE.match(value or ""))
 
     # -----------------------------------------------------------------------
     # LLM Provider Factory
@@ -144,6 +154,9 @@ class SoarAgentRuntimeConnector(BaseConnector):
 
         if not agent_id:
             return action_result.set_status(phantom.APP_ERROR, "agent_id is required.")
+        if not self._valid_id(agent_id):
+            return action_result.set_status(
+                phantom.APP_ERROR, "agent_id must match [A-Za-z0-9_.-] and be 1-64 chars.")
         if not task:
             return action_result.set_status(phantom.APP_ERROR, "task is required.")
 
@@ -247,6 +260,9 @@ class SoarAgentRuntimeConnector(BaseConnector):
         agent_id = param.get("agent_id", "")
         if not agent_id:
             return action_result.set_status(phantom.APP_ERROR, "agent_id is required.")
+        if not self._valid_id(agent_id):
+            return action_result.set_status(
+                phantom.APP_ERROR, "agent_id must match [A-Za-z0-9_.-] and be 1-64 chars.")
 
         skills_raw = param.get("skills", "")
         skills = [s.strip() for s in skills_raw.split(",") if s.strip()] if skills_raw else []
@@ -300,6 +316,9 @@ class SoarAgentRuntimeConnector(BaseConnector):
         skill_id = param.get("skill_id", "")
         if not skill_id:
             return action_result.set_status(phantom.APP_ERROR, "skill_id is required.")
+        if not self._valid_id(skill_id):
+            return action_result.set_status(
+                phantom.APP_ERROR, "skill_id must match [A-Za-z0-9_.-] and be 1-64 chars.")
 
         output_schema_str = param.get("output_schema", "")
         output_schema = None
