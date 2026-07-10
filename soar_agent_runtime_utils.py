@@ -7,7 +7,6 @@ Python 3.13 compatible.
 from __future__ import annotations
 import json
 import re
-import requests
 from urllib.parse import urlparse
 
 try:
@@ -37,21 +36,62 @@ except ImportError:
 # external data (artifacts, SPL results) fed back into the LLM conversation.
 _REACT_KEYWORDS = ("THOUGHT:", "ACTION:", "PARAMS:", "FINAL_ANSWER:", "OBSERVATION:")
 
-# Issue #5 (SPL Injection): Destructive/exfiltrating SPL pipe commands.
+# Issue #5 (SPL Injection): Destructive/exfiltrating/command-executing SPL pipe
+# commands. NOTE: a blocklist is defense-in-depth, not a guarantee — it can be
+# evaded via macros, subsearches, or novel commands. The primary control is the
+# per-agent `allowed_tools` allowlist that gates access to splunk_search at all.
 _BLOCKED_SPL_RE = re.compile(
-    r'\|\s*(delete|drop|truncate|map\s|outputlookup\b|rest\s+/services)',
+    r'\|\s*(delete|drop|truncate|map\s|outputlookup\b|outputcsv\b|rest\s+/services'
+    r'|collect\b|tscollect\b|mcollect\b|sendemail\b|sendalert\b|runshellscript\b'
+    r'|script\b|dump\b|crawl\b)',
     re.IGNORECASE
 )
 
 # Issue #3 (SSRF): Allowed URL schemes per provider.
 _HTTPS_ONLY_PROVIDERS = {"anthropic", "openai", "gemini"}
 _PRIVATE_IP_RE = re.compile(
-    r'^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|127\.|169\.254\.|::1|fc|fd)',
+    r'^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|127\.|169\.254\.|0\.0\.0\.0'
+    r'|::1|::$|fc|fd)',
     re.IGNORECASE
 )
 
 # Issue #4 (DoS): Absolute maximum ReAct steps regardless of config.
 MAX_STEPS_HARD_LIMIT = 50
+
+# Length caps (open item #3: context stuffing). External/user text is truncated
+# before it reaches the LLM so a single input cannot blow up the context window.
+_MAX_OBSERVATION_LEN = 8000
+_MAX_TASK_LEN = 4000
+_MAX_CONTEXT_LEN = 4000
+
+# Exception scrubbing (open item #2: secret leakage via tracebacks). Patterns
+# that may carry credentials must never be echoed back into the LLM context or
+# action results.
+_SECRET_RE = re.compile(
+    r'(sk-[A-Za-z0-9_\-]{8,}'                 # OpenAI / Anthropic style keys
+    r'|Bearer\s+[A-Za-z0-9._\-]{8,}'          # bearer tokens
+    r'|AIza[A-Za-z0-9_\-]{10,}'               # Google API keys
+    r'|(?:api[_-]?key|token|authorization)\s*[=:]\s*\S+'  # key=value pairs
+    r'|https?://[^\s/]*:[^\s/]*@\S+)',        # creds embedded in URLs
+    re.IGNORECASE
+)
+
+
+def _truncate(text: str, limit: int) -> str:
+    """Truncate text to limit, appending a marker when cut."""
+    if len(text) > limit:
+        return text[:limit] + f"\n[...truncated {len(text) - limit} chars]"
+    return text
+
+
+def _scrub(text: str) -> str:
+    """Redact anything resembling a secret before it is surfaced to the LLM/UI."""
+    return _SECRET_RE.sub("[REDACTED]", text)
+
+
+def _scrub_exc(exc: Exception) -> str:
+    """Return a safe, secret-scrubbed one-line description of an exception."""
+    return _scrub(f"{type(exc).__name__}: {exc}")
 
 
 def _sanitize_observation(text: str) -> str:
@@ -237,7 +277,7 @@ class ToolRegistry:
         try:
             return handler(params)
         except Exception as e:
-            return f"ERROR executing {tool_name}: {e}"
+            return f"ERROR executing {tool_name}: {_scrub_exc(e)}"
 
     def _tool_splunk_search(self, params: dict) -> str:
         spl      = params.get("spl_query", "")
@@ -245,19 +285,21 @@ class ToolRegistry:
         latest   = params.get("latest", "now")
         if not spl:
             return "ERROR: spl_query parameter is required."
-        # Issue #5: Block destructive/exfiltrating SPL commands
+        # Issue #5: Block destructive/exfiltrating/command-executing SPL commands
         if _BLOCKED_SPL_RE.search(spl):
-            return "ERROR: Query contains blocked SPL commands (delete/drop/outputlookup/rest)."
+            return ("ERROR: Query contains blocked SPL commands "
+                    "(e.g. delete/drop/outputlookup/collect/sendemail/script/rest).")
         self.connector.save_progress(f"Executing SPL: {spl[:80]}...")
         try:
             import phantom.rules as ph_rules
             results = ph_rules.run_query(query=spl, start_time=earliest, end_time=latest)
             if not results:
                 return "SPL search returned 0 results."
-            raw = f"SPL results ({len(results)} rows):\n{json.dumps(results[:20], indent=2)}"
-            return _sanitize_observation(raw)  # Issue #2: sanitize before LLM injection
+            # Issue #2 sanitization is applied centrally at the LLM boundary
+            # (ReActLoop); returned raw here so step_log keeps forensic fidelity.
+            return f"SPL results ({len(results)} rows):\n{json.dumps(results[:20], indent=2)}"
         except Exception as e:
-            return f"SPL search error: {e}"
+            return f"SPL search error: {_scrub_exc(e)}"
 
     def _tool_add_note(self, params: dict) -> str:
         title   = params.get("title", "Agent Note")
@@ -272,7 +314,7 @@ class ToolRegistry:
             )
             return f"Note added: '{title}'"
         except Exception as e:
-            return f"Failed to add note: {e}"
+            return f"Failed to add note: {_scrub_exc(e)}"
 
     def _tool_update_severity(self, params: dict) -> str:
         severity = params.get("severity", "").lower()
@@ -284,29 +326,34 @@ class ToolRegistry:
             ph_rules.update_container(container=self.container_id, severity=severity)
             return f"Container severity updated to: {severity}"
         except Exception as e:
-            return f"Failed to update severity: {e}"
+            return f"Failed to update severity: {_scrub_exc(e)}"
 
     def _tool_get_container_info(self, params: dict) -> str:
         try:
             import phantom.rules as ph_rules
             container = ph_rules.get_container(self.container_id)
             artifacts = ph_rules.get_artifacts(container_id=self.container_id)
-            raw = json.dumps(
+            # Issue #2 sanitization is applied centrally at the LLM boundary.
+            return json.dumps(
                 {"container": container,
                  "artifact_count": len(artifacts) if artifacts else 0,
                  "artifacts": (artifacts or [])[:5]},
                 indent=2, default=str
             )
-            return _sanitize_observation(raw)  # Issue #2: sanitize artifact data before LLM injection
         except Exception as e:
-            return f"Failed to get container info: {e}"
+            return f"Failed to get container info: {_scrub_exc(e)}"
 
     def _tool_run_sub_agent(self, params: dict) -> str:
         agent_id = params.get("agent_id", "")
         task     = params.get("task", "")
         if not agent_id or not task:
             return "ERROR: agent_id and task are required."
-        return f"[Sub-agent '{agent_id}' queued for task: {task}] — implement via recursive run_agent call."
+        # Open item #6: recursive sub-agent execution is intentionally NOT
+        # implemented. Wiring it to run_agent without a recursion-depth guard
+        # would let an agent bypass its own max_steps budget and spawn unbounded
+        # nested LLM loops (cost/DoS). Any future implementation must enforce a
+        # hard depth limit and propagate the remaining step budget.
+        return f"[Sub-agent '{agent_id}' is not executed: recursive invocation is disabled for safety.]"
 
 
 # ---------------------------------------------------------------------------
@@ -540,7 +587,8 @@ class ReActLoop:
             tool_descriptions = self.tools.get_tool_descriptions(),
             max_steps       = self.max_steps,
             container_id    = self.container_id,
-            extra_context   = self.extra_context or "No extra context provided."
+            extra_context   = _sanitize_observation(_truncate(self.extra_context, _MAX_CONTEXT_LEN))
+                              or "No extra context provided."
         )
 
     def _parse_response(self, text: str) -> tuple[str | None, dict, str, str | None]:
@@ -580,7 +628,10 @@ class ReActLoop:
     def run(self, task: str) -> dict:
         self.connector.save_progress(f"Agent '{self.agent_id}' starting: {task[:80]}...")
         system_prompt = self._build_system_prompt()
-        messages: list[dict] = [{"role": "user", "content": task}]
+        # Open item #2/#3: user-controlled task is length-capped and stripped of
+        # ReAct control keywords before it can steer the loop.
+        safe_task = _sanitize_observation(_truncate(task, _MAX_TASK_LEN))
+        messages: list[dict] = [{"role": "user", "content": safe_task}]
         steps_taken  = 0
         final_answer: str | None = None
 
@@ -591,7 +642,8 @@ class ReActLoop:
             try:
                 response_text = self.llm.chat(system_prompt, messages)
             except Exception as e:
-                return self._error_result(f"LLM call failed at step {steps_taken}: {e}", steps_taken)
+                return self._error_result(
+                    f"LLM call failed at step {steps_taken}: {_scrub_exc(e)}", steps_taken)
 
             tool_name, params, thought, final_answer = self._parse_response(response_text)
             step_entry: dict = {
@@ -610,11 +662,14 @@ class ReActLoop:
 
             if tool_name:
                 observation = self.tools.execute(tool_name, params)
-                step_entry["observation"] = observation
+                step_entry["observation"] = observation  # raw kept for forensics
                 self.step_log.append(step_entry)
+                # Issue #2 (central boundary): every tool observation is sanitized
+                # and length-capped before it re-enters the LLM conversation.
+                safe_obs = _sanitize_observation(_truncate(observation, _MAX_OBSERVATION_LEN))
                 messages += [
                     {"role": "assistant", "content": response_text},
-                    {"role": "user",      "content": f"OBSERVATION: {observation}"}
+                    {"role": "user",      "content": f"OBSERVATION: {safe_obs}"}
                 ]
             else:
                 step_entry["observation"] = "ERROR: No ACTION or FINAL_ANSWER found."
