@@ -4,6 +4,7 @@ Main BaseConnector subclass for SOAR Agent Runtime.
 """
 
 import json
+import time
 import phantom.app as phantom
 from phantom.base_connector import BaseConnector
 from phantom.action_result import ActionResult
@@ -13,8 +14,16 @@ from soar_agent_runtime_utils import (
     ToolRegistry,
     AgentDefinitionStore,
     SkillStore,
-    ReActLoop
+    ReActLoop,
+    AGENT_ROLES,
+    DEFAULT_AGENT_ROLE
 )
+
+try:
+    from ai_soc_telemetry import TelemetryClient
+    HAS_TELEMETRY_CLIENT = True
+except ImportError:
+    HAS_TELEMETRY_CLIENT = False
 
 
 class SoarAgentRuntimeConnector(BaseConnector):
@@ -27,6 +36,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
         self._agent_list_name = "agent_definitions"
         self._skill_list_name = "agent_skills"
         self._default_provider = "anthropic"
+        self._telemetry = None
 
     def initialize(self):
         self._config = self.get_config()
@@ -35,11 +45,66 @@ class SoarAgentRuntimeConnector(BaseConnector):
         self._agent_list_name = self._config.get("agent_list_name", "agent_definitions")
         self._skill_list_name = self._config.get("skill_list_name", "agent_skills")
         self._default_provider = self._config.get("default_provider", "anthropic")
+        self._telemetry = self._build_telemetry()
         return phantom.APP_SUCCESS
 
     def finalize(self):
+        self._flush_telemetry()
         self.save_state(self._state)
         return phantom.APP_SUCCESS
+
+    # -----------------------------------------------------------------------
+    # Telemetry (AI-SOC Telemetry)
+    # -----------------------------------------------------------------------
+
+    def _build_telemetry(self):
+        """Build the telemetry client from the asset config.
+
+        Fail-open: every problem disables telemetry instead of the app. Returns
+        None when telemetry is off or unusable.
+        """
+        if not self._config.get("telemetry_enabled", False):
+            return None
+        if not HAS_TELEMETRY_CLIENT:
+            self.save_progress("[telemetry] ai_soc_telemetry not installed - telemetry disabled.")
+            return None
+        hec_url = self._config.get("hec_url", "")
+        hec_token = self._config.get("hec_token", "")
+        if not hec_url or not hec_token:
+            self.save_progress("[telemetry] hec_url/hec_token not configured - telemetry disabled.")
+            return None
+        try:
+            client = TelemetryClient(
+                hec_url=hec_url,
+                hec_token=hec_token,
+                index=self._config.get("telemetry_index", "ai_soc_audit"),
+                verify_tls=self._config.get("telemetry_verify_tls", True),
+            )
+            self.save_progress("[telemetry] enabled.")
+            return client
+        except Exception as e:
+            # Never leak the token into logs (L8) - report the type only.
+            self.save_progress(f"[telemetry] init failed ({type(e).__name__}) - telemetry disabled.")
+            return None
+
+    def _flush_telemetry(self, timeout: float = 3.0) -> None:
+        """Give the telemetry sender a bounded moment to ship queued events.
+
+        The library ships events from a daemon thread and exposes no flush()/
+        close(), so anything still queued is dropped when this short-lived action
+        process exits - the last action of a run is the most likely to be lost.
+        Polling the queue is a stopgap; the real fix is a flush() upstream.
+        """
+        q = getattr(self._telemetry, "_q", None)
+        if q is None:
+            return
+        try:
+            deadline = time.monotonic() + timeout
+            while not q.empty() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            time.sleep(0.2)  # let a final in-flight POST complete
+        except Exception:
+            pass
 
     # -----------------------------------------------------------------------
     # LLM Provider Factory
@@ -162,7 +227,14 @@ class SoarAgentRuntimeConnector(BaseConnector):
             allowed_tools = [t.strip() for t in allowed_tools_raw.split(",")]
         else:
             allowed_tools = allowed_tools_raw
-        tools = ToolRegistry(self, container_id, allowed_tools)
+        tools = ToolRegistry(
+            self,
+            container_id,
+            allowed_tools,
+            telemetry=self._telemetry,
+            agent_id=agent_id,
+            agent_role=agent_def.get("agent_role", DEFAULT_AGENT_ROLE),
+        )
 
         # Load and inject skills
         skill_ids = agent_def.get("skills", [])
@@ -228,6 +300,15 @@ class SoarAgentRuntimeConnector(BaseConnector):
         skills_raw = param.get("skills", "")
         skills = [s.strip() for s in skills_raw.split(",") if s.strip()] if skills_raw else []
 
+        # agent_role groups the Agent Precision panel, so only fixed values are
+        # accepted - a typo would silently fragment the metric.
+        agent_role = (param.get("agent_role") or DEFAULT_AGENT_ROLE).strip().lower()
+        if agent_role not in AGENT_ROLES:
+            return action_result.set_status(
+                phantom.APP_ERROR,
+                f"agent_role must be one of {list(AGENT_ROLES)}, got '{agent_role}'."
+            )
+
         config = {
             "agent_id": agent_id,
             "provider": param.get("provider", self._default_provider),
@@ -235,14 +316,17 @@ class SoarAgentRuntimeConnector(BaseConnector):
             "system_prompt": param.get("system_prompt", ""),
             "allowed_tools": param.get("allowed_tools", "splunk_search,add_note"),
             "max_steps": int(param.get("max_steps", 0)) or self._default_max_steps,
-            "skills": skills
+            "skills": skills,
+            "agent_role": agent_role
         }
 
         store = AgentDefinitionStore(self, self._agent_list_name)
         if not store.save(agent_id, config):
             return action_result.set_status(phantom.APP_ERROR, f"Failed to save agent '{agent_id}'.")
 
-        action_result.add_data({"agent_id": agent_id, "status": "created", "skills": skills})
+        action_result.add_data({
+            "agent_id": agent_id, "status": "created", "skills": skills, "agent_role": agent_role
+        })
         action_result.update_summary({"agent_id": agent_id})
         return action_result.set_status(phantom.APP_SUCCESS, f"Agent '{agent_id}' saved.")
 
@@ -263,7 +347,8 @@ class SoarAgentRuntimeConnector(BaseConnector):
                 "model": agent.get("model", ""),
                 "allowed_tools": agent.get("allowed_tools", ""),
                 "max_steps": agent.get("max_steps", self._default_max_steps),
-                "skills": ", ".join(agent.get("skills", []))
+                "skills": ", ".join(agent.get("skills", [])),
+                "agent_role": agent.get("agent_role", DEFAULT_AGENT_ROLE)
             })
         action_result.update_summary({"total_agents": len(agents)})
         return action_result.set_status(phantom.APP_SUCCESS, f"Found {len(agents)} agent(s).")
