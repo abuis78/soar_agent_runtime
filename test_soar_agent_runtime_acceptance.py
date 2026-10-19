@@ -38,14 +38,14 @@ VALID_VERDICT = json.dumps({
 @pytest.fixture
 def platform(monkeypatch):
     """Stub phantom.rules: Custom List with agent definitions, notes, severity."""
-    state = {"agents": {}, "notes": [], "severity": []}
+    state = {"agents": {}, "notes": [], "severity": [], "queries": []}
     rules = types.ModuleType("phantom.rules")
     rules.get_list = lambda list_name: [[aid, json.dumps(cfg)] for aid, cfg in state["agents"].items()]
     rules.add_note = lambda **kw: state["notes"].append(kw)
     rules.update_container = lambda container=None, severity=None: state["severity"].append((container, severity))
     rules.get_container = lambda cid: {"id": cid, "name": "case"}
     rules.get_artifacts = lambda **kw: []
-    rules.run_query = lambda **kw: []
+    rules.run_query = lambda **kw: state["queries"].append(kw) or []
     monkeypatch.setitem(sys.modules, "phantom.rules", rules)
     monkeypatch.setattr(sys.modules["phantom"], "rules", rules, raising=False)
     return state
@@ -54,7 +54,7 @@ def platform(monkeypatch):
 @pytest.fixture
 def llm(monkeypatch):
     """Fake OpenAI-compatible and Anthropic clients fed from a response script."""
-    rec = {"responses": [], "openai_base_urls": [], "anthropic_clients": 0, "calls": 0}
+    rec = {"responses": [], "openai_base_urls": [], "anthropic_clients": 0, "calls": 0, "system_prompts": []}
 
     def _next():
         rec["calls"] += 1
@@ -62,6 +62,9 @@ def llm(monkeypatch):
 
     class _Completions:
         def create(self, **kw):
+            for m in kw.get("messages", []):
+                if m.get("role") == "system":
+                    rec["system_prompts"].append(m["content"])
             return types.SimpleNamespace(choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=_next()))])
 
     class FakeOpenAI:
@@ -317,3 +320,141 @@ def test_ac15_app_json_new_fields_are_optional_with_backward_compatible_defaults
         assert cfg[field]["default"] == default, field
     assert cfg["llm_seed"]["required"] is False and "default" not in cfg["llm_seed"]
     assert cfg["default_provider"]["default"] == "anthropic"
+
+
+# ============================================================================
+# Phase 2 (Tool Broker): AC-02, AC-03, AC-04
+# ============================================================================
+
+BROKER_FIELDS = {"broker_url": "https://broker.internal:8443", "broker_client_cert": "/etc/rt.crt",
+                 "broker_client_key": "/etc/rt.key", "broker_ca": "/etc/ca.pem"}
+E10_TOOLS = {"katalog_version": "k7", "angehalten": False, "vorlagen": [
+    {"vorlage_id": "cve_offen_auf_assets", "version": 3, "beschreibung": "Offene Assets zu einer CVE",
+     "parameter": {"cve": {"typ": "string", "muster": "^CVE-\\d{4}-\\d{4,7}$", "pflicht": True}}},
+]}
+INVOKE_OK = {"aufruf_id": "tb-01HZZ", "vorlage_id": "cve_offen_auf_assets", "vorlage_version": 3,
+             "katalog_version": "k7", "zeilen": 1, "gekuerzt": False, "ergebnis_hash": "sha256:1",
+             "daten": [{"asset": "srv-fs-01", "status": "offen"}]}
+
+
+class BrokerStub:
+    """Scripted broker transport: records every call, answers per path."""
+
+    def __init__(self, tools=E10_TOOLS, invoke=INVOKE_OK, raise_exc=None):
+        self.tools, self.invoke, self.raise_exc = tools, invoke, raise_exc
+        self.calls: list[tuple] = []
+
+    def __call__(self, method, url, params, body, timeout_s):
+        self.calls.append((method, url, params, body))
+        if self.raise_exc:
+            raise self.raise_exc
+        if url.endswith("/v1/tools"):
+            return 200, self.tools
+        if url.endswith("/v1/invoke"):
+            return 200, self.invoke
+        return 200, {"status": "ok"}
+
+    def invokes(self):
+        return [c for c in self.calls if c[1].endswith("/v1/invoke")]
+
+
+def verdict(belege, datenlage="teilweise"):
+    return "FINAL_ANSWER: " + json.dumps({"belege": belege, "begruendung": "b", "gegenargumente": [],
+                                          "unsicherheiten": [], "konfidenz": 0.5, "datenlage": datenlage})
+
+
+def airgap_connector(stub):
+    c = make_connector(airgap_mode=True, **BROKER_FIELDS)
+    c._broker_transport = stub
+    return c
+
+
+# --- AC-02 ------------------------------------------------------------------
+
+def test_ac02_airgap_has_no_free_spl_tool_and_prompt_tools_come_from_v1_tools(platform, llm, no_network):
+    define_agent(platform, provider="local", allowed_tools=["splunk_search", "add_note"])
+    stub = BrokerStub()
+    llm["responses"] = ['THOUGHT: x\nACTION: splunk_search\nPARAMS: {"spl_query": "index=main"}', verdict([])]
+    c = airgap_connector(stub)
+    status, result = run(c)
+    assert status is True, result.message
+    prompt = llm["system_prompts"][0]
+    assert "splunk_search" not in prompt
+    assert "Broker templates (catalog k7)" in prompt and "cve_offen_auf_assets v3" in prompt
+    assert platform["queries"] == []                          # no SPL reached the platform
+    assert step_log(result)[0]["observation"].startswith("ERROR: Tool 'splunk_search' is disabled in airgap_mode")
+    assert stub.calls[0][:3] == ("GET", "https://broker.internal:8443/v1/tools", {"agent_id": "triage"})
+    assert any("[airgap] 'splunk_search' removed from allowed tools" in m for m in c.progress)
+
+
+# --- AC-03 ------------------------------------------------------------------
+
+def test_ac03_external_reads_go_through_broker_invoke_and_yield_an_aufruf_id(platform, llm, no_network):
+    define_agent(platform, provider="local")
+    stub = BrokerStub()
+    llm["responses"] = [
+        'THOUGHT: look up\nACTION: broker_invoke\nPARAMS: {"vorlage_id": "cve_offen_auf_assets", "parameter": {"cve": "CVE-2026-12345"}}',
+        'THOUGHT: other case?\nACTION: get_container_info\nPARAMS: {"container_id": 999}',
+        verdict(["tb-01HZZ"]),
+    ]
+    c = airgap_connector(stub)
+    status, result = run(c, container_id=11)
+    assert status is True, result.message
+    lauf_id = result.summary["lauf_id"]
+    (_, _, _, body), = stub.invokes()
+    assert body["vorlage_id"] == "cve_offen_auf_assets" and body["parameter"] == {"cve": "CVE-2026-12345"}
+    assert body["kontext"] == {"agent_id": "triage", "lauf_id": lauf_id, "container_id": 11, "schritt": 1,
+                               "schritt_id": f"{lauf_id}/1"}
+    log = step_log(result)
+    assert log[0]["observation"].startswith("BROKER RESULT aufruf_id=tb-01HZZ vorlage=cve_offen_auf_assets v3 katalog=k7")
+    assert log[1]["observation"].startswith("ERROR: get_container_info reads only the container of this run (11)")
+    assert result.data[0]["urteil"]["belege"] == ["tb-01HZZ"]           # aufruf_id accepted as evidence
+    audit_step1 = [a["cef"] for a in c.artifacts if a["cef"]["schritt_id"] == f"{lauf_id}/1"]
+    assert audit_step1 and audit_step1[0]["aufruf_id"] == "tb-01HZZ"
+    assert platform["queries"] == []
+
+
+def test_ac03_invented_aufruf_id_is_not_accepted(platform, llm):
+    define_agent(platform, provider="local")
+    llm["responses"] = [verdict(["tb-forged"]), verdict([])]
+    status, result = run(airgap_connector(BrokerStub()))
+    assert status is True and result.summary["steps_taken"] == 2
+    assert "did not originate in this run" in step_log(result)[0]["observation"]
+
+
+# --- AC-04 ------------------------------------------------------------------
+
+def test_ac04_unreachable_broker_means_data_gap_and_no_direct_access(platform, llm, no_network):
+    define_agent(platform, provider="local", allowed_tools=["splunk_search", "add_note"])
+    stub = BrokerStub(raise_exc=ConnectionError("connection refused"))
+    llm["responses"] = [
+        'ACTION: broker_invoke\nPARAMS: {"vorlage_id": "cve_offen_auf_assets", "parameter": {}}',
+        'ACTION: splunk_search\nPARAMS: {"spl_query": "index=main"}',
+        verdict([], datenlage="unbekannt"),
+    ]
+    c = airgap_connector(stub)
+    status, result = run(c)
+    assert status is True, result.message
+    assert "Tool Broker: unavailable (UNREACHABLE)" in llm["system_prompts"][0]
+    log = step_log(result)
+    assert log[0]["observation"] == "ERROR: Tool 'broker_invoke' is not in the allowed tools list."
+    assert log[1]["observation"].startswith("ERROR: Tool 'splunk_search' is disabled in airgap_mode")
+    assert platform["queries"] == [] and stub.invokes() == []
+    assert result.data[0]["urteil"]["datenlage"] == "unbekannt"
+
+
+def test_ac04_source_error_from_broker_is_reported_as_gap_without_fallback(platform, llm, no_network):
+    define_agent(platform, provider="local", allowed_tools=["splunk_search", "add_note"])
+    stub = BrokerStub(invoke={"aufruf_id": "tb-err", "art": "fehler", "code": "SOURCE_ERROR", "detail": "splunk down"})
+    llm["responses"] = [
+        'ACTION: broker_invoke\nPARAMS: {"vorlage_id": "cve_offen_auf_assets", "parameter": {"cve": "CVE-2026-1"}}',
+        verdict([], datenlage="blinder_fleck"),
+    ]
+    c = airgap_connector(stub)
+    status, result = run(c)
+    assert status is True, result.message
+    obs = step_log(result)[0]["observation"]
+    assert obs.startswith("BROKER UNAVAILABLE code=SOURCE_ERROR detail=splunk down.") and "no other access path" in obs
+    assert platform["queries"] == [] and len(stub.invokes()) == 1
+    assert result.data[0]["urteil"]["belege"] == []                     # a failed call is no evidence
+    assert result.data[0]["urteil"]["datenlage"] == "blinder_fleck"
