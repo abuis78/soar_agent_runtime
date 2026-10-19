@@ -362,13 +362,18 @@ class SoarAgentRuntimeConnector(BaseConnector):
                 container=container_id,
                 note_type="general",
                 title=f"[Agent: {agent_id}] {task[:60]}",
-                content=f"**Final Answer:**\n{result['final_answer']}\n\n**Steps:** {result['steps_taken']} | **Provider:** {result['provider']} / {result['model']}"
+                content=(
+                    f"**Final Answer:**\n{result['final_answer']}\n\n"
+                    f"**Steps:** {result['steps_taken']} | **Provider:** {result['provider']} / {result['model']} "
+                    f"| **lauf_id:** {result['lauf_id']}"
+                )
             )
         except Exception:
             pass
 
         action_result.update_summary({
             "agent_id": agent_id,
+            "lauf_id": result["lauf_id"],
             "steps_taken": result["steps_taken"],
             "provider": result["provider"],
             "model": result["model"]

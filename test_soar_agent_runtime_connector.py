@@ -211,3 +211,28 @@ def test_connectivity_in_airgap_never_builds_a_cloud_client(monkeypatch):
     c = make_connector(airgap_mode=True)
     c._handle_test_connectivity({})
     assert built == ["local"]
+
+
+# --- lauf_id in run agent result (RT-P01, sub-change 1.6) --------------------
+
+def test_run_agent_result_and_summary_carry_lauf_id(monkeypatch):
+    import re
+
+    class FakeStore:
+        def __init__(self, *a, **kw):
+            pass
+
+        def load(self, agent_id):
+            return {"agent_id": agent_id, "provider": "local", "allowed_tools": ["add_note"]}
+
+    monkeypatch.setattr(connector_module, "AgentDefinitionStore", FakeStore)
+    monkeypatch.setattr(connector_module.LLMProvider, "chat",
+                        lambda self, system_prompt, messages: "FINAL_ANSWER: ok")
+    c = make_connector()
+    status = c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 1})
+    assert status is True
+    result = c.action_results[-1]
+    lauf_id = result.summary["lauf_id"]
+    assert re.match(r"^rt-\d{8}T\d{6}Z-[0-9a-f]{8}$", lauf_id)
+    assert result.data[0]["lauf_id"] == lauf_id
+    assert any(f"[lauf_id {lauf_id}]" in m for m in c.progress)

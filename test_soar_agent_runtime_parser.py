@@ -7,11 +7,13 @@ tool is NOT executed.
 
 from __future__ import annotations
 
+import json
+import re
 import types
 
 import pytest
 
-from soar_agent_runtime_utils import ReActLoop, _PARAMS_PARSE_ERROR
+from soar_agent_runtime_utils import ReActLoop, _PARAMS_PARSE_ERROR, new_run_id
 
 
 # --- fakes ------------------------------------------------------------------
@@ -131,3 +133,60 @@ def test_run_invalid_params_counts_against_max_steps():
     assert tools.calls == []
     assert result["steps_taken"] == 2
     assert result["final_answer"].startswith("Max steps (2) reached")
+
+
+# --- lauf_id / schritt_id (RT-P01, sub-change 1.6) ---------------------------
+
+RUN_ID_RE = re.compile(r"^rt-\d{8}T\d{6}Z-[0-9a-f]{8}$")
+
+
+def test_new_run_id_has_spec_format_and_is_unique():
+    ids = {new_run_id() for _ in range(50)}
+    assert len(ids) == 50
+    assert all(RUN_ID_RE.match(i) for i in ids)
+
+
+def test_loop_generates_run_id_by_default_and_accepts_one():
+    loop, _, _ = make_loop([])
+    assert RUN_ID_RE.match(loop.run_id)
+    assert loop.step_id_prefix == loop.run_id
+    connector = types.SimpleNamespace(save_progress=lambda *a, **k: None)
+    given = ReActLoop(connector=connector, llm=FakeLLM([]), tools=FakeTools(), agent_id="t",
+                      system_prompt="x", max_steps=1, container_id=1,
+                      run_id="rt-20260101T000000Z-deadbeef", step_id_prefix="rt-20260101T000000Z-deadbeef/3.1")
+    assert given.run_id == "rt-20260101T000000Z-deadbeef"
+    assert given.step_id_prefix == "rt-20260101T000000Z-deadbeef/3.1"
+
+
+def test_every_step_carries_schritt_id_and_result_carries_lauf_id():
+    loop, _, _ = make_loop([
+        "ACTION: get_container_info",
+        'ACTION: add_note\nPARAMS: {broken',
+        "FINAL_ANSWER: ok",
+    ])
+    result = loop.run("do it")
+    assert result["lauf_id"] == loop.run_id
+    assert [e["schritt_id"] for e in loop.step_log] == [f"{loop.run_id}/{n}" for n in (1, 2, 3)]
+    assert [e["schritt_id"] for e in json.loads(result["step_log"])] == [f"{loop.run_id}/{n}" for n in (1, 2, 3)]
+
+
+def test_sub_agent_prefix_is_used_for_schritt_id():
+    connector = types.SimpleNamespace(save_progress=lambda *a, **k: None)
+    loop = ReActLoop(connector=connector, llm=FakeLLM(["FINAL_ANSWER: ok"]), tools=FakeTools(),
+                     agent_id="child", system_prompt="x", max_steps=1, container_id=1,
+                     run_id="rt-20260101T000000Z-deadbeef", step_id_prefix="rt-20260101T000000Z-deadbeef/4.1")
+    loop.run("t")
+    assert loop.step_log[0]["schritt_id"] == "rt-20260101T000000Z-deadbeef/4.1/1"
+
+
+def test_error_result_also_carries_lauf_id():
+    class ExplodingLLM(FakeLLM):
+        def chat(self, system_prompt, messages):
+            raise RuntimeError("down")
+
+    connector = types.SimpleNamespace(save_progress=lambda *a, **k: None)
+    loop = ReActLoop(connector=connector, llm=ExplodingLLM([]), tools=FakeTools(), agent_id="t",
+                     system_prompt="x", max_steps=1, container_id=1)
+    result = loop.run("t")
+    assert result["final_answer"].startswith("ERROR: LLM call failed")
+    assert result["lauf_id"] == loop.run_id

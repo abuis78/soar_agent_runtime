@@ -7,6 +7,8 @@ Python 3.13 compatible.
 from __future__ import annotations
 import json
 import re
+import secrets
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 try:
@@ -101,6 +103,14 @@ MAX_STEPS_HARD_LIMIT = 50
 _MAX_OBSERVATION_LEN = 8000
 _MAX_TASK_LEN = 4000
 _MAX_CONTEXT_LEN = 4000
+
+# RT-P01: run and step identifiers (spec names on the wire: lauf_id, schritt_id).
+# lauf_id = rt-<UTC timestamp>-<8 hex>, schritt_id = <prefix>/<n>; sub-agents
+# will inherit the lauf_id and use <lauf_id>/<n>.<depth> as their prefix.
+def new_run_id() -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"rt-{stamp}-{secrets.token_hex(4)}"
+
 
 # RT-P05 (strict parser): observation returned to the model instead of
 # executing a tool with silently-emptied parameters.
@@ -678,7 +688,9 @@ class ReActLoop:
         max_steps: int,
         container_id: int,
         extra_context: str = "",
-        skill_injection: str = ""
+        skill_injection: str = "",
+        run_id: str | None = None,
+        step_id_prefix: str | None = None,
     ) -> None:
         self.connector       = connector
         self.llm             = llm
@@ -689,6 +701,8 @@ class ReActLoop:
         self.container_id    = container_id
         self.extra_context   = extra_context
         self.skill_injection = skill_injection
+        self.run_id          = run_id or new_run_id()
+        self.step_id_prefix  = step_id_prefix or self.run_id
         self.step_log: list[dict] = []
 
     def _build_system_prompt(self) -> str:
@@ -750,7 +764,8 @@ class ReActLoop:
         return tool_name, params, thought, final_answer, parse_error
 
     def run(self, task: str) -> dict:
-        self.connector.save_progress(f"Agent '{self.agent_id}' starting: {task[:80]}...")
+        self.connector.save_progress(
+            f"Agent '{self.agent_id}' starting [lauf_id {self.run_id}]: {task[:80]}...")
         system_prompt = self._build_system_prompt()
         # Open item #2/#3: user-controlled task is length-capped and stripped of
         # ReAct control keywords before it can steer the loop.
@@ -772,6 +787,7 @@ class ReActLoop:
             tool_name, params, thought, final_answer, parse_error = self._parse_response(response_text)
             step_entry: dict = {
                 "step":        steps_taken,
+                "schritt_id":  f"{self.step_id_prefix}/{steps_taken}",
                 "thought":     thought,
                 "action":      tool_name or "FINAL_ANSWER",
                 "params":      params,
@@ -820,6 +836,7 @@ class ReActLoop:
 
         return {
             "agent_id":     self.agent_id,
+            "lauf_id":      self.run_id,
             "final_answer": final_answer,
             "steps_taken":  steps_taken,
             "provider":     self.llm.provider,
@@ -830,6 +847,7 @@ class ReActLoop:
     def _error_result(self, message: str, steps: int) -> dict:
         return {
             "agent_id":     self.agent_id,
+            "lauf_id":      self.run_id,
             "final_answer": f"ERROR: {message}",
             "steps_taken":  steps,
             "provider":     self.llm.provider,
