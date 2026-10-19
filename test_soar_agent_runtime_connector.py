@@ -141,3 +141,73 @@ def test_run_agent_empty_provider_in_definition_uses_asset_default(monkeypatch):
     c = make_connector(default_provider="local")
     c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 1})
     assert seen["provider"] == "local"
+
+
+# --- test connectivity per mode (RT-A04, sub-change 1.4) ---------------------
+
+def _record_connection_tests(monkeypatch, outcome=(True, "OK")):
+    """Replace LLMProvider.test_connection; return the list of providers tested."""
+    tested = []
+
+    def fake_test(self):
+        tested.append(self.provider)
+        return outcome
+
+    monkeypatch.setattr(connector_module.LLMProvider, "test_connection", fake_test)
+    return tested
+
+
+def test_connectivity_without_airgap_tests_every_configured_provider(monkeypatch):
+    tested = _record_connection_tests(monkeypatch)
+    c = make_connector()
+    status = c._handle_test_connectivity({})
+    assert status is True
+    assert sorted(tested) == sorted(ALL_PROVIDERS)
+    assert c.action_results[-1].message.startswith("Connectivity OK (normal).")
+
+
+def test_connectivity_without_airgap_skips_unconfigured_cloud_providers(monkeypatch):
+    tested = _record_connection_tests(monkeypatch)
+    c = SoarAgentRuntimeConnector()
+    c._fake_config = {}
+    c.initialize()
+    c._handle_test_connectivity({})
+    assert tested == ["local"]
+    assert "SKIPPED (no credentials configured)" in c.action_results[-1].message
+
+
+def test_connectivity_in_airgap_only_contacts_local(monkeypatch):
+    tested = _record_connection_tests(monkeypatch)
+    c = make_connector(airgap_mode=True)
+    status = c._handle_test_connectivity({})
+    assert tested == ["local"]
+    assert status is True
+    msg = c.action_results[-1].message
+    assert msg.startswith("Connectivity OK (airgap).")
+    for provider in CLOUD_PROVIDERS:
+        assert f'"{provider}": "SKIPPED (airgap_mode)"' in msg
+    assert "ERROR" not in msg
+
+
+def test_connectivity_in_airgap_fails_when_local_is_down(monkeypatch):
+    tested = _record_connection_tests(monkeypatch, outcome=(False, "connection refused"))
+    c = make_connector(airgap_mode=True)
+    status = c._handle_test_connectivity({})
+    assert tested == ["local"]
+    assert status is False
+    assert c.action_results[-1].message.startswith("All providers failed (airgap).")
+
+
+def test_connectivity_in_airgap_never_builds_a_cloud_client(monkeypatch):
+    built = []
+    original = SoarAgentRuntimeConnector._build_llm_provider
+
+    def spy(self, provider, model):
+        built.append(provider)
+        return original(self, provider, model)
+
+    monkeypatch.setattr(SoarAgentRuntimeConnector, "_build_llm_provider", spy)
+    _record_connection_tests(monkeypatch)
+    c = make_connector(airgap_mode=True)
+    c._handle_test_connectivity({})
+    assert built == ["local"]

@@ -223,7 +223,8 @@ class SoarAgentRuntimeConnector(BaseConnector):
 
     def _handle_test_connectivity(self, param):
         action_result = self.add_action_result(ActionResult(dict(param)))
-        self.save_progress("Testing LLM provider connectivity...")
+        mode = "airgap" if self._airgap_mode else "normal"
+        self.save_progress(f"Testing LLM provider connectivity ({mode} mode)...")
         results = {}
         providers = [
             ("anthropic", "claude-haiku-4-5-20251001"),
@@ -233,6 +234,11 @@ class SoarAgentRuntimeConnector(BaseConnector):
         ]
         any_success = False
         for provider_name, default_model in providers:
+            # RT-A04 / AC-01: in Air-Gap mode no cloud endpoint is contacted,
+            # not even by the test action. Only 'local' is exercised.
+            if self._airgap_mode and provider_name != "local":
+                results[provider_name] = "SKIPPED (airgap_mode)"
+                continue
             key_field = f"{provider_name}_api_key" if provider_name != "local" else "local_llm_api_key"
             url_field = f"{provider_name}_api_url" if provider_name != "local" else "local_llm_url"
             has_config = bool(self._config.get(key_field) or self._config.get(url_field))
@@ -250,8 +256,10 @@ class SoarAgentRuntimeConnector(BaseConnector):
                 results[provider_name] = f"ERROR: {str(e)}"
 
         if any_success:
-            return action_result.set_status(phantom.APP_SUCCESS, f"Connectivity OK. Results: {json.dumps(results)}")
-        return action_result.set_status(phantom.APP_ERROR, f"All providers failed. Results: {json.dumps(results)}")
+            return action_result.set_status(
+                phantom.APP_SUCCESS, f"Connectivity OK ({mode}). Results: {json.dumps(results)}")
+        return action_result.set_status(
+            phantom.APP_ERROR, f"All providers failed ({mode}). Results: {json.dumps(results)}")
 
     # -----------------------------------------------------------------------
     # Action: run agent
