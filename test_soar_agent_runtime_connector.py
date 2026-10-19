@@ -236,3 +236,80 @@ def test_run_agent_result_and_summary_carry_lauf_id(monkeypatch):
     assert re.match(r"^rt-\d{8}T\d{6}Z-[0-9a-f]{8}$", lauf_id)
     assert result.data[0]["lauf_id"] == lauf_id
     assert any(f"[lauf_id {lauf_id}]" in m for m in c.progress)
+
+
+# --- audit sink per mode (RT-P02/P03, sub-change 1.8) -----------------------
+
+from soar_agent_runtime_audit import ArtifactAuditSink, NullAuditSink  # noqa: E402
+
+
+class _LocalStore:
+    def __init__(self, *a, **kw):
+        pass
+
+    def load(self, agent_id):
+        return {"agent_id": agent_id, "provider": "local", "allowed_tools": ["add_note"]}
+
+
+def _capture_loop(monkeypatch):
+    seen = {}
+
+    class CapturingLoop:
+        def __init__(self, **kw):
+            seen.update(kw)
+            self.run_id = "rt-x"
+
+        def run(self, task):
+            return {"agent_id": "triage", "lauf_id": "rt-x", "final_answer": "ok", "steps_taken": 1,
+                    "provider": "local", "model": "m", "audit_ereignisse": 2, "audit_fehler": 0,
+                    "step_log": "[]"}
+
+    monkeypatch.setattr(connector_module, "ReActLoop", CapturingLoop)
+    monkeypatch.setattr(connector_module, "AgentDefinitionStore", _LocalStore)
+    return seen
+
+
+@pytest.mark.parametrize("config,sink_type,fail_closed", [
+    ({"airgap_mode": True}, ArtifactAuditSink, True),
+    ({"airgap_mode": True, "audit_enabled": False}, ArtifactAuditSink, True),
+    ({"audit_enabled": True}, ArtifactAuditSink, False),
+    ({}, NullAuditSink, False),
+])
+def test_run_agent_picks_audit_sink_per_mode(monkeypatch, config, sink_type, fail_closed):
+    seen = _capture_loop(monkeypatch)
+    c = make_connector(**config)
+    c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 7})
+    sink = seen["audit"]
+    assert isinstance(sink, sink_type)
+    assert sink.fail_closed is fail_closed
+    if sink_type is ArtifactAuditSink:
+        assert sink.container_id == 7
+    assert len(seen["def_version"]) == 64
+    summary = c.action_results[-1].summary
+    assert (summary["audit_ereignisse"], summary["audit_fehler"]) == (2, 0)
+
+
+def test_run_agent_in_airgap_writes_audit_artifacts_end_to_end(monkeypatch):
+    monkeypatch.setattr(connector_module, "AgentDefinitionStore", _LocalStore)
+    monkeypatch.setattr(connector_module.LLMProvider, "chat",
+                        lambda self, system_prompt, messages: "FINAL_ANSWER: ok")
+    c = make_connector(airgap_mode=True)
+    status = c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 9})
+    assert status is True
+    assert len(c.artifacts) == 1
+    art = c.artifacts[0]
+    lauf_id = c.action_results[-1].summary["lauf_id"]
+    assert art["label"] == "agent_audit" and art["run_automation"] is False and art["container_id"] == 9
+    assert art["cef"]["lauf_id"] == lauf_id and art["cef"]["schritt_id"] == f"{lauf_id}/1"
+    assert c.action_results[-1].summary["audit_ereignisse"] == 1
+
+
+def test_run_agent_in_airgap_fails_closed_when_artifacts_cannot_be_written(monkeypatch):
+    monkeypatch.setattr(connector_module, "AgentDefinitionStore", _LocalStore)
+    monkeypatch.setattr(connector_module.LLMProvider, "chat",
+                        lambda self, system_prompt, messages: "FINAL_ANSWER: ok")
+    c = make_connector(airgap_mode=True)
+    c.save_artifact = lambda artifact: (False, "disk full", None)
+    status = c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 9})
+    assert status is False
+    assert c.action_results[-1].message.startswith("ERROR: audit not writable")

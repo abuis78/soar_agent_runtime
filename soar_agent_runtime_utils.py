@@ -304,6 +304,7 @@ class ToolRegistry:
     TOOL_DEFINITIONS: dict[str, dict] = {
         "splunk_search": {
             "description": "Execute a Splunk SPL search query and return results",
+            "wirkt": False,
             "parameters": {
                 "spl_query": "The SPL search query to execute",
                 "earliest":  "Earliest time (default: -24h)",
@@ -312,6 +313,7 @@ class ToolRegistry:
         },
         "add_note": {
             "description": "Add a note to the current SOAR container",
+            "wirkt": False,
             "parameters": {
                 "title":   "Note title",
                 "content": "Note content (markdown supported)"
@@ -319,16 +321,19 @@ class ToolRegistry:
         },
         "update_severity": {
             "description": "Update the severity of the current container",
+            "wirkt": True,
             "parameters": {
                 "severity": "New severity: low | medium | high | critical"
             }
         },
         "get_container_info": {
             "description": "Get metadata and artifacts of the current container",
+            "wirkt": False,
             "parameters":  {}
         },
         "run_sub_agent": {
             "description": "Invoke another agent as a sub-task and return its result",
+            "wirkt": False,
             "parameters": {
                 "agent_id": "ID of the agent to invoke",
                 "task":     "Task description for the sub-agent"
@@ -351,6 +356,12 @@ class ToolRegistry:
         self.telemetry = telemetry
         self.agent_id = agent_id
         self.agent_role = agent_role if agent_role in AGENT_ROLES else DEFAULT_AGENT_ROLE
+
+    @classmethod
+    def has_effect(cls, tool_name: str) -> bool:
+        """RT-W02: True for tools that change state (``wirkt``); unknown tools count as effecting."""
+        defn = cls.TOOL_DEFINITIONS.get(tool_name)
+        return True if defn is None else bool(defn.get("wirkt", True))
 
     def get_tool_descriptions(self) -> str:
         lines = []
@@ -691,6 +702,8 @@ class ReActLoop:
         skill_injection: str = "",
         run_id: str | None = None,
         step_id_prefix: str | None = None,
+        audit=None,
+        def_version: str = "",
     ) -> None:
         self.connector       = connector
         self.llm             = llm
@@ -703,6 +716,11 @@ class ReActLoop:
         self.skill_injection = skill_injection
         self.run_id          = run_id or new_run_id()
         self.step_id_prefix  = step_id_prefix or self.run_id
+        # RT-P02/P03: audit sink (soar_agent_runtime_audit.AuditSink); None = no audit.
+        self.audit           = audit
+        self.def_version     = def_version
+        self.audit_written   = 0
+        self.audit_failed    = 0
         self.step_log: list[dict] = []
 
     def _build_system_prompt(self) -> str:
@@ -763,6 +781,45 @@ class ReActLoop:
 
         return tool_name, params, thought, final_answer, parse_error
 
+    # -- audit (RT-P02/P03) -------------------------------------------------
+
+    def _audit_fail_closed(self) -> bool:
+        return bool(self.audit is not None and getattr(self.audit, "fail_closed", False))
+
+    def _audit(self, phase: str, step_entry: dict, observation: str | None = None) -> bool:
+        """Write one audit event; True when stored (or audit disabled)."""
+        if self.audit is None:
+            return True
+        from soar_agent_runtime_audit import build_step_event  # local: avoids import cycle
+        event = build_step_event(
+            run_id=self.run_id,
+            step_id=step_entry["schritt_id"],
+            agent_id=self.agent_id,
+            phase=phase,
+            thought=step_entry.get("thought", ""),
+            tool=step_entry.get("action", ""),
+            params=step_entry.get("params") or {},
+            observation=observation,
+            def_version=self.def_version,
+        )
+        ok = False
+        try:
+            ok = bool(self.audit.write(event))
+        except Exception:
+            ok = False
+        if ok:
+            self.audit_written += 1
+        else:
+            self.audit_failed += 1
+            self.connector.save_progress(
+                f"[audit] write failed for {step_entry['schritt_id']} ({phase})"
+                + (" - fail-closed, stopping." if self._audit_fail_closed() else " - continuing (fail-open)."))
+        return ok
+
+    def _audit_abort(self, step_entry: dict, steps: int, note: str = "") -> dict:
+        return self._error_result(
+            f"audit not writable at step {step_entry['schritt_id']}{note} (fail-closed, RT-P03)", steps)
+
     def run(self, task: str) -> dict:
         self.connector.save_progress(
             f"Agent '{self.agent_id}' starting [lauf_id {self.run_id}]: {task[:80]}...")
@@ -773,30 +830,41 @@ class ReActLoop:
         messages: list[dict] = [{"role": "user", "content": safe_task}]
         steps_taken  = 0
         final_answer: str | None = None
+        fail_closed = self._audit_fail_closed()
 
         while steps_taken < self.max_steps:
             steps_taken += 1
             self.connector.save_progress(f"Step {steps_taken}/{self.max_steps}...")
+            step_entry: dict = {
+                "step":        steps_taken,
+                "schritt_id":  f"{self.step_id_prefix}/{steps_taken}",
+                "thought":     "",
+                "action":      "LLM",
+                "params":      {},
+                "observation": None
+            }
 
             try:
                 response_text = self.llm.chat(system_prompt, messages)
             except Exception as e:
+                step_entry["observation"] = f"ERROR: LLM call failed: {_scrub_exc(e)}"
+                self.step_log.append(step_entry)
+                self._audit("fehler", step_entry, step_entry["observation"])
                 return self._error_result(
                     f"LLM call failed at step {steps_taken}: {_scrub_exc(e)}", steps_taken)
 
             tool_name, params, thought, final_answer, parse_error = self._parse_response(response_text)
-            step_entry: dict = {
-                "step":        steps_taken,
-                "schritt_id":  f"{self.step_id_prefix}/{steps_taken}",
-                "thought":     thought,
-                "action":      tool_name or "FINAL_ANSWER",
-                "params":      params,
-                "observation": None
+            step_entry |= {
+                "thought": thought,
+                "action":  tool_name or "FINAL_ANSWER",
+                "params":  params,
             }
 
             if final_answer is not None:
                 step_entry["observation"] = final_answer
                 self.step_log.append(step_entry)
+                if not self._audit("erledigt", step_entry, final_answer) and fail_closed:
+                    return self._audit_abort(step_entry, steps_taken)
                 self.connector.save_progress(f"Agent '{self.agent_id}' done in {steps_taken} steps.")
                 break
 
@@ -806,6 +874,8 @@ class ReActLoop:
                 step_entry["action"] = tool_name or "INVALID"
                 step_entry["observation"] = parse_error
                 self.step_log.append(step_entry)
+                if not self._audit("fehler", step_entry, parse_error) and fail_closed:
+                    return self._audit_abort(step_entry, steps_taken)
                 messages += [
                     {"role": "assistant", "content": response_text},
                     {"role": "user",      "content": f"OBSERVATION: {parse_error}"}
@@ -813,9 +883,20 @@ class ReActLoop:
                 continue
 
             if tool_name:
+                # RT-P03: an effecting tool is announced to the audit BEFORE it
+                # runs; if that cannot be stored and the sink is fail-closed,
+                # the tool is not executed.
+                if self.tools.has_effect(tool_name) and not self._audit("beabsichtigt", step_entry):
+                    if fail_closed:
+                        step_entry["observation"] = (
+                            f"ERROR: audit not writable, '{tool_name}' not executed (fail-closed).")
+                        self.step_log.append(step_entry)
+                        return self._audit_abort(step_entry, steps_taken, f" before '{tool_name}'")
                 observation = self.tools.execute(tool_name, params)
                 step_entry["observation"] = observation  # raw kept for forensics
                 self.step_log.append(step_entry)
+                if not self._audit("erledigt", step_entry, observation) and fail_closed:
+                    return self._audit_abort(step_entry, steps_taken, f" after '{tool_name}'")
                 # Issue #2 (central boundary): every tool observation is sanitized
                 # and length-capped before it re-enters the LLM conversation.
                 safe_obs = _sanitize_observation(_truncate(observation, _MAX_OBSERVATION_LEN))
@@ -826,6 +907,8 @@ class ReActLoop:
             else:
                 step_entry["observation"] = "ERROR: No ACTION or FINAL_ANSWER found."
                 self.step_log.append(step_entry)
+                if not self._audit("fehler", step_entry, step_entry["observation"]) and fail_closed:
+                    return self._audit_abort(step_entry, steps_taken)
                 messages += [
                     {"role": "assistant", "content": response_text},
                     {"role": "user",      "content": "OBSERVATION: No valid ACTION or FINAL_ANSWER. Follow the format exactly."}
@@ -834,23 +917,20 @@ class ReActLoop:
             final_answer = f"Max steps ({self.max_steps}) reached without FINAL_ANSWER."
             self.connector.save_progress(f"Agent '{self.agent_id}' hit max steps.")
 
+        return self._result(final_answer, steps_taken)
+
+    def _result(self, final_answer: str | None, steps: int) -> dict:
         return {
-            "agent_id":     self.agent_id,
-            "lauf_id":      self.run_id,
-            "final_answer": final_answer,
-            "steps_taken":  steps_taken,
-            "provider":     self.llm.provider,
-            "model":        self.llm.model,
-            "step_log":     json.dumps(self.step_log, indent=2)
+            "agent_id":         self.agent_id,
+            "lauf_id":          self.run_id,
+            "final_answer":     final_answer,
+            "steps_taken":      steps,
+            "provider":         self.llm.provider,
+            "model":            self.llm.model,
+            "audit_ereignisse": self.audit_written,
+            "audit_fehler":     self.audit_failed,
+            "step_log":         json.dumps(self.step_log, indent=2)
         }
 
     def _error_result(self, message: str, steps: int) -> dict:
-        return {
-            "agent_id":     self.agent_id,
-            "lauf_id":      self.run_id,
-            "final_answer": f"ERROR: {message}",
-            "steps_taken":  steps,
-            "provider":     self.llm.provider,
-            "model":        self.llm.model,
-            "step_log":     json.dumps(self.step_log, indent=2)
-        }
+        return self._result(f"ERROR: {message}", steps)

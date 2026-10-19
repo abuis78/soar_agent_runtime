@@ -42,16 +42,23 @@ class FakeTools:
         self.calls.append((tool_name, params))
         return f"OK {tool_name}"
 
+    @staticmethod
+    def has_effect(tool_name):
+        return tool_name == "update_severity"
 
-def make_loop(responses, max_steps=5):
-    connector = types.SimpleNamespace(save_progress=lambda *a, **k: None)
+
+def make_loop(responses, max_steps=5, audit=None):
+    progress: list[str] = []
+    connector = types.SimpleNamespace(save_progress=lambda m, *a, **k: progress.append(str(m)))
     llm = FakeLLM(responses)
     tools = FakeTools()
     loop = ReActLoop(
         connector=connector, llm=llm, tools=tools, agent_id="t",
         system_prompt="You are a test agent.", max_steps=max_steps,
         container_id=1, extra_context="", skill_injection="",
+        audit=audit, def_version="defv1",
     )
+    loop._progress = progress
     return loop, llm, tools
 
 
@@ -190,3 +197,130 @@ def test_error_result_also_carries_lauf_id():
     result = loop.run("t")
     assert result["final_answer"].startswith("ERROR: LLM call failed")
     assert result["lauf_id"] == loop.run_id
+
+
+# --- audit per step, fail-closed (RT-P02/P03, sub-change 1.8) ---------------
+
+class FakeSink:
+    """Records events; ``fail_at`` = 1-based write numbers that fail."""
+
+    def __init__(self, fail_closed=False, fail_at=()):
+        self.fail_closed = fail_closed
+        self.fail_at = set(fail_at)
+        self.events: list[dict] = []
+        self.attempts = 0
+
+    def write(self, event):
+        self.attempts += 1
+        if self.attempts in self.fail_at or "all" in self.fail_at:
+            return False
+        self.events.append(event)
+        return True
+
+    def flush(self):
+        return True
+
+
+def _phases(sink):
+    return [(e["schritt_id"].rsplit("/", 1)[1], e["werkzeug"], e["phase"]) for e in sink.events]
+
+
+def test_no_audit_sink_keeps_counters_at_zero():
+    loop, _, _ = make_loop(["FINAL_ANSWER: ok"])
+    result = loop.run("t")
+    assert (result["audit_ereignisse"], result["audit_fehler"]) == (0, 0)
+
+
+def test_every_step_type_is_audited_and_effecting_tools_are_announced_first():
+    sink = FakeSink()
+    loop, _, tools = make_loop([
+        "ACTION: get_container_info",
+        'ACTION: update_severity\nPARAMS: {"severity": "high"}',
+        "ACTION: add_note\nPARAMS: {broken",
+        "just rambling",
+        "FINAL_ANSWER: done",
+    ], audit=sink)
+    result = loop.run("t")
+    assert _phases(sink) == [
+        ("1", "get_container_info", "erledigt"),
+        ("2", "update_severity", "beabsichtigt"),
+        ("2", "update_severity", "erledigt"),
+        ("3", "add_note", "fehler"),
+        ("4", "FINAL_ANSWER", "fehler"),
+        ("5", "FINAL_ANSWER", "erledigt"),
+    ]
+    assert all(e["lauf_id"] == loop.run_id and e["definition_version"] == "defv1" for e in sink.events)
+    assert json.loads(sink.events[1]["parameter"]) == {"severity": "high"}
+    assert sink.events[1]["ergebnis_hash"] == ""          # intended: nothing happened yet
+    assert sink.events[2]["ergebnis_hash"] != ""          # done: hash of the observation
+    assert (result["audit_ereignisse"], result["audit_fehler"]) == (6, 0)
+    assert tools.calls == [("get_container_info", {}), ("update_severity", {"severity": "high"})]
+
+
+def test_fail_closed_blocks_effecting_tool_when_intent_cannot_be_stored():
+    sink = FakeSink(fail_closed=True, fail_at={"all"})
+    loop, _, tools = make_loop(['ACTION: update_severity\nPARAMS: {"severity": "high"}'], audit=sink)
+    result = loop.run("t")
+    assert tools.calls == []
+    assert result["final_answer"].startswith("ERROR: audit not writable at step ")
+    assert "before 'update_severity'" in result["final_answer"]
+    assert result["steps_taken"] == 1
+    assert loop.step_log[0]["observation"].startswith("ERROR: audit not writable, 'update_severity' not executed")
+    assert result["audit_fehler"] == 1
+
+
+def test_fail_closed_non_effecting_tool_runs_then_stops_when_its_event_fails():
+    sink = FakeSink(fail_closed=True, fail_at={1})
+    loop, _, tools = make_loop(['ACTION: add_note\nPARAMS: {"title": "a", "content": "b"}', "FINAL_ANSWER: x"],
+                               audit=sink)
+    result = loop.run("t")
+    assert tools.calls == [("add_note", {"title": "a", "content": "b"})]
+    assert result["final_answer"].startswith("ERROR: audit not writable at step ")
+    assert "after 'add_note'" in result["final_answer"]
+    assert result["steps_taken"] == 1
+    assert any("[audit] write failed" in m and "fail-closed" in m for m in loop._progress)
+
+
+def test_fail_open_counts_failures_and_still_executes():
+    sink = FakeSink(fail_closed=False, fail_at={"all"})
+    loop, _, tools = make_loop(['ACTION: update_severity\nPARAMS: {"severity": "high"}', "FINAL_ANSWER: ok"],
+                               audit=sink)
+    result = loop.run("t")
+    assert tools.calls == [("update_severity", {"severity": "high"})]
+    assert result["final_answer"] == "ok"
+    assert (result["audit_ereignisse"], result["audit_fehler"]) == (0, 3)
+    assert any("fail-open" in m for m in loop._progress)
+
+
+def test_llm_failure_is_audited_as_error():
+    class ExplodingLLM(FakeLLM):
+        def chat(self, system_prompt, messages):
+            raise RuntimeError("down sk-abcdefghijklmnop")
+
+    sink = FakeSink()
+    progress = []
+    connector = types.SimpleNamespace(save_progress=lambda m, *a, **k: progress.append(m))
+    loop = ReActLoop(connector=connector, llm=ExplodingLLM([]), tools=FakeTools(), agent_id="t",
+                     system_prompt="x", max_steps=1, container_id=1, audit=sink)
+    result = loop.run("t")
+    assert _phases(sink) == [("1", "LLM", "fehler")]
+    assert "sk-abcdefghijklmnop" not in json.dumps(sink.events)
+    assert result["audit_ereignisse"] == 1
+
+
+def test_sink_exception_is_treated_as_failed_write():
+    class Raising(FakeSink):
+        def write(self, event):
+            raise RuntimeError("boom")
+
+    loop, _, _ = make_loop(["FINAL_ANSWER: ok"], audit=Raising(fail_closed=True))
+    result = loop.run("t")
+    assert result["final_answer"].startswith("ERROR: audit not writable")
+
+
+def test_has_effect_flags():
+    from soar_agent_runtime_utils import ToolRegistry
+    assert ToolRegistry.has_effect("update_severity") is True
+    for name in ("splunk_search", "add_note", "get_container_info", "run_sub_agent"):
+        assert ToolRegistry.has_effect(name) is False, name
+    assert ToolRegistry.has_effect("unknown_tool") is True

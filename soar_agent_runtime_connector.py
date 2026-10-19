@@ -20,6 +20,7 @@ from soar_agent_runtime_utils import (
     DEFAULT_AGENT_ROLE,
     MAX_STEPS_HARD_LIMIT,
 )
+from soar_agent_runtime_audit import ArtifactAuditSink, NullAuditSink, definition_version
 
 try:
     from ai_soc_telemetry import TelemetryClient
@@ -50,6 +51,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
         self._llm_max_tokens = 4096
         self._llm_seed = None
         self._max_observation_chars = 8000
+        self._audit_enabled = False
 
     def initialize(self):
         self._config = self.get_config()
@@ -64,6 +66,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
         self._llm_max_tokens = self._cfg_number("llm_max_tokens", 4096, int)
         self._llm_seed = self._cfg_number("llm_seed", None, int)
         self._max_observation_chars = self._cfg_number("max_observation_chars", 8000, int)
+        self._audit_enabled = bool(self._config.get("audit_enabled", False))
         if self._airgap_mode:
             self.save_progress("[airgap] enabled - only provider 'local' is allowed.")
         self._telemetry = self._build_telemetry()
@@ -339,6 +342,13 @@ class SoarAgentRuntimeConnector(BaseConnector):
             skill_injection = SkillStore.build_injection(loaded_skills)
             self.save_progress(f"Injected {len(loaded_skills)} skill(s).")
 
+        # Audit sink (RT-P02/P03, E2): artifact per step; mandatory and
+        # fail-closed in airgap_mode, optional and fail-open otherwise.
+        if self._airgap_mode or self._audit_enabled:
+            audit = ArtifactAuditSink(self, container_id, fail_closed=self._airgap_mode)
+        else:
+            audit = NullAuditSink()
+
         # Run ReAct loop
         system_prompt = agent_def.get("system_prompt", "You are a SOC analyst agent.")
         loop = ReActLoop(
@@ -350,9 +360,12 @@ class SoarAgentRuntimeConnector(BaseConnector):
             max_steps=max_steps,
             container_id=container_id,
             extra_context=extra_context_str,
-            skill_injection=skill_injection
+            skill_injection=skill_injection,
+            audit=audit,
+            def_version=definition_version(agent_def),
         )
         result = loop.run(task)
+        audit.flush()
         action_result.add_data(result)
 
         # Add summary note
@@ -375,6 +388,8 @@ class SoarAgentRuntimeConnector(BaseConnector):
             "agent_id": agent_id,
             "lauf_id": result["lauf_id"],
             "steps_taken": result["steps_taken"],
+            "audit_ereignisse": result["audit_ereignisse"],
+            "audit_fehler": result["audit_fehler"],
             "provider": result["provider"],
             "model": result["model"]
         })

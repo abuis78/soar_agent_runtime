@@ -59,6 +59,7 @@ except ImportError:
             self._fake_action_id = ""
             self.action_results: list = []
             self.progress: list = []
+            self.artifacts: list = []
 
         def get_config(self):
             return self._fake_config
@@ -81,6 +82,10 @@ except ImportError:
 
         def get_action_identifier(self):
             return self._fake_action_id
+
+        def save_artifact(self, artifact):
+            self.artifacts.append(dict(artifact))
+            return True, "ok", len(self.artifacts)
 
     _base_connector = types.ModuleType("phantom.base_connector")
     _base_connector.BaseConnector = _BaseConnector
