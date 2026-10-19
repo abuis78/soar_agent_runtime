@@ -43,6 +43,13 @@ class SoarAgentRuntimeConnector(BaseConnector):
         self._skill_list_name = "agent_skills"
         self._default_provider = "anthropic"
         self._telemetry = None
+        # RT-A01/RT-A03 (Umsetzungskonzept 1.3): Air-Gap profile and model bounds
+        self._airgap_mode = False
+        self._llm_timeout_s = 120.0
+        self._llm_temperature = 0.0
+        self._llm_max_tokens = 4096
+        self._llm_seed = None
+        self._max_observation_chars = 8000
 
     def initialize(self):
         self._config = self.get_config()
@@ -51,6 +58,14 @@ class SoarAgentRuntimeConnector(BaseConnector):
         self._agent_list_name = self._config.get("agent_list_name", "agent_definitions")
         self._skill_list_name = self._config.get("skill_list_name", "agent_skills")
         self._default_provider = self._config.get("default_provider", "anthropic")
+        self._airgap_mode = bool(self._config.get("airgap_mode", False))
+        self._llm_timeout_s = self._cfg_number("llm_timeout_s", 120.0, float)
+        self._llm_temperature = self._cfg_number("llm_temperature", 0.0, float)
+        self._llm_max_tokens = self._cfg_number("llm_max_tokens", 4096, int)
+        self._llm_seed = self._cfg_number("llm_seed", None, int)
+        self._max_observation_chars = self._cfg_number("max_observation_chars", 8000, int)
+        if self._airgap_mode:
+            self.save_progress("[airgap] enabled - only provider 'local' is allowed.")
         self._telemetry = self._build_telemetry()
         return phantom.APP_SUCCESS
 
@@ -128,6 +143,17 @@ class SoarAgentRuntimeConnector(BaseConnector):
             self.save_progress(f"Warning: {name} must be numeric, got {value!r}.")
             return None
 
+    def _cfg_number(self, name: str, default, cast):
+        """Read a numeric asset field; empty = default, invalid = default + warning."""
+        raw = self._config.get(name)
+        if raw is None or raw == "":
+            return default
+        try:
+            return cast(raw)
+        except (ValueError, TypeError):
+            self.save_progress(f"Warning: asset field {name} must be numeric, got {raw!r}. Using {default}.")
+            return default
+
     @staticmethod
     def _valid_id(value: str) -> bool:
         """Open item #5: validate identifiers used as Custom-List keys."""
@@ -137,35 +163,56 @@ class SoarAgentRuntimeConnector(BaseConnector):
     # LLM Provider Factory
     # -----------------------------------------------------------------------
 
+    def _llm_kwargs(self) -> dict:
+        """RT-A03: bounds from the asset, applied to every provider."""
+        return {
+            "timeout_s": self._llm_timeout_s,
+            "temperature": self._llm_temperature,
+            "max_tokens": self._llm_max_tokens,
+            "seed": self._llm_seed,
+        }
+
     def _build_llm_provider(self, provider: str, model: str) -> LLMProvider:
-        provider = provider.lower()
+        provider = (provider or "").lower()
+        # RT-A01/RT-A02: in Air-Gap mode no cloud provider may be constructed,
+        # whatever the source of the value (agent definition, asset default,
+        # DEV fallback definition). Fail closed before any network call.
+        if self._airgap_mode and provider != "local":
+            raise ValueError(
+                f"airgap_mode: provider '{provider}' is not allowed, only 'local'; "
+                "set provider=local in the agent definition or default_provider=local in the asset."
+            )
         if provider == "anthropic":
             return LLMProvider(
                 provider="anthropic",
                 api_key=self._config.get("anthropic_api_key", ""),
                 api_url=self._config.get("anthropic_api_url", "https://api.anthropic.com"),
-                model=model or "claude-haiku-4-5-20251001"
+                model=model or "claude-haiku-4-5-20251001",
+                **self._llm_kwargs(),
             )
         elif provider == "openai":
             return LLMProvider(
                 provider="openai",
                 api_key=self._config.get("openai_api_key", ""),
                 api_url=self._config.get("openai_api_url", "https://api.openai.com/v1"),
-                model=model or "gpt-4o-mini"
+                model=model or "gpt-4o-mini",
+                **self._llm_kwargs(),
             )
         elif provider == "gemini":
             return LLMProvider(
                 provider="gemini",
                 api_key=self._config.get("gemini_api_key", ""),
                 api_url="",
-                model=model or "gemini-2.0-flash"
+                model=model or "gemini-2.0-flash",
+                **self._llm_kwargs(),
             )
         elif provider == "local":
             return LLMProvider(
                 provider="local",
                 api_key=self._config.get("local_llm_api_key", "ollama"),
                 api_url=self._config.get("local_llm_url", "http://localhost:11434/v1"),
-                model=model or "llama3"
+                model=model or "llama3",
+                **self._llm_kwargs(),
             )
         else:
             raise ValueError(f"Unknown provider: {provider}. Use: anthropic | openai | gemini | local")
@@ -249,7 +296,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
             max_steps = MAX_STEPS_HARD_LIMIT
 
         # Build LLM provider
-        provider = agent_def.get("provider", self._default_provider)
+        provider = agent_def.get("provider") or self._default_provider
         model = agent_def.get("model", "")
         self.save_progress(f"Provider: {provider} / {model}")
         try:
