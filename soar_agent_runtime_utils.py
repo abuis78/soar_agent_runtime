@@ -102,6 +102,10 @@ _MAX_OBSERVATION_LEN = 8000
 _MAX_TASK_LEN = 4000
 _MAX_CONTEXT_LEN = 4000
 
+# RT-P05 (strict parser): observation returned to the model instead of
+# executing a tool with silently-emptied parameters.
+_PARAMS_PARSE_ERROR = "ERROR: PARAMS is not valid JSON object. Fix the PARAMS line and retry."
+
 # Exception scrubbing (open item #2: secret leakage via tracebacks). Patterns
 # that may carry credentials must never be echoed back into the LLM context or
 # action results.
@@ -699,11 +703,18 @@ class ReActLoop:
                               or "No extra context provided."
         )
 
-    def _parse_response(self, text: str) -> tuple[str | None, dict, str, str | None]:
+    def _parse_response(self, text: str) -> tuple[str | None, dict, str, str | None, str | None]:
+        """Parse one model turn into (tool_name, params, thought, final_answer, parse_error).
+
+        RT-P05 (strict parser): a PARAMS line that is present but not a JSON
+        object yields ``parse_error`` and must not be executed. A missing
+        PARAMS line is fine and means ``{}`` (parameterless tools).
+        """
         thought      = ""
         tool_name: str | None = None
         params: dict = {}
         final_answer: str | None = None
+        parse_error: str | None = None
 
         lines = text.strip().split("\n")
         i = 0
@@ -722,16 +733,21 @@ class ReActLoop:
                         params_str += "\n" + lines[j]
                         j += 1
                     try:
-                        params = json.loads(params_str)
+                        parsed = json.loads(params_str)
                     except Exception:
+                        parsed = None
+                    if isinstance(parsed, dict):
+                        params = parsed
+                    else:
                         params = {}
+                        parse_error = _PARAMS_PARSE_ERROR
                 case ["FINAL_ANSWER", rest]:
                     tail = "\n".join(lines[i:])
                     final_answer = tail.removeprefix("FINAL_ANSWER:").strip()
                     break
             i += 1
 
-        return tool_name, params, thought, final_answer
+        return tool_name, params, thought, final_answer, parse_error
 
     def run(self, task: str) -> dict:
         self.connector.save_progress(f"Agent '{self.agent_id}' starting: {task[:80]}...")
@@ -753,7 +769,7 @@ class ReActLoop:
                 return self._error_result(
                     f"LLM call failed at step {steps_taken}: {_scrub_exc(e)}", steps_taken)
 
-            tool_name, params, thought, final_answer = self._parse_response(response_text)
+            tool_name, params, thought, final_answer, parse_error = self._parse_response(response_text)
             step_entry: dict = {
                 "step":        steps_taken,
                 "thought":     thought,
@@ -767,6 +783,18 @@ class ReActLoop:
                 self.step_log.append(step_entry)
                 self.connector.save_progress(f"Agent '{self.agent_id}' done in {steps_taken} steps.")
                 break
+
+            if parse_error:
+                # RT-P05: never execute a tool on malformed PARAMS; hand the
+                # error back to the model as the observation for this step.
+                step_entry["action"] = tool_name or "INVALID"
+                step_entry["observation"] = parse_error
+                self.step_log.append(step_entry)
+                messages += [
+                    {"role": "assistant", "content": response_text},
+                    {"role": "user",      "content": f"OBSERVATION: {parse_error}"}
+                ]
+                continue
 
             if tool_name:
                 observation = self.tools.execute(tool_name, params)
