@@ -192,6 +192,13 @@
             "required": false,
             "default": 8000,
             "order": 21
+        },
+        "audit_enabled": {
+            "description": "Write one audit artifact (label agent_audit) per agent step to the case (RT-P02). Always on and fail-closed in airgap_mode.",
+            "data_type": "boolean",
+            "required": false,
+            "default": false,
+            "order": 22
         }
     },
     "actions": [
