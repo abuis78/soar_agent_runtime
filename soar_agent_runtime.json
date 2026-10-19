@@ -6,7 +6,7 @@
     "package_name": "phantom_soar_agent_runtime",
     "type": "generic",
     "license": "Copyright 2026 Andreas Buis",
-    "app_version": "1.3.0",
+    "app_version": "1.4.0",
     "product_vendor": "OpenClaw SOC",
     "product_name": "SOAR Agent Runtime",
     "product_version_regex": ".*",
@@ -36,6 +36,12 @@
             },
             {
                 "module": "google-generativeai==0.8.5"
+            }
+        ],
+        "wheel": [
+            {
+                "module": "ai_soc_telemetry",
+                "input_file": "wheels/py3/ai_soc_telemetry-0.1.0-py3-none-any.whl"
             }
         ]
     },
@@ -106,12 +112,45 @@
             "default": "agent_definitions",
             "order": 9
         },
+        "telemetry_enabled": {
+            "description": "Send agent_action telemetry events to Splunk HEC (AI-SOC Telemetry). Off by default; agent behaviour is unaffected either way.",
+            "data_type": "boolean",
+            "required": false,
+            "default": false,
+            "order": 10
+        },
+        "hec_url": {
+            "description": "Splunk HEC event endpoint, e.g. https://splunk.example.com:8088/services/collector/event",
+            "data_type": "string",
+            "required": false,
+            "order": 11
+        },
+        "hec_token": {
+            "description": "Splunk HEC token, scoped to the ai_soc_audit index",
+            "data_type": "password",
+            "required": false,
+            "order": 12
+        },
+        "telemetry_index": {
+            "description": "Splunk index for telemetry events",
+            "data_type": "string",
+            "required": false,
+            "default": "ai_soc_audit",
+            "order": 13
+        },
+        "telemetry_verify_tls": {
+            "description": "Verify the HEC TLS certificate. Disable only for a self-signed test instance.",
+            "data_type": "boolean",
+            "required": false,
+            "default": true,
+            "order": 14
+        },
         "skill_list_name": {
             "description": "SOAR Custom List name containing skill definitions",
             "data_type": "string",
             "required": false,
             "default": "agent_skills",
-            "order": 10
+            "order": 15
         }
     },
     "actions": [
@@ -255,6 +294,19 @@
                     "required": false,
                     "default": "",
                     "order": 6
+                },
+                "agent_role": {
+                    "description": "Role this agent plays. Groups the Agent Precision panel in AI-SOC Telemetry, so use the fixed values only.",
+                    "data_type": "string",
+                    "required": false,
+                    "default": "generic",
+                    "value_list": [
+                        "triage",
+                        "enrichment",
+                        "response",
+                        "generic"
+                    ],
+                    "order": 7
                 }
             },
             "output": [
@@ -316,6 +368,12 @@
                     "data_type": "string",
                     "column_name": "Skills",
                     "column_order": 5
+                },
+                {
+                    "data_path": "action_result.data.*.agent_role",
+                    "data_type": "string",
+                    "column_name": "Role",
+                    "column_order": 6
                 }
             ],
             "versions": "EQ(*)"

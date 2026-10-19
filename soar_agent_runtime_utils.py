@@ -27,6 +27,44 @@ try:
 except ImportError:
     HAS_GEMINI = False
 
+try:
+    from ai_soc_telemetry import events as telemetry_events
+    HAS_TELEMETRY = True
+except ImportError:
+    HAS_TELEMETRY = False
+
+
+# ---------------------------------------------------------------------------
+# Telemetry: agent_action events (AI-SOC Telemetry)
+# ---------------------------------------------------------------------------
+
+AGENT_ROLES: tuple[str, ...] = ("triage", "enrichment", "response", "generic")
+DEFAULT_AGENT_ROLE = "generic"
+
+# Only tools that represent a real agent DECISION are reported as agent_action.
+# Enrichment and documentation tools (splunk_search, get_container_info,
+# add_note) are deliberately excluded: an analyst never "overrides" a search, so
+# counting them would inflate the Agent-Precision denominator and drive the KPI
+# toward a meaningless 100%. Map tool -> action category; add response tools here
+# as they are implemented.
+_ACTION_TELEMETRY: dict[str, str] = {
+    "update_severity": "Triage",
+}
+
+
+def _outcome_from_result(result: str) -> str:
+    """Derive an OCSF outcome from a tool's return string.
+
+    Tools return plain strings rather than structured results, so the outcome has
+    to be read off the text. Isolated here so that introducing a Result object
+    later only touches this function.
+    """
+    if "is not in the allowed tools list" in result:
+        return "blocked"
+    if result.startswith(("ERROR", "Failed")):
+        return "failed"
+    return "success"
+
 
 # ---------------------------------------------------------------------------
 # Security constants
@@ -256,10 +294,21 @@ class ToolRegistry:
         }
     }
 
-    def __init__(self, connector, container_id: int, allowed_tools: list[str]) -> None:
+    def __init__(
+        self,
+        connector,
+        container_id: int,
+        allowed_tools: list[str],
+        telemetry=None,
+        agent_id: str = "",
+        agent_role: str = DEFAULT_AGENT_ROLE,
+    ) -> None:
         self.connector = connector
         self.container_id = container_id
         self.allowed_tools = allowed_tools
+        self.telemetry = telemetry
+        self.agent_id = agent_id
+        self.agent_role = agent_role if agent_role in AGENT_ROLES else DEFAULT_AGENT_ROLE
 
     def get_tool_descriptions(self) -> str:
         lines = []
@@ -271,13 +320,44 @@ class ToolRegistry:
 
     def execute(self, tool_name: str, params: dict) -> str:
         if tool_name not in self.allowed_tools:
-            return f"ERROR: Tool '{tool_name}' is not in the allowed tools list."
+            result = f"ERROR: Tool '{tool_name}' is not in the allowed tools list."
+            self._emit_action(tool_name, result)
+            return result
         if not (handler := getattr(self, f"_tool_{tool_name}", None)):
             return f"ERROR: Tool '{tool_name}' is registered but not implemented."
         try:
-            return handler(params)
+            result = handler(params)
         except Exception as e:
-            return f"ERROR executing {tool_name}: {_scrub_exc(e)}"
+            result = f"ERROR executing {tool_name}: {_scrub_exc(e)}"
+        self._emit_action(tool_name, result)
+        return result
+
+    def _emit_action(self, tool_name: str, result: str) -> None:
+        """Report a decision-type tool call as an agent_action telemetry event.
+
+        Fail-open by contract: telemetry must never block, alter, or fail an
+        agent action, so every failure path here is swallowed.
+        """
+        category = _ACTION_TELEMETRY.get(tool_name)
+        if not category or not self.telemetry or not HAS_TELEMETRY:
+            return
+        try:
+            self.telemetry.emit(telemetry_events.agent_action(
+                agent={"agent_id": self.agent_id, "agent_role": self.agent_role},
+                case_id=str(self.container_id),
+                category=category,
+                tool=tool_name,
+                target=f"container:{self.container_id}",
+                outcome=_outcome_from_result(result),
+                # Overrides are not knowable at emit time — see handoff §5.1.
+                # Precision is NOT valid until the SPL-join lands.
+                analyst_override=False,
+            ))
+        except Exception as e:
+            try:
+                self.connector.save_progress(f"[telemetry] emit skipped: {type(e).__name__}")
+            except Exception:
+                pass
 
     def _tool_splunk_search(self, params: dict) -> str:
         spl      = params.get("spl_query", "")
