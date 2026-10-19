@@ -20,6 +20,7 @@ from soar_agent_runtime_utils import (
     DEFAULT_AGENT_ROLE,
     MAX_STEPS_HARD_LIMIT,
 )
+from soar_agent_runtime_audit import ArtifactAuditSink, NullAuditSink, definition_version
 
 try:
     from ai_soc_telemetry import TelemetryClient
@@ -43,6 +44,14 @@ class SoarAgentRuntimeConnector(BaseConnector):
         self._skill_list_name = "agent_skills"
         self._default_provider = "anthropic"
         self._telemetry = None
+        # RT-A01/RT-A03 (Umsetzungskonzept 1.3): Air-Gap profile and model bounds
+        self._airgap_mode = False
+        self._llm_timeout_s = 120.0
+        self._llm_temperature = 0.0
+        self._llm_max_tokens = 4096
+        self._llm_seed = None
+        self._max_observation_chars = 8000
+        self._audit_enabled = False
 
     def initialize(self):
         self._config = self.get_config()
@@ -51,6 +60,15 @@ class SoarAgentRuntimeConnector(BaseConnector):
         self._agent_list_name = self._config.get("agent_list_name", "agent_definitions")
         self._skill_list_name = self._config.get("skill_list_name", "agent_skills")
         self._default_provider = self._config.get("default_provider", "anthropic")
+        self._airgap_mode = bool(self._config.get("airgap_mode", False))
+        self._llm_timeout_s = self._cfg_number("llm_timeout_s", 120.0, float)
+        self._llm_temperature = self._cfg_number("llm_temperature", 0.0, float)
+        self._llm_max_tokens = self._cfg_number("llm_max_tokens", 4096, int)
+        self._llm_seed = self._cfg_number("llm_seed", None, int)
+        self._max_observation_chars = self._cfg_number("max_observation_chars", 8000, int)
+        self._audit_enabled = bool(self._config.get("audit_enabled", False))
+        if self._airgap_mode:
+            self.save_progress("[airgap] enabled - only provider 'local' is allowed.")
         self._telemetry = self._build_telemetry()
         return phantom.APP_SUCCESS
 
@@ -128,6 +146,17 @@ class SoarAgentRuntimeConnector(BaseConnector):
             self.save_progress(f"Warning: {name} must be numeric, got {value!r}.")
             return None
 
+    def _cfg_number(self, name: str, default, cast):
+        """Read a numeric asset field; empty = default, invalid = default + warning."""
+        raw = self._config.get(name)
+        if raw is None or raw == "":
+            return default
+        try:
+            return cast(raw)
+        except (ValueError, TypeError):
+            self.save_progress(f"Warning: asset field {name} must be numeric, got {raw!r}. Using {default}.")
+            return default
+
     @staticmethod
     def _valid_id(value: str) -> bool:
         """Open item #5: validate identifiers used as Custom-List keys."""
@@ -137,35 +166,56 @@ class SoarAgentRuntimeConnector(BaseConnector):
     # LLM Provider Factory
     # -----------------------------------------------------------------------
 
+    def _llm_kwargs(self) -> dict:
+        """RT-A03: bounds from the asset, applied to every provider."""
+        return {
+            "timeout_s": self._llm_timeout_s,
+            "temperature": self._llm_temperature,
+            "max_tokens": self._llm_max_tokens,
+            "seed": self._llm_seed,
+        }
+
     def _build_llm_provider(self, provider: str, model: str) -> LLMProvider:
-        provider = provider.lower()
+        provider = (provider or "").lower()
+        # RT-A01/RT-A02: in Air-Gap mode no cloud provider may be constructed,
+        # whatever the source of the value (agent definition, asset default,
+        # DEV fallback definition). Fail closed before any network call.
+        if self._airgap_mode and provider != "local":
+            raise ValueError(
+                f"airgap_mode: provider '{provider}' is not allowed, only 'local'; "
+                "set provider=local in the agent definition or default_provider=local in the asset."
+            )
         if provider == "anthropic":
             return LLMProvider(
                 provider="anthropic",
                 api_key=self._config.get("anthropic_api_key", ""),
                 api_url=self._config.get("anthropic_api_url", "https://api.anthropic.com"),
-                model=model or "claude-haiku-4-5-20251001"
+                model=model or "claude-haiku-4-5-20251001",
+                **self._llm_kwargs(),
             )
         elif provider == "openai":
             return LLMProvider(
                 provider="openai",
                 api_key=self._config.get("openai_api_key", ""),
                 api_url=self._config.get("openai_api_url", "https://api.openai.com/v1"),
-                model=model or "gpt-4o-mini"
+                model=model or "gpt-4o-mini",
+                **self._llm_kwargs(),
             )
         elif provider == "gemini":
             return LLMProvider(
                 provider="gemini",
                 api_key=self._config.get("gemini_api_key", ""),
                 api_url="",
-                model=model or "gemini-2.0-flash"
+                model=model or "gemini-2.0-flash",
+                **self._llm_kwargs(),
             )
         elif provider == "local":
             return LLMProvider(
                 provider="local",
                 api_key=self._config.get("local_llm_api_key", "ollama"),
                 api_url=self._config.get("local_llm_url", "http://localhost:11434/v1"),
-                model=model or "llama3"
+                model=model or "llama3",
+                **self._llm_kwargs(),
             )
         else:
             raise ValueError(f"Unknown provider: {provider}. Use: anthropic | openai | gemini | local")
@@ -176,7 +226,8 @@ class SoarAgentRuntimeConnector(BaseConnector):
 
     def _handle_test_connectivity(self, param):
         action_result = self.add_action_result(ActionResult(dict(param)))
-        self.save_progress("Testing LLM provider connectivity...")
+        mode = "airgap" if self._airgap_mode else "normal"
+        self.save_progress(f"Testing LLM provider connectivity ({mode} mode)...")
         results = {}
         providers = [
             ("anthropic", "claude-haiku-4-5-20251001"),
@@ -186,6 +237,11 @@ class SoarAgentRuntimeConnector(BaseConnector):
         ]
         any_success = False
         for provider_name, default_model in providers:
+            # RT-A04 / AC-01: in Air-Gap mode no cloud endpoint is contacted,
+            # not even by the test action. Only 'local' is exercised.
+            if self._airgap_mode and provider_name != "local":
+                results[provider_name] = "SKIPPED (airgap_mode)"
+                continue
             key_field = f"{provider_name}_api_key" if provider_name != "local" else "local_llm_api_key"
             url_field = f"{provider_name}_api_url" if provider_name != "local" else "local_llm_url"
             has_config = bool(self._config.get(key_field) or self._config.get(url_field))
@@ -203,8 +259,10 @@ class SoarAgentRuntimeConnector(BaseConnector):
                 results[provider_name] = f"ERROR: {str(e)}"
 
         if any_success:
-            return action_result.set_status(phantom.APP_SUCCESS, f"Connectivity OK. Results: {json.dumps(results)}")
-        return action_result.set_status(phantom.APP_ERROR, f"All providers failed. Results: {json.dumps(results)}")
+            return action_result.set_status(
+                phantom.APP_SUCCESS, f"Connectivity OK ({mode}). Results: {json.dumps(results)}")
+        return action_result.set_status(
+            phantom.APP_ERROR, f"All providers failed ({mode}). Results: {json.dumps(results)}")
 
     # -----------------------------------------------------------------------
     # Action: run agent
@@ -249,7 +307,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
             max_steps = MAX_STEPS_HARD_LIMIT
 
         # Build LLM provider
-        provider = agent_def.get("provider", self._default_provider)
+        provider = agent_def.get("provider") or self._default_provider
         model = agent_def.get("model", "")
         self.save_progress(f"Provider: {provider} / {model}")
         try:
@@ -277,12 +335,26 @@ class SoarAgentRuntimeConnector(BaseConnector):
         if isinstance(skill_ids, str):
             skill_ids = [s.strip() for s in skill_ids.split(",") if s.strip()]
         skill_injection = ""
+        required_keys: list[str] = []
         if skill_ids:
             self.save_progress(f"Loading skills: {skill_ids}")
             skill_store = SkillStore(self, self._skill_list_name)
             loaded_skills = skill_store.load_many(skill_ids)
             skill_injection = SkillStore.build_injection(loaded_skills)
+            # RT-P04 (E3): a skill's output_schema template is a required
+            # top-level key set for FINAL_ANSWER.
+            for skill in loaded_skills:
+                schema = skill.get("output_schema")
+                if isinstance(schema, dict):
+                    required_keys += [k for k in schema if k not in required_keys]
             self.save_progress(f"Injected {len(loaded_skills)} skill(s).")
+
+        # Audit sink (RT-P02/P03, E2): artifact per step; mandatory and
+        # fail-closed in airgap_mode, optional and fail-open otherwise.
+        if self._airgap_mode or self._audit_enabled:
+            audit = ArtifactAuditSink(self, container_id, fail_closed=self._airgap_mode)
+        else:
+            audit = NullAuditSink()
 
         # Run ReAct loop
         system_prompt = agent_def.get("system_prompt", "You are a SOC analyst agent.")
@@ -295,9 +367,15 @@ class SoarAgentRuntimeConnector(BaseConnector):
             max_steps=max_steps,
             container_id=container_id,
             extra_context=extra_context_str,
-            skill_injection=skill_injection
+            skill_injection=skill_injection,
+            audit=audit,
+            def_version=definition_version(agent_def),
+            strict_schema=self._airgap_mode,
+            required_keys=required_keys,
+            max_observation_chars=self._max_observation_chars,
         )
         result = loop.run(task)
+        audit.flush()
         action_result.add_data(result)
 
         # Add summary note
@@ -307,14 +385,21 @@ class SoarAgentRuntimeConnector(BaseConnector):
                 container=container_id,
                 note_type="general",
                 title=f"[Agent: {agent_id}] {task[:60]}",
-                content=f"**Final Answer:**\n{result['final_answer']}\n\n**Steps:** {result['steps_taken']} | **Provider:** {result['provider']} / {result['model']}"
+                content=(
+                    f"**Final Answer:**\n{result['final_answer']}\n\n"
+                    f"**Steps:** {result['steps_taken']} | **Provider:** {result['provider']} / {result['model']} "
+                    f"| **lauf_id:** {result['lauf_id']}"
+                )
             )
         except Exception:
             pass
 
         action_result.update_summary({
             "agent_id": agent_id,
+            "lauf_id": result["lauf_id"],
             "steps_taken": result["steps_taken"],
+            "audit_ereignisse": result["audit_ereignisse"],
+            "audit_fehler": result["audit_fehler"],
             "provider": result["provider"],
             "model": result["model"]
         })
