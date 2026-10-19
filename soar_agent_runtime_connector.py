@@ -380,6 +380,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
             agent_role=agent_def.get("agent_role", DEFAULT_AGENT_ROLE),
             broker=broker,
             run_id=run_id,
+            airgap=self._airgap_mode,
         )
         tools.load_broker_tools()  # RT-L03: templates once per run
         if tools.halted:
@@ -496,7 +497,8 @@ class SoarAgentRuntimeConnector(BaseConnector):
             "provider": param.get("provider", self._default_provider),
             "model": param.get("model", ""),
             "system_prompt": param.get("system_prompt", ""),
-            "allowed_tools": param.get("allowed_tools", "splunk_search,add_note"),
+            # RT-L02 / B2: no free-form SPL by default; the same default lives in app.json
+            "allowed_tools": param.get("allowed_tools") or "add_note",
             "max_steps": int(param.get("max_steps", 0)) or self._default_max_steps,
             "skills": skills,
             "agent_role": agent_role

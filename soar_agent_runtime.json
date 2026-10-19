@@ -496,10 +496,10 @@
                     "order": 3
                 },
                 "allowed_tools": {
-                    "description": "Comma-separated list of allowed tools (e.g. splunk_search,add_note,update_severity)",
+                    "description": "Comma-separated list of allowed tools: add_note, update_severity, get_container_info, run_sub_agent, splunk_search (deprecated; disabled in airgap_mode, use Tool Broker templates via broker_invoke instead). Default: add_note",
                     "data_type": "string",
                     "required": false,
-                    "default": "splunk_search,add_note",
+                    "default": "add_note",
                     "order": 4
                 },
                 "max_steps": {

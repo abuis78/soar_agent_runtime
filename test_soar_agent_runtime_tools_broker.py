@@ -267,3 +267,33 @@ def test_data_gap_lets_the_run_continue_with_a_gap_observation():
     result = loop.run("t")
     assert "BROKER UNAVAILABLE code=UNREACHABLE" in llm.seen[1][-1]["content"]
     assert result["urteil"]["datenlage"] == "teilweise" and result["steps_taken"] == 2
+
+
+# --- splunk_search off in airgap, deprecated outside (RT-L02, sub-change 2.4) -
+
+def test_airgap_removes_splunk_search_from_prompt_and_execution():
+    reg = registry(allowed=("splunk_search", "add_note"), airgap=True)
+    assert reg.allowed_tools == ["add_note"]
+    assert "splunk_search" not in reg.get_tool_descriptions()
+    obs = reg.execute("splunk_search", {"spl_query": "index=main"})
+    assert obs == "ERROR: Tool 'splunk_search' is disabled in airgap_mode; read data via broker_invoke templates."
+    assert any("[airgap] 'splunk_search' removed from allowed tools" in m for m in reg._progress)
+
+
+def test_airgap_prompt_with_broker_has_templates_but_no_spl_tool():
+    reg = registry(FakeBroker(), allowed=("splunk_search", "add_note"), airgap=True)
+    reg.load_broker_tools()
+    desc = reg.get_tool_descriptions()
+    assert "splunk_search" not in desc and "broker_invoke" in desc and "cve_offen_auf_assets" in desc
+
+
+def test_outside_airgap_splunk_search_is_marked_deprecated_but_callable(monkeypatch):
+    import sys
+    import types as _t
+    rules = _t.ModuleType("phantom.rules")
+    rules.run_query = lambda **kw: [{"host": "a"}]
+    monkeypatch.setitem(sys.modules, "phantom.rules", rules)
+    reg = registry(allowed=("splunk_search", "add_note"))
+    assert "- splunk_search(" in reg.get_tool_descriptions()
+    assert "(deprecated: prefer broker_invoke templates)" in reg.get_tool_descriptions()
+    assert reg.execute("splunk_search", {"spl_query": "index=main"}).startswith("SPL results (1 rows)")

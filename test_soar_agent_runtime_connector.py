@@ -490,3 +490,43 @@ def test_without_broker_url_registry_has_no_broker(monkeypatch):
     c = make_connector(airgap_mode=True)
     c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 7})
     assert seen["tools"].broker is None and seen["tools"].broker_status == ""
+
+
+# --- create agent default tools (RT-L02, sub-change 2.4) ---------------------
+
+def test_create_agent_defaults_to_add_note_only(monkeypatch):
+    saved = {}
+
+    class Store:
+        def __init__(self, *a, **kw):
+            pass
+
+        def save(self, agent_id, config):
+            saved[agent_id] = config
+            return True
+
+    monkeypatch.setattr(connector_module, "AgentDefinitionStore", Store)
+    c = make_connector()
+    assert c._handle_create_agent({"agent_id": "a1"}) is True
+    assert saved["a1"]["allowed_tools"] == "add_note"
+    c._handle_create_agent({"agent_id": "a2", "allowed_tools": ""})
+    assert saved["a2"]["allowed_tools"] == "add_note"
+    c._handle_create_agent({"agent_id": "a3", "allowed_tools": "splunk_search,add_note"})
+    assert saved["a3"]["allowed_tools"] == "splunk_search,add_note"  # explicit choice is kept
+
+
+def test_app_json_create_agent_default_has_no_spl():
+    with open("soar_agent_runtime.json") as f:
+        app = json.load(f)
+    par = next(a for a in app["actions"] if a["action"] == "create agent")["parameters"]["allowed_tools"]
+    assert par["default"] == "add_note"
+    assert "deprecated" in par["description"] and "airgap_mode" in par["description"]
+
+
+def test_run_agent_passes_airgap_flag_to_registry(monkeypatch):
+    seen = _capture_loop(monkeypatch)
+    make_connector(airgap_mode=True)._handle_run_agent({"agent_id": "t", "task": "x", "container_id": 1})
+    assert seen["tools"].airgap is True
+    seen.clear()
+    make_connector()._handle_run_agent({"agent_id": "t", "task": "x", "container_id": 1})
+    assert seen["tools"].airgap is False

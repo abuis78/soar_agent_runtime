@@ -442,6 +442,8 @@ class ToolRegistry:
     }
 
     BROKER_TOOL = "broker_invoke"
+    LEGACY_SPL_TOOL = "splunk_search"
+    DEPRECATED_NOTE = " (deprecated: prefer broker_invoke templates)"
     # Broker codes that mean "data gap, no other access path" (RT-L06).
     BROKER_GAP_CODES = frozenset({"UNREACHABLE", "TIMEOUT", "BAD_RESPONSE", "SOURCE_ERROR",
                                   "CATALOG_UNAVAILABLE", "AUDIT_UNAVAILABLE"})
@@ -456,9 +458,17 @@ class ToolRegistry:
         agent_role: str = DEFAULT_AGENT_ROLE,
         broker=None,
         run_id: str = "",
+        airgap: bool = False,
     ) -> None:
         self.connector = connector
         self.container_id = container_id
+        self.airgap = bool(airgap)
+        # RT-L02: free-form SPL does not exist in airgap_mode - not in the
+        # prompt, not callable. Outside airgap it stays, marked deprecated.
+        if self.airgap and self.LEGACY_SPL_TOOL in allowed_tools:
+            allowed_tools = [t for t in allowed_tools if t != self.LEGACY_SPL_TOOL]
+            connector.save_progress(
+                f"[airgap] '{self.LEGACY_SPL_TOOL}' removed from allowed tools - use broker_invoke templates.")
         self.allowed_tools = allowed_tools
         self.telemetry = telemetry
         self.agent_id = agent_id
@@ -561,13 +571,17 @@ class ToolRegistry:
                 continue  # described from the broker catalogue below, never statically
             if defn := self.TOOL_DEFINITIONS.get(name):
                 params = ", ".join(f"{k}: {v}" for k, v in defn["parameters"].items())
-                lines.append(f"- {name}({params}): {defn['description']}")
+                note = self.DEPRECATED_NOTE if name == self.LEGACY_SPL_TOOL else ""
+                lines.append(f"- {name}({params}): {defn['description']}{note}")
         if block := self._broker_prompt_block():
             lines.append(block)
         return "\n".join(lines)
 
     def execute(self, tool_name: str, params: dict) -> str:
         self.last_call_id = ""
+        if self.airgap and tool_name == self.LEGACY_SPL_TOOL:
+            return (f"ERROR: Tool '{self.LEGACY_SPL_TOOL}' is disabled in airgap_mode; "
+                    "read data via broker_invoke templates.")
         if not self._is_allowed(tool_name):
             result = f"ERROR: Tool '{tool_name}' is not in the allowed tools list."
             self._emit_action(tool_name, result)
