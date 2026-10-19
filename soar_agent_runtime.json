@@ -10,8 +10,8 @@
     "product_vendor": "OpenClaw SOC",
     "product_name": "SOAR Agent Runtime",
     "product_version_regex": ".*",
-    "min_phantom_version": "6.3.0",
-    "python_version": "3",
+    "min_phantom_version": "7.0.0",
+    "python_version": "3.13",
     "main_module": "soar_agent_runtime_connector.py",
     "logo": "soar_agent_runtime.svg",
     "logo_dark": "soar_agent_runtime_dark.svg",
@@ -23,24 +23,166 @@
             "name": "Created with Claude, model claude-sonnet-4-6"
         }
     ],
-    "pip3_dependencies": {
-        "pypi": [
-            {
-                "module": "requests==2.32.3"
-            },
-            {
-                "module": "openai==1.82.0"
-            },
-            {
-                "module": "anthropic==0.52.0"
-            },
-            {
-                "module": "google-generativeai==0.8.5"
-            }
-        ],
+    "pip313_dependencies": {
         "wheel": [
             {
-                "module": "ai_soc_telemetry",
+                "module": "annotated-types",
+                "input_file": "wheels/py313/annotated_types-0.8.0-py3-none-any.whl"
+            },
+            {
+                "module": "anthropic",
+                "input_file": "wheels/py313/anthropic-0.52.0-py3-none-any.whl"
+            },
+            {
+                "module": "anyio",
+                "input_file": "wheels/py313/anyio-4.15.1-py3-none-any.whl"
+            },
+            {
+                "module": "certifi",
+                "input_file": "wheels/py313/certifi-2026.10.18-py3-none-any.whl"
+            },
+            {
+                "module": "cffi",
+                "input_file": "wheels/py313/cffi-2.1.1-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl"
+            },
+            {
+                "module": "charset-normalizer",
+                "input_file": "wheels/py313/charset_normalizer-3.5.2-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl"
+            },
+            {
+                "module": "cryptography",
+                "input_file": "wheels/py313/cryptography-50.0.2-cp311-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl"
+            },
+            {
+                "module": "distro",
+                "input_file": "wheels/py313/distro-1.9.0-py3-none-any.whl"
+            },
+            {
+                "module": "google-ai-generativelanguage",
+                "input_file": "wheels/py313/google_ai_generativelanguage-0.6.15-py3-none-any.whl"
+            },
+            {
+                "module": "google-api-core",
+                "input_file": "wheels/py313/google_api_core-2.30.3-py3-none-any.whl"
+            },
+            {
+                "module": "google-api-python-client",
+                "input_file": "wheels/py313/google_api_python_client-2.201.0-py3-none-any.whl"
+            },
+            {
+                "module": "google-auth",
+                "input_file": "wheels/py313/google_auth-2.62.0-py3-none-any.whl"
+            },
+            {
+                "module": "google-auth-httplib2",
+                "input_file": "wheels/py313/google_auth_httplib2-0.4.4-py3-none-any.whl"
+            },
+            {
+                "module": "google-generativeai",
+                "input_file": "wheels/py313/google_generativeai-0.8.5-py3-none-any.whl"
+            },
+            {
+                "module": "googleapis-common-protos",
+                "input_file": "wheels/py313/googleapis_common_protos-1.75.0-py3-none-any.whl"
+            },
+            {
+                "module": "grpcio",
+                "input_file": "wheels/py313/grpcio-1.84.0-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl"
+            },
+            {
+                "module": "grpcio-status",
+                "input_file": "wheels/py313/grpcio_status-1.71.2-py3-none-any.whl"
+            },
+            {
+                "module": "h11",
+                "input_file": "wheels/py313/h11-0.16.0-py3-none-any.whl"
+            },
+            {
+                "module": "httpcore",
+                "input_file": "wheels/py313/httpcore-1.0.9-py3-none-any.whl"
+            },
+            {
+                "module": "httplib2",
+                "input_file": "wheels/py313/httplib2-0.32.0-py3-none-any.whl"
+            },
+            {
+                "module": "httpx",
+                "input_file": "wheels/py313/httpx-0.28.1-py3-none-any.whl"
+            },
+            {
+                "module": "idna",
+                "input_file": "wheels/py313/idna-3.20-py3-none-any.whl"
+            },
+            {
+                "module": "jiter",
+                "input_file": "wheels/py313/jiter-0.17.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+            },
+            {
+                "module": "openai",
+                "input_file": "wheels/py313/openai-1.82.0-py3-none-any.whl"
+            },
+            {
+                "module": "proto-plus",
+                "input_file": "wheels/py313/proto_plus-1.28.2-py3-none-any.whl"
+            },
+            {
+                "module": "protobuf",
+                "input_file": "wheels/py313/protobuf-5.29.6-cp38-abi3-manylinux2014_x86_64.whl"
+            },
+            {
+                "module": "pyasn1",
+                "input_file": "wheels/py313/pyasn1-0.6.4-py3-none-any.whl"
+            },
+            {
+                "module": "pyasn1-modules",
+                "input_file": "wheels/py313/pyasn1_modules-0.4.2-py3-none-any.whl"
+            },
+            {
+                "module": "pycparser",
+                "input_file": "wheels/py313/pycparser-3.11-py3-none-any.whl"
+            },
+            {
+                "module": "pydantic",
+                "input_file": "wheels/py313/pydantic-2.14.1-py3-none-any.whl"
+            },
+            {
+                "module": "pydantic-core",
+                "input_file": "wheels/py313/pydantic_core-2.50.1-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+            },
+            {
+                "module": "pyparsing",
+                "input_file": "wheels/py313/pyparsing-3.3.3-py3-none-any.whl"
+            },
+            {
+                "module": "requests",
+                "input_file": "wheels/py313/requests-2.32.3-py3-none-any.whl"
+            },
+            {
+                "module": "sniffio",
+                "input_file": "wheels/py313/sniffio-1.3.1-py3-none-any.whl"
+            },
+            {
+                "module": "tqdm",
+                "input_file": "wheels/py313/tqdm-4.70.1-py3-none-any.whl"
+            },
+            {
+                "module": "typing-extensions",
+                "input_file": "wheels/py313/typing_extensions-4.16.0-py3-none-any.whl"
+            },
+            {
+                "module": "typing-inspection",
+                "input_file": "wheels/py313/typing_inspection-0.4.4-py3-none-any.whl"
+            },
+            {
+                "module": "uritemplate",
+                "input_file": "wheels/py313/uritemplate-4.2.0-py3-none-any.whl"
+            },
+            {
+                "module": "urllib3",
+                "input_file": "wheels/py313/urllib3-2.8.0-py3-none-any.whl"
+            },
+            {
+                "module": "ai-soc-telemetry",
                 "input_file": "wheels/py3/ai_soc_telemetry-0.1.0-py3-none-any.whl"
             }
         ]
