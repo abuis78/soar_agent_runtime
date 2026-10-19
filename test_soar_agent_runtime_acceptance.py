@@ -296,7 +296,10 @@ def test_ac15_app_json_new_fields_are_optional_with_backward_compatible_defaults
     with open("soar_agent_runtime.json") as f:
         cfg = json.load(f)["configuration"]
     expected = {"airgap_mode": False, "audit_enabled": False, "max_observation_chars": 8000,
-                "llm_timeout_s": 120, "llm_temperature": 0, "llm_max_tokens": 4096}
+                "llm_timeout_s": 120, "llm_temperature": 0, "llm_max_tokens": 4096,
+                "broker_timeout_s": 30}
+    for field in ("broker_url", "broker_client_cert", "broker_client_key", "broker_ca"):
+        assert cfg[field]["required"] is False and "default" not in cfg[field], field
     for field, default in expected.items():
         assert cfg[field]["required"] is False, field
         assert cfg[field]["default"] == default, field

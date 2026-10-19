@@ -373,3 +373,42 @@ def test_run_agent_passes_max_observation_chars(monkeypatch, config, expected):
     c = make_connector(**config)
     c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 7})
     assert seen["max_observation_chars"] == expected
+
+
+# --- Tool Broker asset fields (RT-L07, sub-change 2.1) -----------------------
+
+def test_broker_fields_default_to_empty_and_30s():
+    c = make_connector()
+    assert (c._broker_url, c._broker_timeout_s, c._broker_client_cert, c._broker_client_key, c._broker_ca) == \
+        ("", 30.0, "", "", "")
+    assert not any("broker_url" in m for m in c.progress)
+
+
+def test_broker_fields_are_read_from_the_asset():
+    c = make_connector(broker_url=" https://broker.internal:8443 ", broker_timeout_s="12",
+                       broker_client_cert="/opt/phantom/etc/rt.crt", broker_client_key="/opt/phantom/etc/rt.key",
+                       broker_ca="/opt/phantom/etc/ca.pem")
+    assert c._broker_url == "https://broker.internal:8443"
+    assert c._broker_timeout_s == 12.0
+    assert (c._broker_client_cert, c._broker_client_key, c._broker_ca) == \
+        ("/opt/phantom/etc/rt.crt", "/opt/phantom/etc/rt.key", "/opt/phantom/etc/ca.pem")
+
+
+def test_airgap_without_broker_url_warns_but_still_initializes():
+    c = make_connector(airgap_mode=True)
+    assert any(m == "[airgap] broker_url not set - read tools unavailable." for m in c.progress)
+
+
+def test_airgap_with_broker_url_does_not_warn():
+    c = make_connector(airgap_mode=True, broker_url="https://broker.internal:8443")
+    assert not any("broker_url not set" in m for m in c.progress)
+
+
+def test_app_json_declares_broker_fields_in_order():
+    with open("soar_agent_runtime.json") as f:
+        app = json.load(f)
+    cfg = app["configuration"]
+    assert app["app_version"] == "1.6.0"
+    assert [cfg[k]["order"] for k in ("broker_url", "broker_timeout_s", "broker_client_cert", "broker_client_key", "broker_ca")] == [23, 24, 25, 26, 27]
+    assert cfg["broker_client_key"]["data_type"] == "string"  # a path, never the key material
+    assert len({f["order"] for f in cfg.values()}) == len(cfg)  # orders unique

@@ -6,7 +6,7 @@
     "package_name": "phantom_soar_agent_runtime",
     "type": "generic",
     "license": "Copyright 2026 Andreas Buis",
-    "app_version": "1.5.0",
+    "app_version": "1.6.0",
     "product_vendor": "OpenClaw SOC",
     "product_name": "SOAR Agent Runtime",
     "product_version_regex": ".*",
@@ -341,6 +341,37 @@
             "required": false,
             "default": false,
             "order": 22
+        },
+        "broker_url": {
+            "description": "Tool Broker base URL, https only (mTLS, RT-L07). Required in airgap_mode: read tools come from the broker.",
+            "data_type": "string",
+            "required": false,
+            "order": 23
+        },
+        "broker_timeout_s": {
+            "description": "Timeout in seconds for every Tool Broker call (RT-L07)",
+            "data_type": "numeric",
+            "required": false,
+            "default": 30,
+            "order": 24
+        },
+        "broker_client_cert": {
+            "description": "Path on the SOAR host to the client certificate (PEM) presented to the Tool Broker (mTLS)",
+            "data_type": "string",
+            "required": false,
+            "order": 25
+        },
+        "broker_client_key": {
+            "description": "Path on the SOAR host to the private key (PEM) for the client certificate; the key never leaves the host",
+            "data_type": "string",
+            "required": false,
+            "order": 26
+        },
+        "broker_ca": {
+            "description": "Path on the SOAR host to the CA bundle (PEM) that signed the Tool Broker server certificate",
+            "data_type": "string",
+            "required": false,
+            "order": 27
         }
     },
     "actions": [

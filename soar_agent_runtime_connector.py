@@ -52,6 +52,12 @@ class SoarAgentRuntimeConnector(BaseConnector):
         self._llm_seed = None
         self._max_observation_chars = 8000
         self._audit_enabled = False
+        # RT-L07 (Umsetzungskonzept 2.1): Tool Broker connection, mTLS via file paths
+        self._broker_url = ""
+        self._broker_timeout_s = 30.0
+        self._broker_client_cert = ""
+        self._broker_client_key = ""
+        self._broker_ca = ""
 
     def initialize(self):
         self._config = self.get_config()
@@ -67,8 +73,15 @@ class SoarAgentRuntimeConnector(BaseConnector):
         self._llm_seed = self._cfg_number("llm_seed", None, int)
         self._max_observation_chars = self._cfg_number("max_observation_chars", 8000, int)
         self._audit_enabled = bool(self._config.get("audit_enabled", False))
+        self._broker_url = (self._config.get("broker_url") or "").strip()
+        self._broker_timeout_s = self._cfg_number("broker_timeout_s", 30.0, float)
+        self._broker_client_cert = (self._config.get("broker_client_cert") or "").strip()
+        self._broker_client_key = (self._config.get("broker_client_key") or "").strip()
+        self._broker_ca = (self._config.get("broker_ca") or "").strip()
         if self._airgap_mode:
             self.save_progress("[airgap] enabled - only provider 'local' is allowed.")
+            if not self._broker_url:
+                self.save_progress("[airgap] broker_url not set - read tools unavailable.")
         self._telemetry = self._build_telemetry()
         return phantom.APP_SUCCESS
 
