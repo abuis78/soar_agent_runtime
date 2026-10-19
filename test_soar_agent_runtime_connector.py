@@ -412,3 +412,81 @@ def test_app_json_declares_broker_fields_in_order():
     assert [cfg[k]["order"] for k in ("broker_url", "broker_timeout_s", "broker_client_cert", "broker_client_key", "broker_ca")] == [23, 24, 25, 26, 27]
     assert cfg["broker_client_key"]["data_type"] == "string"  # a path, never the key material
     assert len({f["order"] for f in cfg.values()}) == len(cfg)  # orders unique
+
+
+# --- Tool Broker wiring (RT-L03, L06, L07, B01; sub-change 2.3b) --------------
+
+BROKER_ASSET = {"broker_url": "https://broker.internal:8443", "broker_client_cert": "/etc/rt.crt",
+                "broker_client_key": "/etc/rt.key", "broker_ca": "/etc/ca.pem"}
+TOOLS_BODY = {"katalog_version": "k1", "angehalten": False,
+              "vorlagen": [{"vorlage_id": "asset_kontext", "version": 1, "beschreibung": "Asset-Stammdaten"}]}
+
+
+def _transport(status=200, body=None, exc=None):
+    calls = []
+
+    def send(method, url, params, json_body, timeout_s):
+        calls.append((method, url, params, json_body, timeout_s))
+        if exc:
+            raise exc
+        return status, body
+
+    send.calls = calls
+    return send
+
+
+def test_airgap_with_broker_loads_templates_and_shares_run_id(monkeypatch):
+    seen = _capture_loop(monkeypatch)
+    c = make_connector(airgap_mode=True, **BROKER_ASSET)
+    c._broker_transport = _transport(body=TOOLS_BODY)
+    c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 7})
+    tools = seen["tools"]
+    assert list(tools.broker_tools) == ["asset_kontext"] and tools.broker_status == "ok"
+    assert tools.run_id == seen["run_id"] and tools.run_id.startswith("rt-")
+    assert c._broker_transport.calls[0][:3] == ("GET", "https://broker.internal:8443/v1/tools", {"agent_id": "triage"})
+    assert "asset_kontext v1" in tools.get_tool_descriptions()
+
+
+def test_airgap_with_misconfigured_broker_fails_before_the_run(monkeypatch):
+    seen = _capture_loop(monkeypatch)
+    c = make_connector(airgap_mode=True, **(BROKER_ASSET | {"broker_url": "http://broker.internal:8443"}))
+    status = c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 7})
+    assert status is False and seen == {}
+    assert c.action_results[-1].message.startswith("broker misconfigured: broker_url must be an https:// URL")
+
+
+def test_outside_airgap_misconfigured_broker_only_warns(monkeypatch):
+    seen = _capture_loop(monkeypatch)
+    c = make_connector(**(BROKER_ASSET | {"broker_client_key": ""}))
+    status = c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 7})
+    assert status is True and seen["tools"].broker is None
+    assert any(m.startswith("[broker] misconfigured, running without broker:") for m in c.progress)
+
+
+def test_halted_broker_stops_before_the_first_model_call(monkeypatch):
+    seen = _capture_loop(monkeypatch)
+    c = make_connector(airgap_mode=True, **BROKER_ASSET)
+    c._broker_transport = _transport(body=TOOLS_BODY | {"angehalten": True})
+    status = c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 7})
+    assert status is False and seen == {}
+    assert c.action_results[-1].message == "Tool Broker is HALTED - run not started (RT-B01)"
+    assert c.artifacts == []
+
+
+def test_unreachable_broker_starts_the_run_with_a_data_gap_note(monkeypatch):
+    seen = _capture_loop(monkeypatch)
+    c = make_connector(airgap_mode=True, **BROKER_ASSET)
+    c._broker_transport = _transport(exc=ConnectionError("refused"))
+    status = c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 7})
+    assert status is True
+    tools = seen["tools"]
+    assert tools.broker_status == "UNREACHABLE" and tools.broker_tools == {}
+    assert "Tool Broker: unavailable (UNREACHABLE)" in tools.get_tool_descriptions()
+    assert any("[broker] tools unavailable (UNREACHABLE)" in m for m in c.progress)
+
+
+def test_without_broker_url_registry_has_no_broker(monkeypatch):
+    seen = _capture_loop(monkeypatch)
+    c = make_connector(airgap_mode=True)
+    c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 7})
+    assert seen["tools"].broker is None and seen["tools"].broker_status == ""
