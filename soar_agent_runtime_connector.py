@@ -4,6 +4,7 @@ Main BaseConnector subclass for SOAR Agent Runtime.
 """
 
 import json
+import re
 import time
 import phantom.app as phantom
 from phantom.base_connector import BaseConnector
@@ -16,7 +17,8 @@ from soar_agent_runtime_utils import (
     SkillStore,
     ReActLoop,
     AGENT_ROLES,
-    DEFAULT_AGENT_ROLE
+    DEFAULT_AGENT_ROLE,
+    MAX_STEPS_HARD_LIMIT,
 )
 
 try:
@@ -24,6 +26,10 @@ try:
     HAS_TELEMETRY_CLIENT = True
 except ImportError:
     HAS_TELEMETRY_CLIENT = False
+
+# Open item #5: identifiers are used verbatim as SOAR Custom-List keys, so they
+# must be restricted to a safe charset to prevent list-key injection.
+_ID_RE = re.compile(r'^[A-Za-z0-9_.\-]{1,64}$')
 
 
 class SoarAgentRuntimeConnector(BaseConnector):
@@ -107,6 +113,27 @@ class SoarAgentRuntimeConnector(BaseConnector):
             pass
 
     # -----------------------------------------------------------------------
+    # Input helpers
+    # -----------------------------------------------------------------------
+
+    def _safe_int(self, value, default: int = 0, name: str = "parameter") -> int | None:
+        """Issue #6: Safe integer conversion with error reporting."""
+        try:
+            result = int(value)
+            if result < 0:
+                self.save_progress(f"Warning: {name} must be non-negative, got {result!r}. Using {default}.")
+                return default
+            return result
+        except (ValueError, TypeError):
+            self.save_progress(f"Warning: {name} must be numeric, got {value!r}.")
+            return None
+
+    @staticmethod
+    def _valid_id(value: str) -> bool:
+        """Open item #5: validate identifiers used as Custom-List keys."""
+        return bool(_ID_RE.match(value or ""))
+
+    # -----------------------------------------------------------------------
     # LLM Provider Factory
     # -----------------------------------------------------------------------
 
@@ -188,16 +215,22 @@ class SoarAgentRuntimeConnector(BaseConnector):
 
         agent_id = param.get("agent_id", "")
         task = param.get("task", "")
-        container_id = int(param.get("container_id", 0))
-        max_steps_override = int(param.get("max_steps", 0))
         extra_context_str = param.get("extra_context", "")
 
         if not agent_id:
             return action_result.set_status(phantom.APP_ERROR, "agent_id is required.")
+        if not self._valid_id(agent_id):
+            return action_result.set_status(
+                phantom.APP_ERROR, "agent_id must match [A-Za-z0-9_.-] and be 1-64 chars.")
         if not task:
             return action_result.set_status(phantom.APP_ERROR, "task is required.")
+
+        # Issue #6: safe integer conversion
+        container_id = self._safe_int(param.get("container_id", 0), name="container_id")
         if not container_id:
-            return action_result.set_status(phantom.APP_ERROR, "container_id is required.")
+            return action_result.set_status(phantom.APP_ERROR, "container_id must be a valid positive integer.")
+
+        max_steps_override = self._safe_int(param.get("max_steps", 0), name="max_steps") or 0
 
         # Load agent definition
         self.save_progress(f"Loading agent: {agent_id}")
@@ -207,10 +240,13 @@ class SoarAgentRuntimeConnector(BaseConnector):
         except ValueError as e:
             return action_result.set_status(phantom.APP_ERROR, str(e))
 
-        # Resolve max steps
+        # Resolve max steps with hard cap (Issue #4: DoS prevention)
         max_steps = max_steps_override or agent_def.get("max_steps") or self._default_max_steps
         if max_steps <= 0:
             max_steps = self._default_max_steps
+        if max_steps > MAX_STEPS_HARD_LIMIT:
+            self.save_progress(f"Warning: max_steps capped at {MAX_STEPS_HARD_LIMIT} (requested: {max_steps}).")
+            max_steps = MAX_STEPS_HARD_LIMIT
 
         # Build LLM provider
         provider = agent_def.get("provider", self._default_provider)
@@ -296,6 +332,9 @@ class SoarAgentRuntimeConnector(BaseConnector):
         agent_id = param.get("agent_id", "")
         if not agent_id:
             return action_result.set_status(phantom.APP_ERROR, "agent_id is required.")
+        if not self._valid_id(agent_id):
+            return action_result.set_status(
+                phantom.APP_ERROR, "agent_id must match [A-Za-z0-9_.-] and be 1-64 chars.")
 
         skills_raw = param.get("skills", "")
         skills = [s.strip() for s in skills_raw.split(",") if s.strip()] if skills_raw else []
@@ -362,6 +401,9 @@ class SoarAgentRuntimeConnector(BaseConnector):
         skill_id = param.get("skill_id", "")
         if not skill_id:
             return action_result.set_status(phantom.APP_ERROR, "skill_id is required.")
+        if not self._valid_id(skill_id):
+            return action_result.set_status(
+                phantom.APP_ERROR, "skill_id must match [A-Za-z0-9_.-] and be 1-64 chars.")
 
         output_schema_str = param.get("output_schema", "")
         output_schema = None

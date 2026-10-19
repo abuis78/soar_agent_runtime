@@ -26,16 +26,16 @@
     "pip3_dependencies": {
         "pypi": [
             {
-                "module": "requests"
+                "module": "requests==2.32.3"
             },
             {
-                "module": "openai"
+                "module": "openai==1.82.0"
             },
             {
-                "module": "anthropic"
+                "module": "anthropic==0.52.0"
             },
             {
-                "module": "google-generativeai"
+                "module": "google-generativeai==0.8.5"
             }
         ],
         "wheel": [
@@ -144,6 +144,13 @@
             "required": false,
             "default": true,
             "order": 14
+        },
+        "skill_list_name": {
+            "description": "SOAR Custom List name containing skill definitions",
+            "data_type": "string",
+            "required": false,
+            "default": "agent_skills",
+            "order": 15
         }
     },
     "actions": [
