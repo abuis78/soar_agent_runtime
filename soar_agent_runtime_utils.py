@@ -388,6 +388,7 @@ class ToolRegistry:
         "splunk_search": {
             "description": "Execute a Splunk SPL search query and return results",
             "wirkt": False,
+            "quelle": "builtin",
             "parameters": {
                 "spl_query": "The SPL search query to execute",
                 "earliest":  "Earliest time (default: -24h)",
@@ -397,6 +398,7 @@ class ToolRegistry:
         "add_note": {
             "description": "Add a note to the current SOAR container",
             "wirkt": False,
+            "quelle": "builtin",
             "parameters": {
                 "title":   "Note title",
                 "content": "Note content (markdown supported)"
@@ -405,6 +407,7 @@ class ToolRegistry:
         "update_severity": {
             "description": "Update the severity of the current container",
             "wirkt": True,
+            "quelle": "builtin",
             "parameters": {
                 "severity": "New severity: low | medium | high | critical"
             }
@@ -412,17 +415,36 @@ class ToolRegistry:
         "get_container_info": {
             "description": "Get metadata and artifacts of the current container",
             "wirkt": False,
+            "quelle": "builtin",
             "parameters":  {}
         },
         "run_sub_agent": {
             "description": "Invoke another agent as a sub-task and return its result",
             "wirkt": False,
+            "quelle": "builtin",
             "parameters": {
                 "agent_id": "ID of the agent to invoke",
                 "task":     "Task description for the sub-agent"
             }
+        },
+        # RT-L01: the only way to read data outside this case. Available as
+        # soon as a Tool Broker is configured and offers templates; the broker
+        # enforces the per-agent allowlist (TB-F11), the runtime adds none.
+        "broker_invoke": {
+            "description": "Run a read-only Tool Broker template (see 'Broker templates' below); the only way to read data outside this case",
+            "wirkt": False,
+            "quelle": "broker",
+            "parameters": {
+                "vorlage_id": "template id from the list below",
+                "parameter":  "JSON object with the template parameters"
+            }
         }
     }
+
+    BROKER_TOOL = "broker_invoke"
+    # Broker codes that mean "data gap, no other access path" (RT-L06).
+    BROKER_GAP_CODES = frozenset({"UNREACHABLE", "TIMEOUT", "BAD_RESPONSE", "SOURCE_ERROR",
+                                  "CATALOG_UNAVAILABLE", "AUDIT_UNAVAILABLE"})
 
     def __init__(
         self,
@@ -432,6 +454,8 @@ class ToolRegistry:
         telemetry=None,
         agent_id: str = "",
         agent_role: str = DEFAULT_AGENT_ROLE,
+        broker=None,
+        run_id: str = "",
     ) -> None:
         self.connector = connector
         self.container_id = container_id
@@ -439,6 +463,90 @@ class ToolRegistry:
         self.telemetry = telemetry
         self.agent_id = agent_id
         self.agent_role = agent_role if agent_role in AGENT_ROLES else DEFAULT_AGENT_ROLE
+        # Tool Broker (RT-L01..L06): duck-typed BrokerClient (list_tools / invoke)
+        self.broker = broker
+        self.run_id = run_id
+        self.broker_tools: dict = {}          # vorlage_id -> ToolSpec
+        self.broker_katalog_version = ""
+        self.broker_status = ""               # "" = not configured, "ok", "halted" or an error code
+        self.broker_detail = ""
+        self.evidence: set[str] = set()       # aufruf_ids of this run (RT-L04 -> RT-P06)
+        self.halted = False                   # set by a HALTED answer (RT-L05 / RT-B01)
+        self.current_step = 0
+        self.current_step_id = ""
+        self.last_call_id = ""                # aufruf_id of the most recent execute()
+
+    # -- Tool Broker ----------------------------------------------------------
+
+    def load_broker_tools(self) -> bool:
+        """Fetch the templates this agent may use (GET /v1/tools), once per run (RT-L03)."""
+        if self.broker is None:
+            return False
+        try:
+            answer = self.broker.list_tools(self.agent_id)
+        except Exception as e:  # the client should never raise; stay fail-closed anyway
+            self.broker_status, self.broker_detail = "UNREACHABLE", _scrub_exc(e)
+            self.connector.save_progress(f"[broker] tools unavailable (UNREACHABLE): {self.broker_detail}")
+            return False
+        if not answer.ok:
+            self.broker_status, self.broker_detail = answer.code or "BAD_RESPONSE", answer.detail
+            self.connector.save_progress(f"[broker] tools unavailable ({self.broker_status}): {answer.detail}")
+            return False
+        self.broker_katalog_version = answer.katalog_version
+        if answer.angehalten:
+            self.broker_status = "halted"
+            self.halted = True
+            self.connector.save_progress("[broker] HALTED - no read templates in this run.")
+            return False
+        self.broker_tools = {spec.vorlage_id: spec for spec in answer.vorlagen}
+        self.broker_status = "ok"
+        self.connector.save_progress(
+            f"[broker] {len(self.broker_tools)} template(s) available (catalog {answer.katalog_version}).")
+        return True
+
+    def set_step(self, step: int, step_id: str) -> None:
+        """Called by the loop before each tool call; forwarded as broker context (RT-L01)."""
+        self.current_step = int(step)
+        self.current_step_id = step_id
+
+    def evidence_ids(self) -> set[str]:
+        return set(self.evidence)
+
+    def _is_allowed(self, tool_name: str) -> bool:
+        if tool_name == self.BROKER_TOOL:
+            return bool(self.broker_tools)
+        return tool_name in self.allowed_tools
+
+    @staticmethod
+    def _describe_param(name: str, spec: dict) -> str:
+        bits = [str(spec.get("typ", "string"))]
+        if spec.get("muster"):
+            bits.append(f"muster {spec['muster']}")
+        if spec.get("werte"):
+            bits.append("werte " + "|".join(str(w) for w in spec["werte"]))
+        if spec.get("standard") is not None:
+            bits.append(f"standard {spec['standard']}")
+        if spec.get("max") is not None:
+            bits.append(f"max {spec['max']}")
+        bits.append("pflicht" if spec.get("pflicht", True) else "optional")
+        return f"{name} ({', '.join(bits)})"
+
+    def _broker_prompt_block(self) -> str:
+        if self.broker_tools:
+            defn = self.TOOL_DEFINITIONS[self.BROKER_TOOL]
+            params = ", ".join(f"{k}: {v}" for k, v in defn["parameters"].items())
+            lines = [f"- {self.BROKER_TOOL}({params}): {defn['description']}",
+                     f"  Broker templates (catalog {self.broker_katalog_version or 'n/a'}):"]
+            for spec in self.broker_tools.values():
+                plist = "; ".join(self._describe_param(n, p) for n, p in spec.parameter.items()) or "no parameters"
+                lines.append(f"  - {spec.vorlage_id} v{spec.version}: {spec.beschreibung}. Parameters: {plist}")
+            return "\n".join(lines)
+        if self.broker is not None and self.broker_status == "halted":
+            return "- Tool Broker: HALTED. No read templates in this run."
+        if self.broker is not None and self.broker_status not in ("", "ok"):
+            return (f"- Tool Broker: unavailable ({self.broker_status}). Read templates cannot be used in this run; "
+                    "there is no other access path. Report datenlage 'unbekannt' or 'blinder_fleck'.")
+        return ""
 
     @classmethod
     def has_effect(cls, tool_name: str) -> bool:
@@ -449,13 +557,18 @@ class ToolRegistry:
     def get_tool_descriptions(self) -> str:
         lines = []
         for name in self.allowed_tools:
+            if name == self.BROKER_TOOL:
+                continue  # described from the broker catalogue below, never statically
             if defn := self.TOOL_DEFINITIONS.get(name):
                 params = ", ".join(f"{k}: {v}" for k, v in defn["parameters"].items())
                 lines.append(f"- {name}({params}): {defn['description']}")
+        if block := self._broker_prompt_block():
+            lines.append(block)
         return "\n".join(lines)
 
     def execute(self, tool_name: str, params: dict) -> str:
-        if tool_name not in self.allowed_tools:
+        self.last_call_id = ""
+        if not self._is_allowed(tool_name):
             result = f"ERROR: Tool '{tool_name}' is not in the allowed tools list."
             self._emit_action(tool_name, result)
             return result
@@ -494,6 +607,44 @@ class ToolRegistry:
                 self.connector.save_progress(f"[telemetry] emit skipped: {type(e).__name__}")
             except Exception:
                 pass
+
+    def _tool_broker_invoke(self, params: dict) -> str:
+        """RT-L01/L04/L05/L06: run a broker template; every outcome is an observation."""
+        vorlage_id = str(params.get("vorlage_id", "") or "")
+        parameter = params.get("parameter", {})
+        if vorlage_id not in self.broker_tools:
+            known = ", ".join(sorted(self.broker_tools)) or "none"
+            return f"ERROR: unknown template '{vorlage_id}'. Available templates: {known}"
+        if parameter is None:
+            parameter = {}
+        if not isinstance(parameter, dict):
+            return "ERROR: 'parameter' must be a JSON object."
+        kontext = {
+            "agent_id": self.agent_id,
+            "lauf_id": self.run_id,
+            "container_id": self.container_id,
+            "schritt": self.current_step,
+            "schritt_id": self.current_step_id,
+        }
+        self.connector.save_progress(f"[broker] invoke {vorlage_id} (step {self.current_step})")
+        result = self.broker.invoke(vorlage_id, parameter, kontext)
+        if result.ok:
+            self.evidence.add(result.aufruf_id)
+            self.last_call_id = result.aufruf_id
+            head = (f"BROKER RESULT aufruf_id={result.aufruf_id} vorlage={result.vorlage_id} "
+                    f"v{result.vorlage_version if result.vorlage_version is not None else '?'} "
+                    f"katalog={result.katalog_version or 'n/a'} zeilen={result.zeilen} "
+                    f"gekuerzt={'true' if result.gekuerzt else 'false'}")
+            return f"{head}\n{json.dumps(result.daten, indent=2, default=str, ensure_ascii=False)}"
+        if result.aufruf_id:
+            self.last_call_id = result.aufruf_id
+        if result.code == "HALTED":
+            self.halted = True
+            return f"BROKER HALTED code=HALTED aufruf_id={result.aufruf_id or '-'} detail={result.detail}. Run stops."
+        if result.code in self.BROKER_GAP_CODES:
+            return (f"BROKER UNAVAILABLE code={result.code} detail={result.detail}. "
+                    "Data gap: report datenlage 'unbekannt' or 'blinder_fleck'; there is no other access path.")
+        return f"BROKER REJECTED code={result.code} aufruf_id={result.aufruf_id or '-'} detail={result.detail}"
 
     def _tool_splunk_search(self, params: dict) -> str:
         spl      = params.get("spl_query", "")
@@ -885,7 +1036,7 @@ class ReActLoop:
     def _audit_fail_closed(self) -> bool:
         return bool(self.audit is not None and getattr(self.audit, "fail_closed", False))
 
-    def _audit(self, phase: str, step_entry: dict, observation: str | None = None) -> bool:
+    def _audit(self, phase: str, step_entry: dict, observation: str | None = None, call_id: str = "") -> bool:
         """Write one audit event; True when stored (or audit disabled)."""
         if self.audit is None:
             return True
@@ -899,6 +1050,7 @@ class ReActLoop:
             tool=step_entry.get("action", ""),
             params=step_entry.get("params") or {},
             observation=observation,
+            call_id=call_id,
             def_version=self.def_version,
         )
         ok = False
@@ -963,6 +1115,8 @@ class ReActLoop:
                 if self.strict_schema or self.required_keys:
                     # RT-P04/P06: validate; one correction round, then abort (AC-10).
                     valid_ids = {e["schritt_id"] for e in self.step_log}
+                    if evidence := getattr(self.tools, "evidence_ids", None):
+                        valid_ids |= set(evidence())  # broker aufruf_ids (RT-L04 -> RT-P06)
                     verdict, errors = validate_final_answer(
                         final_answer, strict=self.strict_schema,
                         required_keys=self.required_keys, valid_beleg_ids=valid_ids)
@@ -1016,11 +1170,20 @@ class ReActLoop:
                             f"ERROR: audit not writable, '{tool_name}' not executed (fail-closed).")
                         self.step_log.append(step_entry)
                         return self._audit_abort(step_entry, steps_taken, f" before '{tool_name}'")
+                if set_step := getattr(self.tools, "set_step", None):
+                    set_step(steps_taken, step_entry["schritt_id"])  # broker context (RT-L01)
                 observation = self.tools.execute(tool_name, params)
                 step_entry["observation"] = observation  # raw kept for forensics
                 self.step_log.append(step_entry)
-                if not self._audit("erledigt", step_entry, observation) and fail_closed:
+                halted = bool(getattr(self.tools, "halted", False))
+                call_id = str(getattr(self.tools, "last_call_id", "") or "")
+                if not self._audit("fehler" if halted else "erledigt", step_entry, observation,
+                                   call_id=call_id) and fail_closed:
                     return self._audit_abort(step_entry, steps_taken, f" after '{tool_name}'")
+                if halted:
+                    # RT-L05 / RT-B01: HALTED from the broker ends the run before the next step.
+                    self.connector.save_progress(f"Agent '{self.agent_id}' halted by Tool Broker.")
+                    return self._error_result("run halted by Tool Broker (HALTED)", steps_taken)
                 # Issue #2 (central boundary): every tool observation is sanitized
                 # and length-capped before it re-enters the LLM conversation.
                 safe_obs = _mark_data(
