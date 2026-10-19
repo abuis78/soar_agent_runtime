@@ -167,11 +167,29 @@ def _validate_api_url(url: str, provider: str) -> str:
 class LLMProvider:
     """Unified interface for all LLM providers."""
 
-    def __init__(self, provider: str, api_key: str, api_url: str, model: str) -> None:
+    def __init__(
+        self,
+        provider: str,
+        api_key: str,
+        api_url: str,
+        model: str,
+        *,
+        timeout_s: float = 120.0,
+        temperature: float = 0.0,
+        max_tokens: int = 4096,
+        seed: int | None = None,
+    ) -> None:
         self.provider = provider.lower()
         self.api_key = api_key
         self.api_url = _validate_api_url(api_url, self.provider)  # Issue #3: SSRF guard
         self.model = model
+        # RT-A03: bounded, low-temperature, configurable calls. The seed is only
+        # sent to OpenAI-compatible servers and only when explicitly set; a
+        # server that rejects it surfaces a clear error instead of a silent fallback.
+        self.timeout_s = float(timeout_s)
+        self.temperature = float(temperature)
+        self.max_tokens = int(max_tokens)
+        self.seed = int(seed) if seed is not None else None
 
     def chat(self, system_prompt: str, messages: list[dict]) -> str:
         """Send chat request and return assistant response text."""
@@ -190,10 +208,11 @@ class LLMProvider:
     def _chat_anthropic(self, system_prompt: str, messages: list[dict]) -> str:
         if not HAS_ANTHROPIC:
             raise ImportError("anthropic not installed. Run: phenv pip3 install anthropic")
-        client = anthropic.Anthropic(api_key=self.api_key, base_url=self.api_url)
+        client = anthropic.Anthropic(api_key=self.api_key, base_url=self.api_url, timeout=self.timeout_s)
         response = client.messages.create(
             model=self.model,
-            max_tokens=4096,
+            max_tokens=self.max_tokens,
+            temperature=self.temperature,
             system=system_prompt,
             messages=messages
         )
@@ -202,14 +221,8 @@ class LLMProvider:
     def _chat_openai(self, system_prompt: str, messages: list[dict]) -> str:
         if not HAS_OPENAI:
             raise ImportError("openai not installed. Run: phenv pip3 install openai")
-        client = OpenAI(api_key=self.api_key, base_url=self.api_url)
-        full_messages = [{"role": "system", "content": system_prompt}, *messages]
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=full_messages,
-            max_tokens=4096
-        )
-        return response.choices[0].message.content
+        client = OpenAI(api_key=self.api_key, base_url=self.api_url, timeout=self.timeout_s)
+        return self._openai_compatible_chat(client, system_prompt, messages)
 
     def _chat_gemini(self, system_prompt: str, messages: list[dict]) -> str:
         if not HAS_GEMINI:
@@ -217,27 +230,42 @@ class LLMProvider:
         genai.configure(api_key=self.api_key)
         model = genai.GenerativeModel(
             model_name=self.model,
-            system_instruction=system_prompt
+            system_instruction=system_prompt,
+            generation_config={
+                "temperature": self.temperature,
+                "max_output_tokens": self.max_tokens,
+            },
         )
         gemini_messages = [
             {"role": "user" if msg["role"] == "user" else "model",
              "parts": [msg["content"]]}
             for msg in messages
         ]
-        response = model.generate_content(gemini_messages)
+        response = model.generate_content(
+            gemini_messages,
+            request_options={"timeout": self.timeout_s},
+        )
         return response.text
 
     def _chat_local(self, system_prompt: str, messages: list[dict]) -> str:
         """OpenAI-compatible local LLM (Ollama, LM Studio, etc.)."""
         if not HAS_OPENAI:
             raise ImportError("openai not installed. Run: phenv pip3 install openai")
-        client = OpenAI(api_key=self.api_key or "ollama", base_url=self.api_url)
+        client = OpenAI(api_key=self.api_key or "ollama", base_url=self.api_url, timeout=self.timeout_s)
+        return self._openai_compatible_chat(client, system_prompt, messages)
+
+    def _openai_compatible_chat(self, client, system_prompt: str, messages: list[dict]) -> str:
+        """Shared call path for OpenAI and OpenAI-compatible local servers."""
         full_messages = [{"role": "system", "content": system_prompt}, *messages]
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=full_messages,
-            max_tokens=4096
-        )
+        kwargs: dict = {
+            "model": self.model,
+            "messages": full_messages,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+        }
+        if self.seed is not None:
+            kwargs["seed"] = self.seed
+        response = client.chat.completions.create(**kwargs)
         return response.choices[0].message.content
 
     def test_connection(self) -> tuple[bool, str]:
