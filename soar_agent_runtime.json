@@ -6,7 +6,7 @@
     "package_name": "phantom_soar_agent_runtime",
     "type": "generic",
     "license": "Copyright 2026 Andreas Buis",
-    "app_version": "1.4.0",
+    "app_version": "1.5.0",
     "product_vendor": "OpenClaw SOC",
     "product_name": "SOAR Agent Runtime",
     "product_version_regex": ".*",
@@ -151,6 +151,47 @@
             "required": false,
             "default": "agent_skills",
             "order": 15
+        },
+        "airgap_mode": {
+            "description": "Air-gap mode (RT-A01). When enabled only the 'local' provider is allowed, cloud providers are rejected at run start, free-form SPL is disabled and read/act tools go through Tool Broker and Policy Manager. Off = current behaviour.",
+            "data_type": "boolean",
+            "required": false,
+            "default": false,
+            "order": 16
+        },
+        "llm_timeout_s": {
+            "description": "Timeout in seconds for a single model call (RT-A03)",
+            "data_type": "numeric",
+            "required": false,
+            "default": 120,
+            "order": 17
+        },
+        "llm_temperature": {
+            "description": "Sampling temperature for model calls; 0 = as deterministic as the model allows (RT-A03)",
+            "data_type": "numeric",
+            "required": false,
+            "default": 0,
+            "order": 18
+        },
+        "llm_max_tokens": {
+            "description": "Maximum output tokens per model call (RT-A03)",
+            "data_type": "numeric",
+            "required": false,
+            "default": 4096,
+            "order": 19
+        },
+        "llm_seed": {
+            "description": "Optional sampling seed, sent only if set and only if the inference server supports it (RT-A03). Leave empty to not send a seed.",
+            "data_type": "numeric",
+            "required": false,
+            "order": 20
+        },
+        "max_observation_chars": {
+            "description": "Maximum characters of a single tool observation, extra_context block or container payload passed to the model; longer input is truncated and marked (RT-B04)",
+            "data_type": "numeric",
+            "required": false,
+            "default": 8000,
+            "order": 21
         }
     },
     "actions": [
