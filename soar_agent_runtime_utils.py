@@ -413,7 +413,7 @@ class ToolRegistry:
             }
         },
         "get_container_info": {
-            "description": "Get metadata and artifacts of the current container",
+            "description": "Get metadata and artifacts of the current container (this run's case only; max 5 artifacts, output is size-capped)",
             "wirkt": False,
             "quelle": "builtin",
             "parameters":  {}
@@ -709,16 +709,28 @@ class ToolRegistry:
         except Exception as e:
             return f"Failed to update severity: {_scrub_exc(e)}"
 
+    MAX_ARTIFACTS_SHOWN = 5
+
     def _tool_get_container_info(self, params: dict) -> str:
+        # RT-L08: only the container of this run. A different id in PARAMS is
+        # refused without touching the platform; other cases go via the broker.
+        for key in ("container_id", "case_id"):
+            requested = (params or {}).get(key)
+            if requested not in (None, "") and str(requested).strip() != str(self.container_id):
+                return (f"ERROR: get_container_info reads only the container of this run "
+                        f"({self.container_id}); other cases are read via broker_invoke templates.")
         try:
             import phantom.rules as ph_rules
             container = ph_rules.get_container(self.container_id)
-            artifacts = ph_rules.get_artifacts(container_id=self.container_id)
-            # Issue #2 sanitization is applied centrally at the LLM boundary.
+            artifacts = list(ph_rules.get_artifacts(container_id=self.container_id) or [])
+            shown = artifacts[:self.MAX_ARTIFACTS_SHOWN]
+            # Issue #2 sanitization and the size cap (RT-B04) are applied
+            # centrally at the LLM boundary; the artifact cut is marked here.
             return json.dumps(
                 {"container": container,
-                 "artifact_count": len(artifacts) if artifacts else 0,
-                 "artifacts": (artifacts or [])[:5]},
+                 "artifact_count": len(artifacts),
+                 "artifacts_shown": len(shown),
+                 "artifacts": shown},
                 indent=2, default=str
             )
         except Exception as e:

@@ -297,3 +297,51 @@ def test_outside_airgap_splunk_search_is_marked_deprecated_but_callable(monkeypa
     assert "- splunk_search(" in reg.get_tool_descriptions()
     assert "(deprecated: prefer broker_invoke templates)" in reg.get_tool_descriptions()
     assert reg.execute("splunk_search", {"spl_query": "index=main"}).startswith("SPL results (1 rows)")
+
+
+# --- get_container_info: own case only, size-capped (RT-L08, sub-change 2.5) --
+
+@pytest.fixture
+def case_rules(monkeypatch):
+    import sys
+    import types as _t
+    calls = []
+    rules = _t.ModuleType("phantom.rules")
+    rules.get_container = lambda cid: calls.append(cid) or {"id": cid, "name": "case", "blob": "X" * 300}
+    rules.get_artifacts = lambda **kw: [{"id": i, "cef": {"n": i}} for i in range(7)]
+    monkeypatch.setitem(sys.modules, "phantom.rules", rules)
+    return calls
+
+
+@pytest.mark.parametrize("params", [{}, {"container_id": 4711}, {"container_id": "4711"}, {"case_id": 4711}])
+def test_get_container_info_reads_own_case(case_rules, params):
+    reg = registry(allowed=("get_container_info",))
+    data = json.loads(reg.execute("get_container_info", params))
+    assert case_rules == [4711]
+    assert data["container"]["id"] == 4711
+    assert (data["artifact_count"], data["artifacts_shown"], len(data["artifacts"])) == (7, 5, 5)
+
+
+@pytest.mark.parametrize("params", [{"container_id": 4712}, {"container_id": "99"}, {"case_id": 1}])
+def test_get_container_info_refuses_other_cases_without_platform_access(case_rules, params):
+    reg = registry(allowed=("get_container_info",))
+    obs = reg.execute("get_container_info", params)
+    assert obs == ("ERROR: get_container_info reads only the container of this run (4711); "
+                   "other cases are read via broker_invoke templates.")
+    assert case_rules == []
+
+
+def test_get_container_info_description_states_the_limits():
+    desc = registry(allowed=("get_container_info",)).get_tool_descriptions()
+    assert "this run's case only; max 5 artifacts, output is size-capped" in desc
+
+
+def test_large_container_payload_is_truncated_at_the_loop_boundary(case_rules):
+    reg = registry(allowed=("get_container_info",))
+    llm = FakeLLM(["ACTION: get_container_info", "FINAL_ANSWER: ok"])
+    loop = ReActLoop(connector=reg.connector, llm=llm, tools=reg, agent_id="t", system_prompt="x",
+                     max_steps=3, container_id=4711, max_observation_chars=120)
+    loop.run("t")
+    obs = llm.seen[1][-1]["content"]
+    assert "[...truncated " in obs and obs.endswith("<<<END DATA>>>")
+    assert len(loop.step_log[0]["observation"]) > 120  # raw kept for forensics
