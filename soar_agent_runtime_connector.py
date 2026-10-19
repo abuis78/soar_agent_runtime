@@ -372,6 +372,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
             def_version=definition_version(agent_def),
             strict_schema=self._airgap_mode,
             required_keys=required_keys,
+            max_observation_chars=self._max_observation_chars,
         )
         result = loop.run(task)
         audit.flush()

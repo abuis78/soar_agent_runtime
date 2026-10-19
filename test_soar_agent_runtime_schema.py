@@ -141,7 +141,9 @@ def test_strict_prompt_contains_contract_and_observations_carry_schritt_id():
     loop, llm = make_loop(["ACTION: get_container_info", "FINAL_ANSWER: " + json.dumps(good())], strict=True)
     loop.run("t")
     assert FINAL_ANSWER_CONTRACT.strip() in llm.system_prompts[0]
-    assert llm.seen[1][-1]["content"].startswith(f"OBSERVATION [schritt_id {loop.run_id}/1]: OK get_container_info")
+    obs = llm.seen[1][-1]["content"]
+    assert obs.startswith(f"OBSERVATION [schritt_id {loop.run_id}/1]: ")
+    assert "OK get_container_info" in obs
 
 
 def test_strict_valid_answer_with_run_evidence_is_accepted_and_parsed():

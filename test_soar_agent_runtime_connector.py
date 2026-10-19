@@ -362,3 +362,14 @@ def test_run_agent_without_skills_passes_no_required_keys(monkeypatch):
     c = make_connector()
     c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 7})
     assert seen["required_keys"] == [] and seen["strict_schema"] is False
+
+
+# --- max_observation_chars pass-through (RT-B04, sub-change 1.10) ------------
+
+@pytest.mark.parametrize("config,expected", [({}, 8000), ({"max_observation_chars": 1234}, 1234),
+                                              ({"max_observation_chars": "500"}, 500)])
+def test_run_agent_passes_max_observation_chars(monkeypatch, config, expected):
+    seen = _capture_loop(monkeypatch)
+    c = make_connector(**config)
+    c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 7})
+    assert seen["max_observation_chars"] == expected
