@@ -7,6 +7,8 @@ llm_* asset fields reach LLMProvider. Runs off-platform via conftest.py.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 import soar_agent_runtime_connector as connector_module
@@ -289,10 +291,17 @@ def test_run_agent_picks_audit_sink_per_mode(monkeypatch, config, sink_type, fai
     assert (summary["audit_ereignisse"], summary["audit_fehler"]) == (2, 0)
 
 
+_VALID_VERDICT = "FINAL_ANSWER: " + json.dumps({
+    "belege": [], "begruendung": "nothing suspicious", "gegenargumente": [],
+    "unsicherheiten": ["no telemetry"], "konfidenz": 0.6, "datenlage": "teilweise",
+})
+
+
 def test_run_agent_in_airgap_writes_audit_artifacts_end_to_end(monkeypatch):
+    """Airgap: strict FINAL_ANSWER contract (1.9) plus audit artifact per step (1.8)."""
     monkeypatch.setattr(connector_module, "AgentDefinitionStore", _LocalStore)
     monkeypatch.setattr(connector_module.LLMProvider, "chat",
-                        lambda self, system_prompt, messages: "FINAL_ANSWER: ok")
+                        lambda self, system_prompt, messages: _VALID_VERDICT)
     c = make_connector(airgap_mode=True)
     status = c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 9})
     assert status is True
@@ -313,3 +322,43 @@ def test_run_agent_in_airgap_fails_closed_when_artifacts_cannot_be_written(monke
     status = c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 9})
     assert status is False
     assert c.action_results[-1].message.startswith("ERROR: audit not writable")
+
+
+# --- FINAL_ANSWER contract flags (RT-P04, sub-change 1.9) --------------------
+
+class _SkillStoreWithSchemas:
+    build_injection = staticmethod(lambda skills: "## skills")
+
+    def __init__(self, *a, **kw):
+        pass
+
+    def load_many(self, ids):
+        return [
+            {"skill_id": "triage", "inject": "be brief",
+             "output_schema": {"verdict": "TP | FP", "reason": "why"}},
+            {"skill_id": "ioc", "output_schema": {"reason": "dup", "iocs": []}},
+            {"skill_id": "plain", "inject": "no schema"},
+        ]
+
+
+class _SkilledStore(_LocalStore):
+    def load(self, agent_id):
+        return super().load(agent_id) | {"skills": "triage, ioc, plain"}
+
+
+@pytest.mark.parametrize("config,strict", [({}, False), ({"airgap_mode": True}, True)])
+def test_run_agent_passes_schema_flags_and_skill_keys(monkeypatch, config, strict):
+    seen = _capture_loop(monkeypatch)
+    monkeypatch.setattr(connector_module, "AgentDefinitionStore", _SkilledStore)
+    monkeypatch.setattr(connector_module, "SkillStore", _SkillStoreWithSchemas)
+    c = make_connector(**config)
+    c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 7})
+    assert seen["strict_schema"] is strict
+    assert seen["required_keys"] == ["verdict", "reason", "iocs"]
+
+
+def test_run_agent_without_skills_passes_no_required_keys(monkeypatch):
+    seen = _capture_loop(monkeypatch)
+    c = make_connector()
+    c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 7})
+    assert seen["required_keys"] == [] and seen["strict_schema"] is False

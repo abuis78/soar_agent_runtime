@@ -335,11 +335,18 @@ class SoarAgentRuntimeConnector(BaseConnector):
         if isinstance(skill_ids, str):
             skill_ids = [s.strip() for s in skill_ids.split(",") if s.strip()]
         skill_injection = ""
+        required_keys: list[str] = []
         if skill_ids:
             self.save_progress(f"Loading skills: {skill_ids}")
             skill_store = SkillStore(self, self._skill_list_name)
             loaded_skills = skill_store.load_many(skill_ids)
             skill_injection = SkillStore.build_injection(loaded_skills)
+            # RT-P04 (E3): a skill's output_schema template is a required
+            # top-level key set for FINAL_ANSWER.
+            for skill in loaded_skills:
+                schema = skill.get("output_schema")
+                if isinstance(schema, dict):
+                    required_keys += [k for k in schema if k not in required_keys]
             self.save_progress(f"Injected {len(loaded_skills)} skill(s).")
 
         # Audit sink (RT-P02/P03, E2): artifact per step; mandatory and
@@ -363,6 +370,8 @@ class SoarAgentRuntimeConnector(BaseConnector):
             skill_injection=skill_injection,
             audit=audit,
             def_version=definition_version(agent_def),
+            strict_schema=self._airgap_mode,
+            required_keys=required_keys,
         )
         result = loop.run(task)
         audit.flush()

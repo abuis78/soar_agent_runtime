@@ -116,6 +116,76 @@ def new_run_id() -> str:
 # executing a tool with silently-emptied parameters.
 _PARAMS_PARSE_ERROR = "ERROR: PARAMS is not valid JSON object. Fix the PARAMS line and retry."
 
+# RT-P04/P06 (decision E3): mandatory FINAL_ANSWER fields in airgap_mode.
+# Spec names on the wire; checked by validate_final_answer().
+REQUIRED_ANSWER_FIELDS = ("belege", "begruendung", "gegenargumente", "unsicherheiten", "konfidenz", "datenlage")
+DATENLAGE_VALUES = ("vollstaendig", "teilweise", "unbekannt", "blinder_fleck")
+FINAL_ANSWER_CONTRACT = """
+## FINAL_ANSWER Contract (mandatory)
+Your FINAL_ANSWER MUST be a single JSON object (no text outside the JSON) with these fields:
+- "belege": list of beleg_id strings. A beleg_id is a schritt_id shown in an OBSERVATION of this run. Never invent one; use [] if you have no evidence.
+- "begruendung": string, your reasoning for the recommendation
+- "gegenargumente": list of strings, arguments against your conclusion
+- "unsicherheiten": list of strings, what you could not verify
+- "konfidenz": number between 0 and 1
+- "datenlage": one of "vollstaendig" | "teilweise" | "unbekannt" | "blinder_fleck"
+Skill output fields, if any, go into the same object.
+Example:
+FINAL_ANSWER: {"belege": ["<schritt_id>"], "begruendung": "...", "gegenargumente": ["..."], "unsicherheiten": [], "konfidenz": 0.7, "datenlage": "teilweise"}
+"""
+
+
+def validate_final_answer(
+    text: str,
+    *,
+    strict: bool = False,
+    required_keys=(),
+    valid_beleg_ids=(),
+) -> tuple[dict | None, list[str]]:
+    """Check a FINAL_ANSWER against the contract. Returns (parsed object or None, errors).
+
+    strict: the six mandatory fields with types/ranges (RT-P04) and every
+    beleg_id must originate in this run (RT-P06). required_keys: top-level
+    keys demanded by skill output schemas (E3). Empty errors = valid.
+    """
+    try:
+        data = json.loads(text)
+    except Exception:
+        data = None
+    if not isinstance(data, dict):
+        return None, ["FINAL_ANSWER must be a JSON object"]
+    errors: list[str] = []
+    if strict:
+        for field in REQUIRED_ANSWER_FIELDS:
+            if field not in data:
+                errors.append(f"missing field '{field}'")
+        if "belege" in data:
+            if not isinstance(data["belege"], list):
+                errors.append("'belege' must be a list")
+            else:
+                valid = set(valid_beleg_ids)
+                for item in data["belege"]:
+                    beleg_id = item.get("beleg_id") if isinstance(item, dict) else item
+                    if not isinstance(beleg_id, str) or not beleg_id:
+                        errors.append("every entry in 'belege' needs a string beleg_id")
+                    elif beleg_id not in valid:
+                        errors.append(f"beleg_id '{beleg_id}' did not originate in this run")
+        if "begruendung" in data and not (isinstance(data["begruendung"], str) and data["begruendung"].strip()):
+            errors.append("'begruendung' must be a non-empty string")
+        for field in ("gegenargumente", "unsicherheiten"):
+            if field in data and not isinstance(data[field], list):
+                errors.append(f"'{field}' must be a list")
+        if "konfidenz" in data:
+            k = data["konfidenz"]
+            if isinstance(k, bool) or not isinstance(k, (int, float)) or not 0 <= k <= 1:
+                errors.append("'konfidenz' must be a number between 0 and 1")
+        if "datenlage" in data and data["datenlage"] not in DATENLAGE_VALUES:
+            errors.append(f"'datenlage' must be one of {list(DATENLAGE_VALUES)}")
+    for key in required_keys:
+        if key not in data:
+            errors.append(f"missing skill field '{key}'")
+    return data, errors
+
 # Exception scrubbing (open item #2: secret leakage via tracebacks). Patterns
 # that may carry credentials must never be echoed back into the LLM context or
 # action results.
@@ -704,6 +774,8 @@ class ReActLoop:
         step_id_prefix: str | None = None,
         audit=None,
         def_version: str = "",
+        strict_schema: bool = False,
+        required_keys=(),
     ) -> None:
         self.connector       = connector
         self.llm             = llm
@@ -721,13 +793,18 @@ class ReActLoop:
         self.def_version     = def_version
         self.audit_written   = 0
         self.audit_failed    = 0
+        # RT-P04/P06 (E3): strict contract only in airgap; skill keys always.
+        self.strict_schema   = bool(strict_schema)
+        self.required_keys   = tuple(required_keys or ())
+        self.correction_used = False
+        self.verdict: dict | None = None
         self.step_log: list[dict] = []
 
     def _build_system_prompt(self) -> str:
         return REACT_SYSTEM_TEMPLATE.format(
             agent_id        = self.agent_id,
             system_prompt   = self.system_prompt,
-            skill_injection = self.skill_injection,
+            skill_injection = self.skill_injection + (FINAL_ANSWER_CONTRACT if self.strict_schema else ""),
             tool_descriptions = self.tools.get_tool_descriptions(),
             max_steps       = self.max_steps,
             container_id    = self.container_id,
@@ -861,6 +938,31 @@ class ReActLoop:
             }
 
             if final_answer is not None:
+                if self.strict_schema or self.required_keys:
+                    # RT-P04/P06: validate; one correction round, then abort (AC-10).
+                    valid_ids = {e["schritt_id"] for e in self.step_log}
+                    verdict, errors = validate_final_answer(
+                        final_answer, strict=self.strict_schema,
+                        required_keys=self.required_keys, valid_beleg_ids=valid_ids)
+                    if errors:
+                        detail = "; ".join(errors)
+                        msg = f"ERROR: FINAL_ANSWER invalid: {detail}"
+                        step_entry["observation"] = msg
+                        self.step_log.append(step_entry)
+                        if not self._audit("fehler", step_entry, msg) and fail_closed:
+                            return self._audit_abort(step_entry, steps_taken)
+                        if self.correction_used:
+                            return self._error_result(
+                                f"FINAL_ANSWER invalid after correction round: {detail}", steps_taken)
+                        self.correction_used = True
+                        self.connector.save_progress(f"FINAL_ANSWER invalid, correction round: {detail}")
+                        messages += [
+                            {"role": "assistant", "content": response_text},
+                            {"role": "user",
+                             "content": f"OBSERVATION: {msg}. Respond again with a corrected FINAL_ANSWER."}
+                        ]
+                        continue
+                    self.verdict = verdict
                 step_entry["observation"] = final_answer
                 self.step_log.append(step_entry)
                 if not self._audit("erledigt", step_entry, final_answer) and fail_closed:
@@ -900,9 +1002,12 @@ class ReActLoop:
                 # Issue #2 (central boundary): every tool observation is sanitized
                 # and length-capped before it re-enters the LLM conversation.
                 safe_obs = _sanitize_observation(_truncate(observation, _MAX_OBSERVATION_LEN))
+                # In strict mode the model must cite schritt_ids as belege, so
+                # every observation names its own id (RT-P06).
+                obs_tag = f"OBSERVATION [schritt_id {step_entry['schritt_id']}]:" if self.strict_schema else "OBSERVATION:"
                 messages += [
                     {"role": "assistant", "content": response_text},
-                    {"role": "user",      "content": f"OBSERVATION: {safe_obs}"}
+                    {"role": "user",      "content": f"{obs_tag} {safe_obs}"}
                 ]
             else:
                 step_entry["observation"] = "ERROR: No ACTION or FINAL_ANSWER found."
@@ -929,6 +1034,7 @@ class ReActLoop:
             "model":            self.llm.model,
             "audit_ereignisse": self.audit_written,
             "audit_fehler":     self.audit_failed,
+            "urteil":           self.verdict,
             "step_log":         json.dumps(self.step_log, indent=2)
         }
 
