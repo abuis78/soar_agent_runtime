@@ -143,14 +143,26 @@ def test_ac01_airgap_local_run_talks_only_to_the_local_endpoint(platform, llm, n
     assert llm["anthropic_clients"] == 0
 
 
-def test_ac01_airgap_test_connectivity_contacts_only_local(llm, no_network):
+def test_ac01_airgap_test_connectivity_contacts_only_local_and_broker(llm, no_network):
+    """Airgap test connectivity: local model + Tool Broker health (2.6), nothing else."""
     llm["responses"] = ["OK"]
-    c = make_connector(airgap_mode=True, openai_api_key="k", gemini_api_key="k")
+    broker_calls = []
+
+    def broker_transport(method, url, params, body, timeout_s):
+        broker_calls.append((method, url))
+        return 200, {"status": "ok"}
+
+    c = make_connector(airgap_mode=True, openai_api_key="k", gemini_api_key="k",
+                       broker_url="https://broker.internal:8443", broker_client_cert="/etc/rt.crt",
+                       broker_client_key="/etc/rt.key", broker_ca="/etc/ca.pem")
+    c._broker_transport = broker_transport
     status = c._handle_test_connectivity({})
     assert status is True
     msg = c.action_results[-1].message
     assert msg.startswith("Connectivity OK (airgap).")
     assert set(llm["openai_base_urls"]) == {LOCAL_URL} and llm["anthropic_clients"] == 0
+    assert broker_calls == [("GET", "https://broker.internal:8443/health")]
+    assert '"broker": "OK: broker healthy (HTTP 200)"' in msg
     for p in ("anthropic", "openai", "gemini"):
         assert f'"{p}": "SKIPPED (airgap_mode)"' in msg
 

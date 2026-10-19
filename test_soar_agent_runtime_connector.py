@@ -179,8 +179,11 @@ def test_connectivity_without_airgap_skips_unconfigured_cloud_providers(monkeypa
 
 
 def test_connectivity_in_airgap_only_contacts_local(monkeypatch):
+    """Since 2.6 the airgap check also needs a healthy broker; cloud providers stay untouched."""
     tested = _record_connection_tests(monkeypatch)
-    c = make_connector(airgap_mode=True)
+    c = make_connector(airgap_mode=True, broker_url="https://broker.internal:8443",
+                       broker_client_cert="/etc/rt.crt", broker_client_key="/etc/rt.key")
+    c._broker_transport = lambda method, url, params, body, timeout_s: (200, {"status": "ok"})
     status = c._handle_test_connectivity({})
     assert tested == ["local"]
     assert status is True
@@ -530,3 +533,80 @@ def test_run_agent_passes_airgap_flag_to_registry(monkeypatch):
     seen.clear()
     make_connector()._handle_run_agent({"agent_id": "t", "task": "x", "container_id": 1})
     assert seen["tools"].airgap is False
+
+
+# --- test connectivity: broker health (RT-A04 part 2, sub-change 2.6) --------
+
+def _health_transport(status=200, exc=None):
+    calls = []
+
+    def send(method, url, params, body, timeout_s):
+        calls.append((method, url))
+        if exc:
+            raise exc
+        return status, {"status": "ok"} if status == 200 else "down"
+
+    send.calls = calls
+    return send
+
+
+def test_connectivity_airgap_with_healthy_broker_succeeds(monkeypatch):
+    _record_connection_tests(monkeypatch)
+    c = make_connector(airgap_mode=True, **BROKER_ASSET)
+    c._broker_transport = _health_transport()
+    assert c._handle_test_connectivity({}) is True
+    msg = c.action_results[-1].message
+    assert msg.startswith("Connectivity OK (airgap).")
+    assert '"broker": "OK: broker healthy (HTTP 200)"' in msg and '"anthropic": "SKIPPED (airgap_mode)"' in msg
+    assert c._broker_transport.calls == [("GET", "https://broker.internal:8443/health")]
+    assert "Testing broker..." in c.progress
+
+
+def test_connectivity_airgap_with_unreachable_broker_fails_despite_healthy_local(monkeypatch):
+    _record_connection_tests(monkeypatch)
+    c = make_connector(airgap_mode=True, **BROKER_ASSET)
+    c._broker_transport = _health_transport(exc=ConnectionError("refused"))
+    assert c._handle_test_connectivity({}) is False
+    msg = c.action_results[-1].message
+    assert msg.startswith("Broker check failed (airgap).") and '"broker": "ERROR: broker unreachable' in msg
+    assert '"local": "OK"' in msg
+
+
+def test_connectivity_airgap_without_broker_url_fails_as_not_configured(monkeypatch):
+    _record_connection_tests(monkeypatch)
+    c = make_connector(airgap_mode=True)
+    assert c._handle_test_connectivity({}) is False
+    assert '"broker": "NOT CONFIGURED (required in airgap_mode)"' in c.action_results[-1].message
+
+
+def test_connectivity_airgap_with_misconfigured_broker_reports_it(monkeypatch):
+    _record_connection_tests(monkeypatch)
+    c = make_connector(airgap_mode=True, **(BROKER_ASSET | {"broker_url": "http://broker.internal"}))
+    assert c._handle_test_connectivity({}) is False
+    assert '"broker": "ERROR: misconfigured: broker_url must be an https:// URL' in c.action_results[-1].message
+
+
+def test_connectivity_airgap_local_failure_still_wins_over_broker(monkeypatch):
+    _record_connection_tests(monkeypatch, outcome=(False, "connection refused"))
+    c = make_connector(airgap_mode=True, **BROKER_ASSET)
+    c._broker_transport = _health_transport()
+    assert c._handle_test_connectivity({}) is False
+    assert c.action_results[-1].message.startswith("All providers failed (airgap).")
+
+
+def test_connectivity_normal_mode_without_broker_is_unchanged(monkeypatch):
+    _record_connection_tests(monkeypatch)
+    c = make_connector()
+    assert c._handle_test_connectivity({}) is True
+    msg = c.action_results[-1].message
+    assert msg.startswith("Connectivity OK (normal).") and '"broker": "SKIPPED (no broker_url)"' in msg
+    assert "Testing broker..." not in c.progress
+
+
+def test_connectivity_normal_mode_unhealthy_broker_is_reported_but_not_fatal(monkeypatch):
+    _record_connection_tests(monkeypatch)
+    c = make_connector(**BROKER_ASSET)
+    c._broker_transport = _health_transport(status=503)
+    assert c._handle_test_connectivity({}) is True
+    msg = c.action_results[-1].message
+    assert msg.startswith("Connectivity OK (normal).") and '"broker": "ERROR: broker unhealthy: HTTP 503' in msg

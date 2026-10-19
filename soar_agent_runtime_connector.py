@@ -295,11 +295,34 @@ class SoarAgentRuntimeConnector(BaseConnector):
             except Exception as e:
                 results[provider_name] = f"ERROR: {str(e)}"
 
-        if any_success:
+        # RT-A04 (part 2): Tool Broker health. Mandatory in airgap_mode,
+        # informational otherwise. Policy Manager health follows in 3.7.
+        broker_ok = self._test_broker(results)
+
+        if not any_success:
             return action_result.set_status(
-                phantom.APP_SUCCESS, f"Connectivity OK ({mode}). Results: {json.dumps(results)}")
+                phantom.APP_ERROR, f"All providers failed ({mode}). Results: {json.dumps(results)}")
+        if self._airgap_mode and not broker_ok:
+            return action_result.set_status(
+                phantom.APP_ERROR, f"Broker check failed ({mode}). Results: {json.dumps(results)}")
         return action_result.set_status(
-            phantom.APP_ERROR, f"All providers failed ({mode}). Results: {json.dumps(results)}")
+            phantom.APP_SUCCESS, f"Connectivity OK ({mode}). Results: {json.dumps(results)}")
+
+    def _test_broker(self, results: dict) -> bool:
+        """Fill results["broker"]; True only when a configured broker answers /health."""
+        if not self._broker_url:
+            results["broker"] = ("NOT CONFIGURED (required in airgap_mode)" if self._airgap_mode
+                                 else "SKIPPED (no broker_url)")
+            return False
+        self.save_progress("Testing broker...")
+        try:
+            client = self._build_broker_client()
+        except BrokerConfigError as e:
+            results["broker"] = f"ERROR: misconfigured: {e}"
+            return False
+        ok, message = client.health()
+        results["broker"] = f"OK: {message}" if ok else f"ERROR: {message}"
+        return ok
 
     # -----------------------------------------------------------------------
     # Action: run agent
