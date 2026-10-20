@@ -457,6 +457,8 @@ class ToolRegistry:
         "begruendung": "Why this action is needed (text)",
         "gegenargumente": "What speaks against it (text)",
         "beleg_ids": "JSON list of evidence ids from this run (aufruf_id of a broker result or schritt_id of an earlier step)",
+        "unsicherheiten": "optional: what you are unsure about (text)",
+        "konfidenz": "optional: your confidence 0..1 (number)",
     }
     # Broker codes that mean "data gap, no other access path" (RT-L06).
     BROKER_GAP_CODES = frozenset({"UNREACHABLE", "TIMEOUT", "BAD_RESPONSE", "SOURCE_ERROR",
@@ -474,6 +476,8 @@ class ToolRegistry:
         run_id: str = "",
         airgap: bool = False,
         policy=None,
+        stage: int | None = None,
+        domain: str = "",
     ) -> None:
         self.connector = connector
         self.container_id = container_id
@@ -508,6 +512,10 @@ class ToolRegistry:
         # action denied (fail-closed), outside airgap the gate is not used (E4).
         self.policy = policy if policy is not None else NoPolicyClient(
             "policy_mode not configured; every effecting action is denied (RT-W03)")
+        # RT-W08: stufe comes from the triggering playbook, domaene from the
+        # run; both empty when not given (the Policy Manager treats that as unknown).
+        self.stage = stage if isinstance(stage, int) and not isinstance(stage, bool) else None
+        self.domain = str(domain or "")
 
     # -- Tool Broker ----------------------------------------------------------
 
@@ -661,11 +669,30 @@ class ToolRegistry:
     # -- Policy Manager gate (RT-W06, W07) --------------------------------------
 
     PROPOSAL_LABEL = "agent_action_proposal"
-    META_PARAMS = ("begruendung", "gegenargumente", "beleg_ids")
+    META_PARAMS = ("begruendung", "gegenargumente", "beleg_ids", "unsicherheiten", "konfidenz")
+
+    @staticmethod
+    def _confidence(value) -> float | None:
+        """konfidenz 0..1 or None; an unusable value is dropped, never rejected."""
+        if isinstance(value, bool) or value is None:
+            return None
+        try:
+            conf = float(value)
+        except (TypeError, ValueError):
+            return None
+        return conf if 0.0 <= conf <= 1.0 else None
 
     def _build_policy_request(self, tool_name: str, params: dict) -> PolicyRequest:
-        """Request content per RT-W08 (3.4: core fields; stufe/domaene/konfidenz in 3.5)."""
+        """Request content per RT-W08: initiator, ids, stufe, domaene, evidence and
+        the judgement (begruendung, gegenargumente, unsicherheiten, konfidenz).
+        Reversibility is not sent; the client identity is the mTLS certificate."""
         action_params = {k: v for k, v in params.items() if k not in self.META_PARAMS}
+        confidence = self._confidence(params.get("konfidenz"))
+        judgement = {"begruendung": params.get("begruendung", ""),
+                     "gegenargumente": params.get("gegenargumente", ""),
+                     "unsicherheiten": str(params.get("unsicherheiten") or "")}
+        if confidence is not None:
+            judgement["konfidenz"] = confidence
         return PolicyRequest(
             kind=tool_name,
             category=_ACTION_TELEMETRY.get(tool_name, ""),
@@ -675,9 +702,11 @@ class ToolRegistry:
             agent_id=self.agent_id,
             run_id=self.run_id,
             step_id=self.current_step_id,
+            stage=self.stage,
+            domain=self.domain,
+            confidence=confidence,
             evidence_ids=tuple(str(b) for b in params.get("beleg_ids", [])),
-            judgement={"begruendung": params.get("begruendung", ""),
-                       "gegenargumente": params.get("gegenargumente", "")},
+            judgement=judgement,
         )
 
     def _gate_effect(self, tool_name: str, handler, params: dict) -> str:

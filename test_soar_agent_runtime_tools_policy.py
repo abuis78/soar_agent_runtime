@@ -50,7 +50,7 @@ def rules(monkeypatch):
 
 
 def registry(airgap=True, allowed=("update_severity", "add_note", "broker_invoke"), broker=None, steps=2,
-             policy=None, artifact_ok=True):
+             policy=None, artifact_ok=True, **extra):
     progress, artifacts = [], []
 
     def save_artifact(artifact):
@@ -62,7 +62,7 @@ def registry(airgap=True, allowed=("update_severity", "add_note", "broker_invoke
     if policy is None:
         policy = StubPolicyClient()   # ALLOW with pm-stub-1 unless a test says otherwise
     reg = ToolRegistry(connector, 4711, list(allowed), agent_id="triage", broker=broker, run_id="rt-x",
-                       airgap=airgap, policy=policy)
+                       airgap=airgap, policy=policy, **extra)
     reg._progress, reg._artifacts, reg._policy = progress, artifacts, policy
     for n in range(1, steps + 1):          # the loop calls set_step before every tool call
         reg.set_step(n, f"rt-x/{n}")
@@ -164,8 +164,12 @@ def test_allow_executes_and_sends_the_request_without_meta_params(rules):
     assert req.kind == "update_severity" and req.params == {"severity": "high"}
     assert req.targets == ("container:4711",) and req.initiator == "triage" and req.agent_id == "triage"
     assert req.run_id == "rt-x" and req.step_id == "rt-x/2" and req.evidence_ids == ("rt-x/1",)
-    assert req.judgement == {"begruendung": "beacon confirmed", "gegenargumente": "could be a scanner"}
+    assert req.judgement == {"begruendung": "beacon confirmed", "gegenargumente": "could be a scanner",
+                             "unsicherheiten": ""}
     assert req.category == "Triage"
+    assert req.stage is None and req.domain == "" and req.confidence is None
+    wire = req.to_wire()["kontext"]
+    assert "stufe" not in wire and "agent_konfidenz" not in wire and wire["domaene"] == ""
     assert "[policy] decide update_severity (step 2)" in reg._progress
 
 
@@ -252,6 +256,43 @@ def test_outside_airgap_the_gate_is_not_consulted(rules):
     reg = registry(airgap=False, policy=StubPolicyClient(halted=True))
     assert reg.execute("update_severity", {"severity": "low"}) == "Container severity updated to: low"
     assert reg._policy.requests == [] and reg.halted is False
+
+
+# --- RT-W08: full request content ----------------------------------------------------------
+
+def test_request_carries_stage_domain_and_full_judgement(rules):
+    reg = registry(stage=2, domain="soc")
+    params = {**GOOD, "unsicherheiten": "only one sensor", "konfidenz": 0.85}
+    assert reg.execute("update_severity", params).startswith("Container severity updated to: high")
+    req = reg._policy.requests[0]
+    assert req.stage == 2 and req.domain == "soc" and req.confidence == 0.85
+    assert req.params == {"severity": "high"}                   # meta fields never reach the action
+    assert req.judgement == {"begruendung": "beacon confirmed", "gegenargumente": "could be a scanner",
+                             "unsicherheiten": "only one sensor", "konfidenz": 0.85}
+    wire = req.to_wire()
+    assert wire["kontext"]["stufe"] == 2 and wire["kontext"]["agent_konfidenz"] == 0.85
+    assert wire["kontext"]["domaene"] == "soc" and wire["kontext"]["principal_type"] == "agent"
+    assert wire["kontext"]["initiator"] == "triage" and "reversib" not in str(wire)
+    assert rules.calls == [{"container": 4711, "severity": "high"}]
+
+
+@pytest.mark.parametrize("konfidenz", ["high", 1.5, -0.1, True, None, "0.9x"])
+def test_unusable_confidence_is_dropped_not_rejected(rules, konfidenz):
+    reg = registry()
+    assert reg.execute("update_severity", {**GOOD, "konfidenz": konfidenz}).startswith("Container severity")
+    req = reg._policy.requests[0]
+    assert req.confidence is None and "konfidenz" not in req.judgement
+
+
+@pytest.mark.parametrize("stage", [True, "2", 3.5, None])
+def test_stage_is_an_int_or_unknown(stage):
+    assert registry(stage=stage).stage is None
+    assert registry(stage=0).stage == 0 and registry(stage=4).stage == 4
+
+
+def test_prompt_marks_unsicherheiten_and_konfidenz_optional():
+    line = next(ln for ln in registry().get_tool_descriptions().splitlines() if ln.startswith("- update_severity("))
+    assert "unsicherheiten: optional" in line and "konfidenz: optional" in line
 
 
 # --- loop: audit carries entscheidung_id, policy HALTED ends the run ----------------------
