@@ -13,7 +13,14 @@ import types
 import pytest
 
 from soar_agent_runtime_broker import InvokeResult
-from soar_agent_runtime_utils import ToolRegistry
+from soar_agent_runtime_policy import (
+    CODE_HALTED,
+    CODE_NO_POLICY_MODE,
+    GATE_APPROVE_2PERSON,
+    PolicyDecision,
+    StubPolicyClient,
+)
+from soar_agent_runtime_utils import ReActLoop, ToolRegistry
 
 OK = InvokeResult(ok=True, aufruf_id="tb-1", vorlage_id="asset_kontext", vorlage_version=1,
                   katalog_version="k", zeilen=1, daten=[{"asset": "srv-1"}])
@@ -42,10 +49,21 @@ def rules(monkeypatch):
     return mod
 
 
-def registry(airgap=True, allowed=("update_severity", "add_note", "broker_invoke"), broker=None, steps=2):
-    progress = []
-    connector = types.SimpleNamespace(save_progress=lambda m, *a, **k: progress.append(str(m)))
-    reg = ToolRegistry(connector, 4711, list(allowed), agent_id="triage", broker=broker, run_id="rt-x", airgap=airgap)
+def registry(airgap=True, allowed=("update_severity", "add_note", "broker_invoke"), broker=None, steps=2,
+             policy=None, artifact_ok=True):
+    progress, artifacts = [], []
+
+    def save_artifact(artifact):
+        artifacts.append(artifact)
+        return (True, "ok", len(artifacts)) if artifact_ok else (False, "database read-only", None)
+
+    connector = types.SimpleNamespace(save_progress=lambda m, *a, **k: progress.append(str(m)),
+                                      save_artifact=save_artifact)
+    if policy is None:
+        policy = StubPolicyClient()   # ALLOW with pm-stub-1 unless a test says otherwise
+    reg = ToolRegistry(connector, 4711, list(allowed), agent_id="triage", broker=broker, run_id="rt-x",
+                       airgap=airgap, policy=policy)
+    reg._progress, reg._artifacts, reg._policy = progress, artifacts, policy
     for n in range(1, steps + 1):          # the loop calls set_step before every tool call
         reg.set_step(n, f"rt-x/{n}")
     return reg
@@ -96,7 +114,7 @@ def test_valid_evidence_lets_the_call_through(rules):
     reg.execute("broker_invoke", {"vorlage_id": "asset_kontext"})
     reg.set_step(4, "rt-x/4")
     result = reg.execute("update_severity", {**GOOD, "beleg_ids": ["tb-1", "rt-x/3"]})
-    assert result == "Container severity updated to: high"    # gate itself arrives in 3.4
+    assert result == "Container severity updated to: high (entscheidung_id=pm-stub-1)"
     assert rules.calls == [{"container": 4711, "severity": "high"}]
 
 
@@ -129,3 +147,181 @@ def test_prompt_lists_effect_params_only_in_airgap():
     assert "beleg_ids" not in add_note
     normal = registry(airgap=False).get_tool_descriptions()
     assert "beleg_ids" not in normal
+
+
+# --- RT-W06/W07: the gate ---------------------------------------------------------------
+
+APPROVE = PolicyDecision(gate=GATE_APPROVE_2PERSON, decision_id="e-2", approval_id="f-2", approvals_needed=2,
+                         expires_at="2026-10-20T10:00:00Z", policy_version="v1")
+
+
+def test_allow_executes_and_sends_the_request_without_meta_params(rules):
+    reg = registry()
+    result = reg.execute("update_severity", GOOD)
+    assert result == "Container severity updated to: high (entscheidung_id=pm-stub-1)"
+    assert reg.last_decision_id == "pm-stub-1" and rules.calls == [{"container": 4711, "severity": "high"}]
+    req = reg._policy.requests[0]
+    assert req.kind == "update_severity" and req.params == {"severity": "high"}
+    assert req.targets == ("container:4711",) and req.initiator == "triage" and req.agent_id == "triage"
+    assert req.run_id == "rt-x" and req.step_id == "rt-x/2" and req.evidence_ids == ("rt-x/1",)
+    assert req.judgement == {"begruendung": "beacon confirmed", "gegenargumente": "could be a scanner"}
+    assert req.category == "Triage"
+    assert "[policy] decide update_severity (step 2)" in reg._progress
+
+
+def test_no_policy_client_in_airgap_denies_every_effecting_action(rules):
+    progress = []
+    connector = types.SimpleNamespace(save_progress=lambda m, *a, **k: progress.append(str(m)))
+    reg = ToolRegistry(connector, 4711, ["update_severity"], agent_id="triage", run_id="rt-x", airgap=True)
+    reg.set_step(1, "rt-x/1")
+    reg.set_step(2, "rt-x/2")
+    result = reg.execute("update_severity", GOOD)
+    assert result.startswith(f"POLICY DENIED code={CODE_NO_POLICY_MODE}")
+    assert "policy_mode not configured" in result and "was not executed" in result
+    assert rules.calls == []
+
+
+def test_approval_gate_records_proposal_and_does_not_execute(rules):
+    rules.notes = []
+    rules.add_note = lambda **kw: rules.notes.append(kw)
+    reg = registry(policy=StubPolicyClient(APPROVE))
+    result = reg.execute("update_severity", GOOD)
+    assert result.startswith("HELD: 'update_severity' requires APPROVE_2PERSON (2 approval(s))")
+    assert "freigabe_id=f-2" in result and "entscheidung_id=e-2" in result and "not executed" in result
+    assert "consume(freigabe_id)" in result and "Do not retry" in result
+    assert rules.calls == []                                    # AC-07: nothing executed
+    assert reg.last_decision_id == "e-2"
+    [artifact] = reg._artifacts
+    assert artifact["label"] == "agent_action_proposal" and artifact["container_id"] == 4711
+    assert artifact["run_automation"] is False and artifact["name"] == "update_severity -> high"
+    assert artifact["source_data_identifier"] == "f-2:rt-x/2"
+    cef = artifact["cef"]
+    assert cef["freigabe_id"] == "f-2" and cef["entscheidung_id"] == "e-2" and cef["gate"] == "APPROVE_2PERSON"
+    assert cef["aktion"] == "update_severity" and cef["ziel"] == ["container:4711"]
+    assert cef["parameter"] == '{"severity": "high"}' and cef["beleg_ids"] == ["rt-x/1"]
+    assert cef["lauf_id"] == "rt-x" and cef["schritt_id"] == "rt-x/2" and cef["agent_id"] == "triage"
+    assert cef["begruendung"] == "beacon confirmed" and cef["ablauf"] == "2026-10-20T10:00:00Z"
+    assert cef["freigaben_noetig"] == 2 and cef["policy_version"] == "v1"
+    [note] = rules.notes
+    assert note["container"] == 4711 and note["title"] == "Freigabe ausstehend: update_severity -> high"
+    assert "f-2" in note["content"] and "consume(freigabe_id)" in note["content"]
+    assert reg._policy.consumed == []                            # the runtime never consumes
+
+
+def test_failed_proposal_artifact_is_an_error_and_nothing_runs(rules):
+    reg = registry(policy=StubPolicyClient(APPROVE), artifact_ok=False)
+    result = reg.execute("update_severity", GOOD)
+    assert result.startswith("ERROR: proposal not recorded (database read-only)")
+    assert "no approval is pending" in result and rules.calls == []
+
+
+def test_failed_note_does_not_undo_the_proposal(rules):
+    def boom(**kw):
+        raise RuntimeError("notes down")
+    rules.add_note = boom
+    reg = registry(policy=StubPolicyClient(APPROVE))
+    assert reg.execute("update_severity", GOOD).startswith("HELD:")
+    assert len(reg._artifacts) == 1 and any("proposal note failed" in m for m in reg._progress)
+
+
+def test_deny_reports_code_and_reason(rules):
+    deny = PolicyDecision.deny("NOT_ALLOWED_FOR_AGENT", "triage may not change severity", "e-9")
+    reg = registry(policy=StubPolicyClient(deny))
+    result = reg.execute("update_severity", GOOD)
+    assert result == ("POLICY DENIED code=NOT_ALLOWED_FOR_AGENT (triage may not change severity); "
+                      "'update_severity' was not executed.")
+    assert rules.calls == [] and reg.halted is False and reg._artifacts == []
+
+
+def test_halted_policy_manager_halts_the_registry(rules):
+    reg = registry(policy=StubPolicyClient(halted=True))
+    result = reg.execute("update_severity", GOOD)
+    assert result.startswith(f"POLICY DENIED code={CODE_HALTED}")
+    assert reg.halted is True and reg.halt_source == "Policy Manager" and rules.calls == []
+
+
+def test_allow_with_failing_handler_reports_the_error_with_decision_id(rules):
+    def boom(**kw):
+        raise RuntimeError("platform down")
+    rules.update_container = boom
+    assert registry().execute("update_severity", GOOD) == \
+        "Failed to update severity: RuntimeError: platform down (entscheidung_id=pm-stub-1)"
+
+
+def test_outside_airgap_the_gate_is_not_consulted(rules):
+    reg = registry(airgap=False, policy=StubPolicyClient(halted=True))
+    assert reg.execute("update_severity", {"severity": "low"}) == "Container severity updated to: low"
+    assert reg._policy.requests == [] and reg.halted is False
+
+
+# --- loop: audit carries entscheidung_id, policy HALTED ends the run ----------------------
+
+class FakeLLM:
+    provider, model = "local", "fake"
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.seen = []
+
+    def chat(self, system_prompt, messages):
+        self.seen.append([dict(m) for m in messages])
+        return self.responses.pop(0)
+
+
+class FakeSink:
+    fail_closed = False
+
+    def __init__(self):
+        self.events = []
+
+    def write(self, event):
+        self.events.append(event)
+        return True
+
+    def flush(self):
+        return True
+
+
+def make_loop(responses, policy):
+    reg = registry(policy=policy, steps=0)
+    llm, sink = FakeLLM(responses), FakeSink()
+    loop = ReActLoop(connector=reg.connector, llm=llm, tools=reg, agent_id="triage", system_prompt="x",
+                     max_steps=5, container_id=4711, run_id="rt-x", audit=sink)
+    return loop, llm, reg, sink
+
+
+ACT = ('ACTION: update_severity\nPARAMS: {"severity": "high", "begruendung": "b", "gegenargumente": "g", '
+       '"beleg_ids": ["rt-x/1"]}')
+
+
+def test_loop_audit_event_carries_entscheidung_id(rules):
+    loop, llm, reg, sink = make_loop(["ACTION: get_container_info", ACT, "FINAL_ANSWER: done"], StubPolicyClient())
+    rules.get_container = lambda cid: {"id": cid}
+    rules.get_artifacts = lambda container_id: []
+    loop.run("t")
+    done = [e for e in sink.events if e["werkzeug"] == "update_severity" and e["phase"] == "erledigt"]
+    assert done and done[0]["entscheidung_id"] == "pm-stub-1"
+    assert rules.calls == [{"container": 4711, "severity": "high"}]
+
+
+def test_loop_ends_when_the_policy_manager_is_halted(rules):
+    loop, llm, reg, sink = make_loop(["ACTION: get_container_info", ACT, "FINAL_ANSWER: never"],
+                                     StubPolicyClient(halted=True))
+    rules.get_container = lambda cid: {"id": cid}
+    rules.get_artifacts = lambda container_id: []
+    result = loop.run("t")
+    assert result["final_answer"] == "ERROR: run halted by Policy Manager (HALTED)"
+    assert result["steps_taken"] == 2 and len(llm.seen) == 2 and rules.calls == []
+    assert sink.events[-1]["phase"] == "fehler" and sink.events[-1]["werkzeug"] == "update_severity"
+
+
+def test_loop_continues_after_a_held_proposal(rules):
+    rules.add_note = lambda **kw: None
+    loop, llm, reg, sink = make_loop(["ACTION: get_container_info", ACT, "FINAL_ANSWER: proposed"],
+                                     StubPolicyClient(APPROVE))
+    rules.get_container = lambda cid: {"id": cid}
+    rules.get_artifacts = lambda container_id: []
+    result = loop.run("t")
+    assert result["final_answer"] == "proposed" and result["steps_taken"] == 3   # AC-07: no waiting
+    assert "HELD: 'update_severity'" in llm.seen[2][-1]["content"]
+    assert rules.calls == [] and len(reg._artifacts) == 1

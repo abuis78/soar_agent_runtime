@@ -11,6 +11,12 @@ import secrets
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
+from soar_agent_runtime_policy import (
+    CODE_HALTED as POLICY_CODE_HALTED,
+    NoPolicyClient,
+    PolicyRequest,
+)
+
 try:
     import anthropic
     HAS_ANTHROPIC = True
@@ -467,6 +473,7 @@ class ToolRegistry:
         broker=None,
         run_id: str = "",
         airgap: bool = False,
+        policy=None,
     ) -> None:
         self.connector = connector
         self.container_id = container_id
@@ -491,9 +498,16 @@ class ToolRegistry:
         self.evidence: set[str] = set()       # aufruf_ids of this run (RT-L04 -> RT-P06)
         self.step_ids: set[str] = set()       # schritt_ids seen so far (own evidence, RT-W05)
         self.halted = False                   # set by a HALTED answer (RT-L05 / RT-B01)
+        self.halt_source = ""                 # "Tool Broker" or "Policy Manager"
         self.current_step = 0
         self.current_step_id = ""
         self.last_call_id = ""                # aufruf_id of the most recent execute()
+        self.last_decision_id = ""            # entscheidung_id of the most recent execute()
+        # Policy Manager gate (RT-W03/W06): in airgap_mode an effecting tool
+        # runs only after decide(). No client configured = every effecting
+        # action denied (fail-closed), outside airgap the gate is not used (E4).
+        self.policy = policy if policy is not None else NoPolicyClient(
+            "policy_mode not configured; every effecting action is denied (RT-W03)")
 
     # -- Tool Broker ----------------------------------------------------------
 
@@ -619,6 +633,7 @@ class ToolRegistry:
 
     def execute(self, tool_name: str, params: dict) -> str:
         self.last_call_id = ""
+        self.last_decision_id = ""
         if self.airgap and tool_name == self.LEGACY_SPL_TOOL:
             return (f"ERROR: Tool '{self.LEGACY_SPL_TOOL}' is disabled in airgap_mode; "
                     "read data via broker_invoke templates.")
@@ -629,16 +644,126 @@ class ToolRegistry:
         if not (handler := getattr(self, f"_tool_{tool_name}", None)):
             return f"ERROR: Tool '{tool_name}' is registered but not implemented."
         if self.airgap and self.has_effect(tool_name):
-            # RT-W05: evidence is checked here, before any policy request (3.4).
+            # RT-W05: evidence is checked here, before any policy request.
             if error := self._check_effect_params(tool_name, params):
                 self._emit_action(tool_name, error)
                 return error
+            result = self._gate_effect(tool_name, handler, params)
+            self._emit_action(tool_name, result)
+            return result
         try:
             result = handler(params)
         except Exception as e:
             result = f"ERROR executing {tool_name}: {_scrub_exc(e)}"
         self._emit_action(tool_name, result)
         return result
+
+    # -- Policy Manager gate (RT-W06, W07) --------------------------------------
+
+    PROPOSAL_LABEL = "agent_action_proposal"
+    META_PARAMS = ("begruendung", "gegenargumente", "beleg_ids")
+
+    def _build_policy_request(self, tool_name: str, params: dict) -> PolicyRequest:
+        """Request content per RT-W08 (3.4: core fields; stufe/domaene/konfidenz in 3.5)."""
+        action_params = {k: v for k, v in params.items() if k not in self.META_PARAMS}
+        return PolicyRequest(
+            kind=tool_name,
+            category=_ACTION_TELEMETRY.get(tool_name, ""),
+            targets=(f"container:{self.container_id}",),
+            params=action_params,
+            initiator=self.agent_id,
+            agent_id=self.agent_id,
+            run_id=self.run_id,
+            step_id=self.current_step_id,
+            evidence_ids=tuple(str(b) for b in params.get("beleg_ids", [])),
+            judgement={"begruendung": params.get("begruendung", ""),
+                       "gegenargumente": params.get("gegenargumente", "")},
+        )
+
+    def _gate_effect(self, tool_name: str, handler, params: dict) -> str:
+        """Ask the Policy Manager; execute only on ALLOW, propose on an approval
+        gate, report DENY. Never waits for an approval (RT-W06)."""
+        request = self._build_policy_request(tool_name, params)
+        self.connector.save_progress(f"[policy] decide {tool_name} (step {self.current_step})")
+        decision = self.policy.decide(request)
+        self.last_decision_id = decision.decision_id
+        if decision.allowed:
+            try:
+                result = handler(params)
+            except Exception as e:
+                result = f"ERROR executing {tool_name}: {_scrub_exc(e)}"
+            return f"{result} (entscheidung_id={decision.decision_id})"
+        if decision.needs_approval:
+            recorded, detail = self._record_proposal(tool_name, request, decision)
+            if not recorded:
+                return (f"ERROR: proposal not recorded ({detail}); '{tool_name}' was not executed "
+                        f"and no approval is pending.")
+            return (f"HELD: '{tool_name}' requires {decision.gate} ({decision.approvals_needed or 1} approval(s)). "
+                    f"Proposal recorded with freigabe_id={decision.approval_id} "
+                    f"entscheidung_id={decision.decision_id}; not executed. The run continues; a follow-up "
+                    f"playbook executes the action after consume(freigabe_id). Do not retry this action.")
+        if decision.code == POLICY_CODE_HALTED:
+            self.halted = True
+            self.halt_source = "Policy Manager"
+        reason = decision.reason_text()
+        return (f"POLICY DENIED code={decision.code or 'DENY'}"
+                f"{' (' + reason + ')' if reason else ''}; '{tool_name}' was not executed.")
+
+    def _record_proposal(self, tool_name: str, request: PolicyRequest, decision) -> tuple[bool, str]:
+        """Artifact + note with the data a follow-up playbook needs (RT-W07)."""
+        target = request.params.get("severity") or ", ".join(request.targets)
+        cef = {
+            "freigabe_id": decision.approval_id,
+            "entscheidung_id": decision.decision_id,
+            "gate": decision.gate,
+            "freigaben_noetig": decision.approvals_needed,
+            "ablauf": decision.expires_at,
+            "aktion": tool_name,
+            "ziel": list(request.targets),
+            "parameter": json.dumps(request.params, sort_keys=True, default=str),
+            "lauf_id": request.run_id,
+            "schritt_id": request.step_id,
+            "agent_id": request.agent_id,
+            "begruendung": request.judgement.get("begruendung", ""),
+            "gegenargumente": request.judgement.get("gegenargumente", ""),
+            "beleg_ids": list(request.evidence_ids),
+            "policy_version": decision.policy_version,
+        }
+        artifact = {
+            "container_id": self.container_id,
+            "label": self.PROPOSAL_LABEL,
+            "name": f"{tool_name} -> {target}",
+            "type": self.PROPOSAL_LABEL,
+            "source_data_identifier": f"{decision.approval_id}:{request.step_id}",
+            "cef": cef,
+            "run_automation": False,
+        }
+        try:
+            status, message, _artifact_id = self.connector.save_artifact(artifact)
+        except Exception as e:
+            return False, _scrub_exc(e)
+        if not status:
+            return False, _scrub(str(message or "save_artifact returned APP_ERROR"))
+        try:
+            import phantom.rules as ph_rules
+            ph_rules.add_note(
+                container=self.container_id, note_type="general",
+                title=f"Freigabe ausstehend: {tool_name} -> {target}",
+                content=(f"Agent `{request.agent_id}` schlaegt `{tool_name}` vor (Lauf `{request.run_id}`, "
+                         f"Schritt `{request.step_id}`).\n\n"
+                         f"- Gate: {decision.gate} ({decision.approvals_needed or 1} Freigabe(n))\n"
+                         f"- freigabe_id: `{decision.approval_id}`\n"
+                         f"- entscheidung_id: `{decision.decision_id}`\n"
+                         f"- Parameter: `{cef['parameter']}`\n"
+                         f"- Begruendung: {cef['begruendung']}\n"
+                         f"- Gegenargumente: {cef['gegenargumente']}\n"
+                         f"- Belege: {', '.join(request.evidence_ids)}\n\n"
+                         f"Ausfuehrung nur durch das Folge-Playbook nach `consume(freigabe_id)`."),
+            )
+        except Exception as e:
+            # The artifact is the contract (RT-W07); a failed note is reported, not fatal.
+            self.connector.save_progress(f"[policy] proposal note failed: {_scrub_exc(e)}")
+        return True, ""
 
     def _emit_action(self, tool_name: str, result: str) -> None:
         """Report a decision-type tool call as an agent_action telemetry event.
@@ -1107,7 +1232,8 @@ class ReActLoop:
     def _audit_fail_closed(self) -> bool:
         return bool(self.audit is not None and getattr(self.audit, "fail_closed", False))
 
-    def _audit(self, phase: str, step_entry: dict, observation: str | None = None, call_id: str = "") -> bool:
+    def _audit(self, phase: str, step_entry: dict, observation: str | None = None, call_id: str = "",
+               decision_id: str = "") -> bool:
         """Write one audit event; True when stored (or audit disabled)."""
         if self.audit is None:
             return True
@@ -1122,6 +1248,7 @@ class ReActLoop:
             params=step_entry.get("params") or {},
             observation=observation,
             call_id=call_id,
+            decision_id=decision_id,
             def_version=self.def_version,
         )
         ok = False
@@ -1248,13 +1375,15 @@ class ReActLoop:
                 self.step_log.append(step_entry)
                 halted = bool(getattr(self.tools, "halted", False))
                 call_id = str(getattr(self.tools, "last_call_id", "") or "")
+                decision_id = str(getattr(self.tools, "last_decision_id", "") or "")
                 if not self._audit("fehler" if halted else "erledigt", step_entry, observation,
-                                   call_id=call_id) and fail_closed:
+                                   call_id=call_id, decision_id=decision_id) and fail_closed:
                     return self._audit_abort(step_entry, steps_taken, f" after '{tool_name}'")
                 if halted:
                     # RT-L05 / RT-B01: HALTED from the broker ends the run before the next step.
-                    self.connector.save_progress(f"Agent '{self.agent_id}' halted by Tool Broker.")
-                    return self._error_result("run halted by Tool Broker (HALTED)", steps_taken)
+                    source = str(getattr(self.tools, "halt_source", "") or "Tool Broker")
+                    self.connector.save_progress(f"Agent '{self.agent_id}' halted by {source}.")
+                    return self._error_result(f"run halted by {source} (HALTED)", steps_taken)
                 # Issue #2 (central boundary): every tool observation is sanitized
                 # and length-capped before it re-enters the LLM conversation.
                 safe_obs = _mark_data(
