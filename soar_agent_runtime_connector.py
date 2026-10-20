@@ -306,9 +306,11 @@ class SoarAgentRuntimeConnector(BaseConnector):
             except Exception as e:
                 results[provider_name] = f"ERROR: {str(e)}"
 
-        # RT-A04 (part 2): Tool Broker health. Mandatory in airgap_mode,
-        # informational otherwise. Policy Manager health follows in 3.7.
+        # RT-A04 (part 2): Tool Broker and Policy Manager health. Both are
+        # mandatory in airgap_mode; outside it the broker is informational and
+        # the policy gate is not used at all (E4).
         broker_ok = self._test_broker(results)
+        policy_ok = self._test_policy(results)
 
         if not any_success:
             return action_result.set_status(
@@ -316,6 +318,9 @@ class SoarAgentRuntimeConnector(BaseConnector):
         if self._airgap_mode and not broker_ok:
             return action_result.set_status(
                 phantom.APP_ERROR, f"Broker check failed ({mode}). Results: {json.dumps(results)}")
+        if self._airgap_mode and not policy_ok:
+            return action_result.set_status(
+                phantom.APP_ERROR, f"Policy check failed ({mode}). Results: {json.dumps(results)}")
         return action_result.set_status(
             phantom.APP_SUCCESS, f"Connectivity OK ({mode}). Results: {json.dumps(results)}")
 
@@ -350,6 +355,28 @@ class SoarAgentRuntimeConnector(BaseConnector):
             return False
         ok, message = client.health()
         results["broker"] = f"OK: {message}" if ok else f"ERROR: {message}"
+        return ok
+
+    def _test_policy(self, results: dict) -> bool:
+        """Fill results["policy"]; True only when the Policy Manager gate reports healthy.
+
+        A halted Policy Manager is reachable and therefore healthy; health()
+        says "HALTED (<reason>)" so the operator sees it. Outside airgap_mode
+        the gate is never consulted (E4), so nothing is built or checked.
+        """
+        if not self._policy_mode:
+            results["policy"] = ("NOT CONFIGURED (required in airgap_mode)" if self._airgap_mode
+                                 else "SKIPPED (no policy_mode)")
+            return False
+        if not self._airgap_mode:
+            results["policy"] = f"SKIPPED (policy_mode '{self._policy_mode}' is only used in airgap_mode)"
+            return False
+        self.save_progress("Testing policy manager...")
+        try:
+            ok, message = self._build_policy_client().health()
+        except Exception as e:  # fail closed, like every other gate call (RT-W03)
+            ok, message = False, f"policy health check raised {type(e).__name__}: {e}"
+        results["policy"] = f"OK: {message}" if ok else f"ERROR: {message}"
         return ok
 
     # -----------------------------------------------------------------------

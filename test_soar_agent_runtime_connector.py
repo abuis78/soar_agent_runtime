@@ -8,11 +8,13 @@ llm_* asset fields reach LLMProvider. Runs off-platform via conftest.py.
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 
 import soar_agent_runtime_connector as connector_module
 from soar_agent_runtime_connector import SoarAgentRuntimeConnector
+from soar_agent_runtime_policy import NoPolicyClient, StubPolicyClient
 
 CLOUD_PROVIDERS = ["anthropic", "openai", "gemini"]
 ALL_PROVIDERS = CLOUD_PROVIDERS + ["local"]
@@ -179,11 +181,12 @@ def test_connectivity_without_airgap_skips_unconfigured_cloud_providers(monkeypa
 
 
 def test_connectivity_in_airgap_only_contacts_local(monkeypatch):
-    """Since 2.6 the airgap check also needs a healthy broker; cloud providers stay untouched."""
+    """Since 2.6/3.7 the airgap check also needs a healthy broker and policy gate; cloud stays untouched."""
     tested = _record_connection_tests(monkeypatch)
     c = make_connector(airgap_mode=True, broker_url="https://broker.internal:8443",
-                       broker_client_cert="/etc/rt.crt", broker_client_key="/etc/rt.key")
+                       broker_client_cert="/etc/rt.crt", broker_client_key="/etc/rt.key", policy_mode="embedded")
     c._broker_transport = lambda method, url, params, body, timeout_s: (200, {"status": "ok"})
+    c._policy_client = StubPolicyClient()
     status = c._handle_test_connectivity({})
     assert tested == ["local"]
     assert status is True
@@ -421,6 +424,8 @@ def test_app_json_declares_broker_fields_in_order():
 
 BROKER_ASSET = {"broker_url": "https://broker.internal:8443", "broker_client_cert": "/etc/rt.crt",
                 "broker_client_key": "/etc/rt.key", "broker_ca": "/etc/ca.pem"}
+POLICY_ASSET = {"policy_mode": "embedded", "policy_path": "/opt/phantom/etc/policy.json",
+                "policy_state_dir": "/opt/phantom/local/data/policy/"}
 TOOLS_BODY = {"katalog_version": "k1", "angehalten": False,
               "vorlagen": [{"vorlage_id": "asset_kontext", "version": 1, "beschreibung": "Asset-Stammdaten"}]}
 
@@ -537,6 +542,13 @@ def test_run_agent_passes_airgap_flag_to_registry(monkeypatch):
 
 # --- test connectivity: broker health (RT-A04 part 2, sub-change 2.6) --------
 
+def _airgap_connector(policy=None, **overrides) -> SoarAgentRuntimeConnector:
+    """Airgap asset with broker and policy configured; the policy gate is a stub (3.7)."""
+    c = make_connector(**({"airgap_mode": True} | BROKER_ASSET | POLICY_ASSET | overrides))
+    c._policy_client = policy or StubPolicyClient()
+    return c
+
+
 def _health_transport(status=200, exc=None):
     calls = []
 
@@ -552,7 +564,7 @@ def _health_transport(status=200, exc=None):
 
 def test_connectivity_airgap_with_healthy_broker_succeeds(monkeypatch):
     _record_connection_tests(monkeypatch)
-    c = make_connector(airgap_mode=True, **BROKER_ASSET)
+    c = _airgap_connector()
     c._broker_transport = _health_transport()
     assert c._handle_test_connectivity({}) is True
     msg = c.action_results[-1].message
@@ -564,7 +576,7 @@ def test_connectivity_airgap_with_healthy_broker_succeeds(monkeypatch):
 
 def test_connectivity_airgap_with_unreachable_broker_fails_despite_healthy_local(monkeypatch):
     _record_connection_tests(monkeypatch)
-    c = make_connector(airgap_mode=True, **BROKER_ASSET)
+    c = _airgap_connector()
     c._broker_transport = _health_transport(exc=ConnectionError("refused"))
     assert c._handle_test_connectivity({}) is False
     msg = c.action_results[-1].message
@@ -581,14 +593,14 @@ def test_connectivity_airgap_without_broker_url_fails_as_not_configured(monkeypa
 
 def test_connectivity_airgap_with_misconfigured_broker_reports_it(monkeypatch):
     _record_connection_tests(monkeypatch)
-    c = make_connector(airgap_mode=True, **(BROKER_ASSET | {"broker_url": "http://broker.internal"}))
+    c = _airgap_connector(broker_url="http://broker.internal")
     assert c._handle_test_connectivity({}) is False
     assert '"broker": "ERROR: misconfigured: broker_url must be an https:// URL' in c.action_results[-1].message
 
 
 def test_connectivity_airgap_local_failure_still_wins_over_broker(monkeypatch):
     _record_connection_tests(monkeypatch, outcome=(False, "connection refused"))
-    c = make_connector(airgap_mode=True, **BROKER_ASSET)
+    c = _airgap_connector()
     c._broker_transport = _health_transport()
     assert c._handle_test_connectivity({}) is False
     assert c.action_results[-1].message.startswith("All providers failed (airgap).")
@@ -613,11 +625,6 @@ def test_connectivity_normal_mode_unhealthy_broker_is_reported_but_not_fatal(mon
 
 
 # --- Policy Manager wiring (RT-W03, W08, E11; sub-change 3.1a) ----------------
-
-from soar_agent_runtime_policy import NoPolicyClient, StubPolicyClient  # noqa: E402
-
-POLICY_ASSET = {"policy_mode": "embedded", "policy_path": "/opt/phantom/etc/policy.json",
-                "policy_state_dir": "/opt/phantom/local/data/policy/"}
 
 
 def test_app_json_declares_policy_fields_and_run_agent_params():
@@ -656,7 +663,6 @@ def test_airgap_without_policy_mode_builds_a_denying_client():
 
 
 def test_airgap_embedded_without_package_is_unavailable(monkeypatch):
-    import sys
     monkeypatch.setitem(sys.modules, "policy_client", None)
     monkeypatch.setitem(sys.modules, "policy_client.embedded", None)
     gate = make_connector(airgap_mode=True, **POLICY_ASSET)._build_policy_client()
@@ -707,3 +713,104 @@ def test_run_agent_outside_airgap_passes_no_policy(monkeypatch):
     seen = _capture_registry(monkeypatch)
     make_connector()._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 7})
     assert seen["policy"] is None and seen["stage"] is None and seen["domain"] == ""
+
+
+# --- test connectivity: Policy Manager health (RT-A04 part 2, sub-change 3.7) --
+
+class _HealthGate(NoPolicyClient):
+    """Gate whose health() is scripted: a (ok, message) tuple or an exception."""
+
+    def __init__(self, outcome):
+        super().__init__("scripted")
+        self.outcome = outcome
+
+    def health(self):
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return self.outcome
+
+
+def test_connectivity_airgap_with_healthy_policy_reports_ok(monkeypatch):
+    _record_connection_tests(monkeypatch)
+    c = _airgap_connector()
+    c._broker_transport = _health_transport()
+    assert c._handle_test_connectivity({}) is True
+    assert '"policy": "OK: policy stub healthy"' in c.action_results[-1].message
+    assert "Testing policy manager..." in c.progress
+
+
+def test_connectivity_airgap_with_unhealthy_policy_fails_despite_healthy_local_and_broker(monkeypatch):
+    _record_connection_tests(monkeypatch)
+    c = _airgap_connector(policy=StubPolicyClient(healthy=False))
+    c._broker_transport = _health_transport()
+    assert c._handle_test_connectivity({}) is False
+    msg = c.action_results[-1].message
+    assert msg.startswith("Policy check failed (airgap).")
+    assert '"policy": "ERROR: policy stub unhealthy"' in msg
+    assert '"broker": "OK: broker healthy (HTTP 200)"' in msg and '"local": "OK"' in msg
+
+
+def test_connectivity_airgap_without_policy_mode_fails_as_not_configured(monkeypatch):
+    _record_connection_tests(monkeypatch)
+    c = make_connector(airgap_mode=True, **BROKER_ASSET)
+    c._broker_transport = _health_transport()
+    assert c._handle_test_connectivity({}) is False
+    msg = c.action_results[-1].message
+    assert msg.startswith("Policy check failed (airgap).")
+    assert '"policy": "NOT CONFIGURED (required in airgap_mode)"' in msg
+    assert "Testing policy manager..." not in c.progress
+
+
+def test_connectivity_airgap_without_policy_package_reports_unavailable(monkeypatch):
+    _record_connection_tests(monkeypatch)
+    monkeypatch.setitem(sys.modules, "policy_client", None)
+    monkeypatch.setitem(sys.modules, "policy_client.embedded", None)
+    c = make_connector(airgap_mode=True, **BROKER_ASSET, **POLICY_ASSET)   # no injected stub
+    c._broker_transport = _health_transport()
+    assert c._handle_test_connectivity({}) is False
+    msg = c.action_results[-1].message
+    assert msg.startswith("Policy check failed (airgap).")
+    assert '"policy": "ERROR: policy_client package not available' in msg
+
+
+def test_connectivity_airgap_halted_policy_manager_is_healthy_but_flagged(monkeypatch):
+    _record_connection_tests(monkeypatch)
+    c = _airgap_connector(policy=_HealthGate((True, "policy embedded healthy, HALTED (drill)")))
+    c._broker_transport = _health_transport()
+    assert c._handle_test_connectivity({}) is True
+    msg = c.action_results[-1].message
+    assert msg.startswith("Connectivity OK (airgap).") and '"policy": "OK: policy embedded healthy, HALTED (drill)"' in msg
+
+
+def test_connectivity_airgap_policy_health_exception_fails_closed(monkeypatch):
+    _record_connection_tests(monkeypatch)
+    c = _airgap_connector(policy=_HealthGate(OSError("policy.json unreadable")))
+    c._broker_transport = _health_transport()
+    assert c._handle_test_connectivity({}) is False
+    msg = c.action_results[-1].message
+    assert msg.startswith("Policy check failed (airgap).")
+    assert '"policy": "ERROR: policy health check raised OSError: policy.json unreadable"' in msg
+
+
+def test_connectivity_airgap_broker_failure_is_reported_before_policy(monkeypatch):
+    _record_connection_tests(monkeypatch)
+    c = _airgap_connector(policy=StubPolicyClient(healthy=False))
+    c._broker_transport = _health_transport(status=503)
+    assert c._handle_test_connectivity({}) is False
+    msg = c.action_results[-1].message
+    assert msg.startswith("Broker check failed (airgap).") and '"policy": "ERROR: policy stub unhealthy"' in msg
+
+
+def test_connectivity_normal_mode_skips_policy_and_never_builds_a_gate(monkeypatch):
+    _record_connection_tests(monkeypatch)
+    monkeypatch.setattr(connector_module, "build_policy_client",
+                        lambda *a, **k: pytest.fail("policy gate built outside airgap_mode"))
+    c = make_connector(**POLICY_ASSET)
+    assert c._handle_test_connectivity({}) is True
+    msg = c.action_results[-1].message
+    assert msg.startswith("Connectivity OK (normal).")
+    assert '"policy": "SKIPPED (policy_mode \'embedded\' is only used in airgap_mode)"' in msg
+    assert "Testing policy manager..." not in c.progress
+    plain = make_connector()
+    assert plain._handle_test_connectivity({}) is True
+    assert '"policy": "SKIPPED (no policy_mode)"' in plain.action_results[-1].message
