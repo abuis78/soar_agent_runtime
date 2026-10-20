@@ -179,8 +179,11 @@ def test_connectivity_without_airgap_skips_unconfigured_cloud_providers(monkeypa
 
 
 def test_connectivity_in_airgap_only_contacts_local(monkeypatch):
+    """Since 2.6 the airgap check also needs a healthy broker; cloud providers stay untouched."""
     tested = _record_connection_tests(monkeypatch)
-    c = make_connector(airgap_mode=True)
+    c = make_connector(airgap_mode=True, broker_url="https://broker.internal:8443",
+                       broker_client_cert="/etc/rt.crt", broker_client_key="/etc/rt.key")
+    c._broker_transport = lambda method, url, params, body, timeout_s: (200, {"status": "ok"})
     status = c._handle_test_connectivity({})
     assert tested == ["local"]
     assert status is True
@@ -373,3 +376,237 @@ def test_run_agent_passes_max_observation_chars(monkeypatch, config, expected):
     c = make_connector(**config)
     c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 7})
     assert seen["max_observation_chars"] == expected
+
+
+# --- Tool Broker asset fields (RT-L07, sub-change 2.1) -----------------------
+
+def test_broker_fields_default_to_empty_and_30s():
+    c = make_connector()
+    assert (c._broker_url, c._broker_timeout_s, c._broker_client_cert, c._broker_client_key, c._broker_ca) == \
+        ("", 30.0, "", "", "")
+    assert not any("broker_url" in m for m in c.progress)
+
+
+def test_broker_fields_are_read_from_the_asset():
+    c = make_connector(broker_url=" https://broker.internal:8443 ", broker_timeout_s="12",
+                       broker_client_cert="/opt/phantom/etc/rt.crt", broker_client_key="/opt/phantom/etc/rt.key",
+                       broker_ca="/opt/phantom/etc/ca.pem")
+    assert c._broker_url == "https://broker.internal:8443"
+    assert c._broker_timeout_s == 12.0
+    assert (c._broker_client_cert, c._broker_client_key, c._broker_ca) == \
+        ("/opt/phantom/etc/rt.crt", "/opt/phantom/etc/rt.key", "/opt/phantom/etc/ca.pem")
+
+
+def test_airgap_without_broker_url_warns_but_still_initializes():
+    c = make_connector(airgap_mode=True)
+    assert any(m == "[airgap] broker_url not set - read tools unavailable." for m in c.progress)
+
+
+def test_airgap_with_broker_url_does_not_warn():
+    c = make_connector(airgap_mode=True, broker_url="https://broker.internal:8443")
+    assert not any("broker_url not set" in m for m in c.progress)
+
+
+def test_app_json_declares_broker_fields_in_order():
+    with open("soar_agent_runtime.json") as f:
+        app = json.load(f)
+    cfg = app["configuration"]
+    assert app["app_version"] == "1.6.0"
+    assert [cfg[k]["order"] for k in ("broker_url", "broker_timeout_s", "broker_client_cert", "broker_client_key", "broker_ca")] == [23, 24, 25, 26, 27]
+    assert cfg["broker_client_key"]["data_type"] == "string"  # a path, never the key material
+    assert len({f["order"] for f in cfg.values()}) == len(cfg)  # orders unique
+
+
+# --- Tool Broker wiring (RT-L03, L06, L07, B01; sub-change 2.3b) --------------
+
+BROKER_ASSET = {"broker_url": "https://broker.internal:8443", "broker_client_cert": "/etc/rt.crt",
+                "broker_client_key": "/etc/rt.key", "broker_ca": "/etc/ca.pem"}
+TOOLS_BODY = {"katalog_version": "k1", "angehalten": False,
+              "vorlagen": [{"vorlage_id": "asset_kontext", "version": 1, "beschreibung": "Asset-Stammdaten"}]}
+
+
+def _transport(status=200, body=None, exc=None):
+    calls = []
+
+    def send(method, url, params, json_body, timeout_s):
+        calls.append((method, url, params, json_body, timeout_s))
+        if exc:
+            raise exc
+        return status, body
+
+    send.calls = calls
+    return send
+
+
+def test_airgap_with_broker_loads_templates_and_shares_run_id(monkeypatch):
+    seen = _capture_loop(monkeypatch)
+    c = make_connector(airgap_mode=True, **BROKER_ASSET)
+    c._broker_transport = _transport(body=TOOLS_BODY)
+    c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 7})
+    tools = seen["tools"]
+    assert list(tools.broker_tools) == ["asset_kontext"] and tools.broker_status == "ok"
+    assert tools.run_id == seen["run_id"] and tools.run_id.startswith("rt-")
+    assert c._broker_transport.calls[0][:3] == ("GET", "https://broker.internal:8443/v1/tools", {"agent_id": "triage"})
+    assert "asset_kontext v1" in tools.get_tool_descriptions()
+
+
+def test_airgap_with_misconfigured_broker_fails_before_the_run(monkeypatch):
+    seen = _capture_loop(monkeypatch)
+    c = make_connector(airgap_mode=True, **(BROKER_ASSET | {"broker_url": "http://broker.internal:8443"}))
+    status = c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 7})
+    assert status is False and seen == {}
+    assert c.action_results[-1].message.startswith("broker misconfigured: broker_url must be an https:// URL")
+
+
+def test_outside_airgap_misconfigured_broker_only_warns(monkeypatch):
+    seen = _capture_loop(monkeypatch)
+    c = make_connector(**(BROKER_ASSET | {"broker_client_key": ""}))
+    status = c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 7})
+    assert status is True and seen["tools"].broker is None
+    assert any(m.startswith("[broker] misconfigured, running without broker:") for m in c.progress)
+
+
+def test_halted_broker_stops_before_the_first_model_call(monkeypatch):
+    seen = _capture_loop(monkeypatch)
+    c = make_connector(airgap_mode=True, **BROKER_ASSET)
+    c._broker_transport = _transport(body=TOOLS_BODY | {"angehalten": True})
+    status = c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 7})
+    assert status is False and seen == {}
+    assert c.action_results[-1].message == "Tool Broker is HALTED - run not started (RT-B01)"
+    assert c.artifacts == []
+
+
+def test_unreachable_broker_starts_the_run_with_a_data_gap_note(monkeypatch):
+    seen = _capture_loop(monkeypatch)
+    c = make_connector(airgap_mode=True, **BROKER_ASSET)
+    c._broker_transport = _transport(exc=ConnectionError("refused"))
+    status = c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 7})
+    assert status is True
+    tools = seen["tools"]
+    assert tools.broker_status == "UNREACHABLE" and tools.broker_tools == {}
+    assert "Tool Broker: unavailable (UNREACHABLE)" in tools.get_tool_descriptions()
+    assert any("[broker] tools unavailable (UNREACHABLE)" in m for m in c.progress)
+
+
+def test_without_broker_url_registry_has_no_broker(monkeypatch):
+    seen = _capture_loop(monkeypatch)
+    c = make_connector(airgap_mode=True)
+    c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 7})
+    assert seen["tools"].broker is None and seen["tools"].broker_status == ""
+
+
+# --- create agent default tools (RT-L02, sub-change 2.4) ---------------------
+
+def test_create_agent_defaults_to_add_note_only(monkeypatch):
+    saved = {}
+
+    class Store:
+        def __init__(self, *a, **kw):
+            pass
+
+        def save(self, agent_id, config):
+            saved[agent_id] = config
+            return True
+
+    monkeypatch.setattr(connector_module, "AgentDefinitionStore", Store)
+    c = make_connector()
+    assert c._handle_create_agent({"agent_id": "a1"}) is True
+    assert saved["a1"]["allowed_tools"] == "add_note"
+    c._handle_create_agent({"agent_id": "a2", "allowed_tools": ""})
+    assert saved["a2"]["allowed_tools"] == "add_note"
+    c._handle_create_agent({"agent_id": "a3", "allowed_tools": "splunk_search,add_note"})
+    assert saved["a3"]["allowed_tools"] == "splunk_search,add_note"  # explicit choice is kept
+
+
+def test_app_json_create_agent_default_has_no_spl():
+    with open("soar_agent_runtime.json") as f:
+        app = json.load(f)
+    par = next(a for a in app["actions"] if a["action"] == "create agent")["parameters"]["allowed_tools"]
+    assert par["default"] == "add_note"
+    assert "deprecated" in par["description"] and "airgap_mode" in par["description"]
+
+
+def test_run_agent_passes_airgap_flag_to_registry(monkeypatch):
+    seen = _capture_loop(monkeypatch)
+    make_connector(airgap_mode=True)._handle_run_agent({"agent_id": "t", "task": "x", "container_id": 1})
+    assert seen["tools"].airgap is True
+    seen.clear()
+    make_connector()._handle_run_agent({"agent_id": "t", "task": "x", "container_id": 1})
+    assert seen["tools"].airgap is False
+
+
+# --- test connectivity: broker health (RT-A04 part 2, sub-change 2.6) --------
+
+def _health_transport(status=200, exc=None):
+    calls = []
+
+    def send(method, url, params, body, timeout_s):
+        calls.append((method, url))
+        if exc:
+            raise exc
+        return status, {"status": "ok"} if status == 200 else "down"
+
+    send.calls = calls
+    return send
+
+
+def test_connectivity_airgap_with_healthy_broker_succeeds(monkeypatch):
+    _record_connection_tests(monkeypatch)
+    c = make_connector(airgap_mode=True, **BROKER_ASSET)
+    c._broker_transport = _health_transport()
+    assert c._handle_test_connectivity({}) is True
+    msg = c.action_results[-1].message
+    assert msg.startswith("Connectivity OK (airgap).")
+    assert '"broker": "OK: broker healthy (HTTP 200)"' in msg and '"anthropic": "SKIPPED (airgap_mode)"' in msg
+    assert c._broker_transport.calls == [("GET", "https://broker.internal:8443/health")]
+    assert "Testing broker..." in c.progress
+
+
+def test_connectivity_airgap_with_unreachable_broker_fails_despite_healthy_local(monkeypatch):
+    _record_connection_tests(monkeypatch)
+    c = make_connector(airgap_mode=True, **BROKER_ASSET)
+    c._broker_transport = _health_transport(exc=ConnectionError("refused"))
+    assert c._handle_test_connectivity({}) is False
+    msg = c.action_results[-1].message
+    assert msg.startswith("Broker check failed (airgap).") and '"broker": "ERROR: broker unreachable' in msg
+    assert '"local": "OK"' in msg
+
+
+def test_connectivity_airgap_without_broker_url_fails_as_not_configured(monkeypatch):
+    _record_connection_tests(monkeypatch)
+    c = make_connector(airgap_mode=True)
+    assert c._handle_test_connectivity({}) is False
+    assert '"broker": "NOT CONFIGURED (required in airgap_mode)"' in c.action_results[-1].message
+
+
+def test_connectivity_airgap_with_misconfigured_broker_reports_it(monkeypatch):
+    _record_connection_tests(monkeypatch)
+    c = make_connector(airgap_mode=True, **(BROKER_ASSET | {"broker_url": "http://broker.internal"}))
+    assert c._handle_test_connectivity({}) is False
+    assert '"broker": "ERROR: misconfigured: broker_url must be an https:// URL' in c.action_results[-1].message
+
+
+def test_connectivity_airgap_local_failure_still_wins_over_broker(monkeypatch):
+    _record_connection_tests(monkeypatch, outcome=(False, "connection refused"))
+    c = make_connector(airgap_mode=True, **BROKER_ASSET)
+    c._broker_transport = _health_transport()
+    assert c._handle_test_connectivity({}) is False
+    assert c.action_results[-1].message.startswith("All providers failed (airgap).")
+
+
+def test_connectivity_normal_mode_without_broker_is_unchanged(monkeypatch):
+    _record_connection_tests(monkeypatch)
+    c = make_connector()
+    assert c._handle_test_connectivity({}) is True
+    msg = c.action_results[-1].message
+    assert msg.startswith("Connectivity OK (normal).") and '"broker": "SKIPPED (no broker_url)"' in msg
+    assert "Testing broker..." not in c.progress
+
+
+def test_connectivity_normal_mode_unhealthy_broker_is_reported_but_not_fatal(monkeypatch):
+    _record_connection_tests(monkeypatch)
+    c = make_connector(**BROKER_ASSET)
+    c._broker_transport = _health_transport(status=503)
+    assert c._handle_test_connectivity({}) is True
+    msg = c.action_results[-1].message
+    assert msg.startswith("Connectivity OK (normal).") and '"broker": "ERROR: broker unhealthy: HTTP 503' in msg

@@ -19,8 +19,10 @@ from soar_agent_runtime_utils import (
     AGENT_ROLES,
     DEFAULT_AGENT_ROLE,
     MAX_STEPS_HARD_LIMIT,
+    new_run_id,
 )
 from soar_agent_runtime_audit import ArtifactAuditSink, NullAuditSink, definition_version
+from soar_agent_runtime_broker import BrokerClient, BrokerConfig, BrokerConfigError
 
 try:
     from ai_soc_telemetry import TelemetryClient
@@ -52,6 +54,13 @@ class SoarAgentRuntimeConnector(BaseConnector):
         self._llm_seed = None
         self._max_observation_chars = 8000
         self._audit_enabled = False
+        # RT-L07 (Umsetzungskonzept 2.1): Tool Broker connection, mTLS via file paths
+        self._broker_url = ""
+        self._broker_timeout_s = 30.0
+        self._broker_client_cert = ""
+        self._broker_client_key = ""
+        self._broker_ca = ""
+        self._broker_transport = None  # tests inject a fake; None = requests over mTLS
 
     def initialize(self):
         self._config = self.get_config()
@@ -67,8 +76,15 @@ class SoarAgentRuntimeConnector(BaseConnector):
         self._llm_seed = self._cfg_number("llm_seed", None, int)
         self._max_observation_chars = self._cfg_number("max_observation_chars", 8000, int)
         self._audit_enabled = bool(self._config.get("audit_enabled", False))
+        self._broker_url = (self._config.get("broker_url") or "").strip()
+        self._broker_timeout_s = self._cfg_number("broker_timeout_s", 30.0, float)
+        self._broker_client_cert = (self._config.get("broker_client_cert") or "").strip()
+        self._broker_client_key = (self._config.get("broker_client_key") or "").strip()
+        self._broker_ca = (self._config.get("broker_ca") or "").strip()
         if self._airgap_mode:
             self.save_progress("[airgap] enabled - only provider 'local' is allowed.")
+            if not self._broker_url:
+                self.save_progress("[airgap] broker_url not set - read tools unavailable.")
         self._telemetry = self._build_telemetry()
         return phantom.APP_SUCCESS
 
@@ -161,6 +177,27 @@ class SoarAgentRuntimeConnector(BaseConnector):
     def _valid_id(value: str) -> bool:
         """Open item #5: validate identifiers used as Custom-List keys."""
         return bool(_ID_RE.match(value or ""))
+
+    # -----------------------------------------------------------------------
+    # Tool Broker client (RT-L07)
+    # -----------------------------------------------------------------------
+
+    def _build_broker_client(self):
+        """BrokerClient from the asset fields, or None when no broker_url is set.
+
+        Raises BrokerConfigError for an unusable configuration; the caller
+        decides (fail-closed in airgap_mode, warning otherwise).
+        """
+        if not self._broker_url:
+            return None
+        config = BrokerConfig(
+            url=self._broker_url,
+            timeout_s=self._broker_timeout_s,
+            client_cert=self._broker_client_cert,
+            client_key=self._broker_client_key,
+            ca=self._broker_ca,
+        )
+        return BrokerClient(config, transport=self._broker_transport)
 
     # -----------------------------------------------------------------------
     # LLM Provider Factory
@@ -258,11 +295,34 @@ class SoarAgentRuntimeConnector(BaseConnector):
             except Exception as e:
                 results[provider_name] = f"ERROR: {str(e)}"
 
-        if any_success:
+        # RT-A04 (part 2): Tool Broker health. Mandatory in airgap_mode,
+        # informational otherwise. Policy Manager health follows in 3.7.
+        broker_ok = self._test_broker(results)
+
+        if not any_success:
             return action_result.set_status(
-                phantom.APP_SUCCESS, f"Connectivity OK ({mode}). Results: {json.dumps(results)}")
+                phantom.APP_ERROR, f"All providers failed ({mode}). Results: {json.dumps(results)}")
+        if self._airgap_mode and not broker_ok:
+            return action_result.set_status(
+                phantom.APP_ERROR, f"Broker check failed ({mode}). Results: {json.dumps(results)}")
         return action_result.set_status(
-            phantom.APP_ERROR, f"All providers failed ({mode}). Results: {json.dumps(results)}")
+            phantom.APP_SUCCESS, f"Connectivity OK ({mode}). Results: {json.dumps(results)}")
+
+    def _test_broker(self, results: dict) -> bool:
+        """Fill results["broker"]; True only when a configured broker answers /health."""
+        if not self._broker_url:
+            results["broker"] = ("NOT CONFIGURED (required in airgap_mode)" if self._airgap_mode
+                                 else "SKIPPED (no broker_url)")
+            return False
+        self.save_progress("Testing broker...")
+        try:
+            client = self._build_broker_client()
+        except BrokerConfigError as e:
+            results["broker"] = f"ERROR: misconfigured: {e}"
+            return False
+        ok, message = client.health()
+        results["broker"] = f"OK: {message}" if ok else f"ERROR: {message}"
+        return ok
 
     # -----------------------------------------------------------------------
     # Action: run agent
@@ -315,6 +375,19 @@ class SoarAgentRuntimeConnector(BaseConnector):
         except ValueError as e:
             return action_result.set_status(phantom.APP_ERROR, str(e))
 
+        # Tool Broker (RT-L07): misconfiguration is fatal in airgap_mode,
+        # a warning otherwise. Unreachable brokers are handled per run (RT-L06).
+        try:
+            broker = self._build_broker_client()
+        except BrokerConfigError as e:
+            if self._airgap_mode:
+                return action_result.set_status(phantom.APP_ERROR, f"broker misconfigured: {e}")
+            self.save_progress(f"[broker] misconfigured, running without broker: {e}")
+            broker = None
+
+        # One lauf_id for broker context, audit and result (RT-P01)
+        run_id = new_run_id()
+
         # Build tool registry
         allowed_tools_raw = agent_def.get("allowed_tools", ["add_note"])
         if isinstance(allowed_tools_raw, str):
@@ -328,7 +401,15 @@ class SoarAgentRuntimeConnector(BaseConnector):
             telemetry=self._telemetry,
             agent_id=agent_id,
             agent_role=agent_def.get("agent_role", DEFAULT_AGENT_ROLE),
+            broker=broker,
+            run_id=run_id,
+            airgap=self._airgap_mode,
         )
+        tools.load_broker_tools()  # RT-L03: templates once per run
+        if tools.halted:
+            # RT-B01 / RT-L05: halt state known before the first step -> do not start.
+            return action_result.set_status(
+                phantom.APP_ERROR, "Tool Broker is HALTED - run not started (RT-B01)")
 
         # Load and inject skills
         skill_ids = agent_def.get("skills", [])
@@ -362,6 +443,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
             connector=self,
             llm=llm,
             tools=tools,
+            run_id=run_id,
             agent_id=agent_id,
             system_prompt=system_prompt,
             max_steps=max_steps,
@@ -438,7 +520,8 @@ class SoarAgentRuntimeConnector(BaseConnector):
             "provider": param.get("provider", self._default_provider),
             "model": param.get("model", ""),
             "system_prompt": param.get("system_prompt", ""),
-            "allowed_tools": param.get("allowed_tools", "splunk_search,add_note"),
+            # RT-L02 / B2: no free-form SPL by default; the same default lives in app.json
+            "allowed_tools": param.get("allowed_tools") or "add_note",
             "max_steps": int(param.get("max_steps", 0)) or self._default_max_steps,
             "skills": skills,
             "agent_role": agent_role
