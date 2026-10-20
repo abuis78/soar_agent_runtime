@@ -23,6 +23,7 @@ import pytest
 import soar_agent_runtime_connector as connector_module
 import soar_agent_runtime_utils as utils
 from soar_agent_runtime_connector import SoarAgentRuntimeConnector
+from soar_agent_runtime_policy import StubPolicyClient
 
 LOCAL_URL = "http://llm.internal:11434/v1"
 RUN_ID_RE = r"^rt-\d{8}T\d{6}Z-[0-9a-f]{8}$"
@@ -228,6 +229,7 @@ def test_ac12_every_step_is_audited_with_lauf_id_and_schritt_id(platform, llm, m
         f"FINAL_ANSWER: {VALID_VERDICT}",
     ]
     c = make_connector(airgap_mode=True)
+    c._policy_client = StubPolicyClient()                     # ALLOW (3.1a injection point)
     status, result = run(c, container_id=23)
     assert status is True, result.message
     lauf_id = result.summary["lauf_id"]
@@ -240,10 +242,8 @@ def test_ac12_every_step_is_audited_with_lauf_id_and_schritt_id(platform, llm, m
         (f"{lauf_id}/3", "FINAL_ANSWER", "erledigt"),
     ]
     assert all(e["lauf_id"] == lauf_id for e in cefs)
-    # RT-W03 (3.4): the connector does not wire a policy client yet (3.1a), so in
-    # airgap_mode the effect is denied fail-closed and the denial is audited.
-    assert platform["severity"] == []
-    assert step_log(result)[1]["observation"].startswith("POLICY DENIED code=NO_POLICY_MODE")
+    assert platform["severity"] == [(23, "high")]
+    assert cefs[2]["entscheidung_id"] == "pm-stub-1"
     assert result.summary["audit_ereignisse"] == 4 and result.summary["audit_fehler"] == 0
 
 

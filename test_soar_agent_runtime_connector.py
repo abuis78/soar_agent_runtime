@@ -411,7 +411,7 @@ def test_app_json_declares_broker_fields_in_order():
     with open("soar_agent_runtime.json") as f:
         app = json.load(f)
     cfg = app["configuration"]
-    assert app["app_version"] == "1.6.0"
+    assert app["app_version"] == "1.7.0"
     assert [cfg[k]["order"] for k in ("broker_url", "broker_timeout_s", "broker_client_cert", "broker_client_key", "broker_ca")] == [23, 24, 25, 26, 27]
     assert cfg["broker_client_key"]["data_type"] == "string"  # a path, never the key material
     assert len({f["order"] for f in cfg.values()}) == len(cfg)  # orders unique
@@ -610,3 +610,100 @@ def test_connectivity_normal_mode_unhealthy_broker_is_reported_but_not_fatal(mon
     assert c._handle_test_connectivity({}) is True
     msg = c.action_results[-1].message
     assert msg.startswith("Connectivity OK (normal).") and '"broker": "ERROR: broker unhealthy: HTTP 503' in msg
+
+
+# --- Policy Manager wiring (RT-W03, W08, E11; sub-change 3.1a) ----------------
+
+from soar_agent_runtime_policy import NoPolicyClient, StubPolicyClient  # noqa: E402
+
+POLICY_ASSET = {"policy_mode": "embedded", "policy_path": "/opt/phantom/etc/policy.json",
+                "policy_state_dir": "/opt/phantom/local/data/policy/"}
+
+
+def test_app_json_declares_policy_fields_and_run_agent_params():
+    with open("soar_agent_runtime.json") as f:
+        app = json.load(f)
+    cfg = app["configuration"]
+    assert [cfg[k]["order"] for k in ("policy_mode", "policy_path", "policy_state_dir")] == [28, 29, 30]
+    assert cfg["policy_mode"]["value_list"] == ["", "embedded", "service"] and cfg["policy_mode"]["default"] == ""
+    assert all(cfg[k]["required"] is False for k in ("policy_mode", "policy_path", "policy_state_dir"))
+    assert len({f["order"] for f in cfg.values()}) == len(cfg)
+    run = next(a for a in app["actions"] if a["action"] == "run agent")["parameters"]
+    assert run["stufe"]["data_type"] == "numeric" and run["stufe"]["required"] is False
+    assert run["domaene"]["data_type"] == "string" and run["domaene"]["required"] is False
+    assert len({p["order"] for p in run.values()}) == len(run)
+
+
+def test_policy_fields_are_read_and_normalised():
+    c = make_connector(policy_mode=" Embedded ", policy_path=" /p.json ", policy_state_dir="/state/")
+    assert (c._policy_mode, c._policy_path, c._policy_state_dir) == ("embedded", "/p.json", "/state")
+    assert make_connector()._policy_mode == ""
+
+
+def test_airgap_without_policy_mode_warns():
+    c = make_connector(airgap_mode=True, **BROKER_ASSET)
+    assert any("policy_mode not set" in m and "denied" in m for m in c.progress)
+    assert not any("policy_mode not set" in m for m in make_connector(airgap_mode=True, **BROKER_ASSET, **POLICY_ASSET).progress)
+
+
+def test_outside_airgap_no_policy_client_is_built():
+    assert make_connector(**POLICY_ASSET)._build_policy_client() is None
+
+
+def test_airgap_without_policy_mode_builds_a_denying_client():
+    gate = make_connector(airgap_mode=True)._build_policy_client()
+    assert isinstance(gate, NoPolicyClient) and "policy_mode missing" in gate.reason
+
+
+def test_airgap_embedded_without_package_is_unavailable(monkeypatch):
+    import sys
+    monkeypatch.setitem(sys.modules, "policy_client", None)
+    monkeypatch.setitem(sys.modules, "policy_client.embedded", None)
+    gate = make_connector(airgap_mode=True, **POLICY_ASSET)._build_policy_client()
+    assert isinstance(gate, NoPolicyClient) and gate.code == "UNAVAILABLE"
+
+
+def test_airgap_embedded_derives_state_files_from_state_dir(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(connector_module, "build_policy_client",
+                        lambda mode, **kw: seen.update(mode=mode, **kw) or StubPolicyClient())
+    make_connector(airgap_mode=True, **POLICY_ASSET)._build_policy_client()
+    assert seen == {"mode": "embedded", "policy_path": "/opt/phantom/etc/policy.json",
+                    "approvals_path": "/opt/phantom/local/data/policy/approvals.json",
+                    "halt_path": "/opt/phantom/local/data/policy/halt.json",
+                    "audit_path": "/opt/phantom/local/data/policy/audit.jsonl"}
+
+
+def _capture_registry(monkeypatch):
+    seen = {}
+    real = connector_module.ToolRegistry
+
+    def factory(*a, **kw):
+        seen.update(kw)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(connector_module, "ToolRegistry", factory)
+    return seen
+
+
+@pytest.mark.parametrize("param,stage,domain", [
+    ({}, None, ""), ({"stufe": 2, "domaene": " soc "}, 2, "soc"), ({"stufe": "3"}, 3, ""),
+    ({"stufe": 7}, None, ""), ({"stufe": "x"}, None, ""), ({"stufe": ""}, None, ""),
+])
+def test_run_agent_passes_stage_domain_and_policy_to_the_registry(monkeypatch, param, stage, domain):
+    _capture_loop(monkeypatch)
+    seen = _capture_registry(monkeypatch)
+    c = make_connector(airgap_mode=True, **BROKER_ASSET)
+    c._broker_transport = _transport(body=TOOLS_BODY)
+    stub = StubPolicyClient()
+    c._policy_client = stub
+    c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 7, **param})
+    assert seen["policy"] is stub and seen["stage"] == stage and seen["domain"] == domain
+    assert any(m.startswith("[policy] mode=embedded (ready)") for m in c.progress)
+
+
+def test_run_agent_outside_airgap_passes_no_policy(monkeypatch):
+    _capture_loop(monkeypatch)
+    seen = _capture_registry(monkeypatch)
+    make_connector()._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 7})
+    assert seen["policy"] is None and seen["stage"] is None and seen["domain"] == ""
