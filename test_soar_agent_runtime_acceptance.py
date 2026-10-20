@@ -23,7 +23,8 @@ import pytest
 import soar_agent_runtime_connector as connector_module
 import soar_agent_runtime_utils as utils
 from soar_agent_runtime_connector import SoarAgentRuntimeConnector
-from soar_agent_runtime_policy import StubPolicyClient
+from soar_agent_runtime_policy import (GATE_APPROVE_2PERSON, GATE_DENY, PolicyClientAdapter, PolicyDecision,
+                                       StubPolicyClient)
 
 LOCAL_URL = "http://llm.internal:11434/v1"
 RUN_ID_RE = r"^rt-\d{8}T\d{6}Z-[0-9a-f]{8}$"
@@ -466,3 +467,177 @@ def test_ac04_source_error_from_broker_is_reported_as_gap_without_fallback(platf
     assert platform["queries"] == [] and len(stub.invokes()) == 1
     assert result.data[0]["urteil"]["belege"] == []                     # a failed call is no evidence
     assert result.data[0]["urteil"]["datenlage"] == "blinder_fleck"
+
+
+# ============================================================================
+# Phase 3 (Policy Manager): AC-05, AC-06, AC-07, AC-08
+# ============================================================================
+
+RUN_ID = "rt-ac3"
+# One scripted call per effecting tool: params the agent sends, and the platform
+# change it must (ALLOW) or must not (anything else) produce. A new `wirkt` tool
+# fails test_ac05 until it gets a row here.
+EFFECT_CALLS = {
+    "update_severity": ({"severity": "high"}, lambda platform: platform["severity"], [(11, "high")]),
+}
+EFFECTING_TOOLS = sorted(n for n, d in utils.ToolRegistry.TOOL_DEFINITIONS.items() if d.get("wirkt", True))
+JUDGEMENT = {"begruendung": "beacon confirmed by step 1", "gegenargumente": "could be a scanner",
+             "beleg_ids": [f"{RUN_ID}/1"]}
+
+
+def effect_script(tool, beleg_ids=None):
+    params = EFFECT_CALLS[tool][0] | JUDGEMENT | ({"beleg_ids": beleg_ids} if beleg_ids is not None else {})
+    return ["THOUGHT: look at the case\nACTION: get_container_info",
+            f"THOUGHT: act\nACTION: {tool}\nPARAMS: {json.dumps(params)}",
+            f"FINAL_ANSWER: {VALID_VERDICT}"]
+
+
+def policy_connector(monkeypatch, policy=None, **config):
+    """Airgap connector with a fixed lauf_id and an injected policy gate (None = asset config decides)."""
+    monkeypatch.setattr("soar_agent_runtime_connector.new_run_id", lambda: RUN_ID)
+    c = make_connector(airgap_mode=True, **config)
+    c._policy_client = policy
+    return c
+
+
+def audit_events(c):
+    return [a["cef"] for a in c.artifacts if a["label"] == "agent_audit"]
+
+
+def proposals(c):
+    return [a for a in c.artifacts if a["label"] == "agent_action_proposal"]
+
+
+# --- AC-05 ------------------------------------------------------------------
+
+def test_ac05_registry_has_an_acceptance_case_for_every_effecting_tool():
+    assert EFFECTING_TOOLS == sorted(EFFECT_CALLS) and EFFECTING_TOOLS
+
+
+@pytest.mark.parametrize("tool", EFFECTING_TOOLS)
+def test_ac05_effecting_tool_does_nothing_without_an_allow_decision(platform, llm, monkeypatch, tool):
+    define_agent(platform, provider="local", allowed_tools=[tool, "get_container_info"])
+    llm["responses"] = effect_script(tool)
+    stub = StubPolicyClient(PolicyDecision(gate=GATE_DENY, decision_id="pm-deny", code="RISK_TOO_HIGH",
+                                           reasons=({"regel": "R7", "grund": "score 90 > 60"},)))
+    c = policy_connector(monkeypatch, stub)
+    status, result = run(c)
+    assert status is True, result.message
+    _, read, _ = EFFECT_CALLS[tool]
+    assert read(platform) == []                                       # no platform change
+    assert len(stub.requests) == 1 and stub.requests[0].kind == tool  # the gate was asked exactly once
+    obs = step_log(result)[1]["observation"]
+    assert obs.startswith("POLICY DENIED code=RISK_TOO_HIGH (score 90 > 60)") and f"'{tool}' was not executed" in obs
+
+
+@pytest.mark.parametrize("tool", EFFECTING_TOOLS)
+def test_ac05_effecting_tool_runs_exactly_once_on_allow_and_the_audit_names_the_decision(platform, llm, monkeypatch, tool):
+    define_agent(platform, provider="local", allowed_tools=[tool, "get_container_info"])
+    llm["responses"] = effect_script(tool)
+    stub = StubPolicyClient()                                         # ALLOW, entscheidung_id pm-stub-1
+    c = policy_connector(monkeypatch, stub)
+    status, result = run(c)
+    assert status is True, result.message
+    _, read, expected = EFFECT_CALLS[tool]
+    assert read(platform) == expected
+    assert step_log(result)[1]["observation"].endswith("(entscheidung_id=pm-stub-1)")
+    req, = stub.requests
+    assert (req.kind, req.run_id, req.step_id, req.evidence_ids) == (tool, RUN_ID, f"{RUN_ID}/2", (f"{RUN_ID}/1",))
+    assert req.judgement["begruendung"] == JUDGEMENT["begruendung"] and "beleg_ids" not in req.params
+    done = [e for e in audit_events(c) if e["schritt_id"] == f"{RUN_ID}/2" and e["phase"] == "erledigt"]
+    assert done and done[0]["entscheidung_id"] == "pm-stub-1"
+
+
+# --- AC-06 ------------------------------------------------------------------
+
+def test_ac06_missing_policy_mode_executes_nothing_and_names_the_reason(platform, llm, monkeypatch):
+    define_agent(platform, provider="local")
+    llm["responses"] = effect_script("update_severity")
+    c = policy_connector(monkeypatch)                                 # no policy_mode in the asset
+    status, result = run(c)
+    assert status is True, result.message
+    assert platform["severity"] == []
+    obs = step_log(result)[1]["observation"]
+    assert obs.startswith("POLICY DENIED code=NO_POLICY_MODE (policy_mode missing or invalid")
+    assert "'update_severity' was not executed" in obs
+    assert any("policy_mode not set" in m for m in c.progress)
+
+
+def test_ac06_missing_policy_package_executes_nothing_and_names_the_reason(platform, llm, monkeypatch):
+    define_agent(platform, provider="local")
+    llm["responses"] = effect_script("update_severity")
+    monkeypatch.setitem(sys.modules, "policy_client", None)
+    monkeypatch.setitem(sys.modules, "policy_client.embedded", None)
+    c = policy_connector(monkeypatch, policy_mode="embedded", policy_path="/etc/pm/policy.json",
+                         policy_state_dir="/var/pm")
+    status, result = run(c)
+    assert status is True, result.message
+    assert platform["severity"] == []
+    obs = step_log(result)[1]["observation"]
+    assert obs.startswith("POLICY DENIED code=UNAVAILABLE (policy_client package not available (ModuleNotFoundError)")
+    assert any(m.startswith("[policy] mode=none (not available") for m in c.progress)
+
+
+def test_ac06_unreachable_policy_manager_executes_nothing_and_names_the_reason(platform, llm, monkeypatch):
+    class Unreachable:
+        def decide(self, request):
+            raise ConnectionError("policy manager refused")
+
+    class Req:
+        @staticmethod
+        def from_wire(data):
+            return data
+
+    define_agent(platform, provider="local")
+    llm["responses"] = effect_script("update_severity")
+    c = policy_connector(monkeypatch, PolicyClientAdapter(Unreachable(), Req, "embedded"))
+    status, result = run(c)
+    assert status is True, result.message
+    assert platform["severity"] == []
+    obs = step_log(result)[1]["observation"]
+    assert obs.startswith("POLICY DENIED code=UNAVAILABLE (") and "ConnectionError" in obs
+    assert "'update_severity' was not executed" in obs
+
+
+# --- AC-07 ------------------------------------------------------------------
+
+def test_ac07_approval_gate_records_a_proposal_with_freigabe_id_and_does_not_wait_or_execute(platform, llm, monkeypatch):
+    define_agent(platform, provider="local")
+    llm["responses"] = effect_script("update_severity")
+    stub = StubPolicyClient(PolicyDecision(gate=GATE_APPROVE_2PERSON, decision_id="pm-7", approval_id="fg-7",
+                                           approvals_needed=2, expires_at="2026-10-21T08:00:00Z", policy_version="v3"))
+    c = policy_connector(monkeypatch, stub)
+    status, result = run(c)
+    assert status is True, result.message                             # the run continues to its verdict
+    assert platform["severity"] == []                                 # nothing executed
+    assert len(stub.requests) == 1 and stub.consumed == []            # asked once, never waited or consumed
+    assert llm["calls"] == 3 and result.summary["steps_taken"] == 3
+    obs = step_log(result)[1]["observation"]
+    assert obs.startswith("HELD: 'update_severity' requires APPROVE_2PERSON (2 approval(s)). "
+                          "Proposal recorded with freigabe_id=fg-7 entscheidung_id=pm-7; not executed.")
+    proposal, = proposals(c)
+    assert proposal["container_id"] == 11 and proposal["run_automation"] is False
+    assert proposal["source_data_identifier"] == f"fg-7:{RUN_ID}/2"
+    cef = proposal["cef"]
+    assert cef["freigabe_id"] == "fg-7" and cef["entscheidung_id"] == "pm-7" and cef["gate"] == "APPROVE_2PERSON"
+    assert cef["aktion"] == "update_severity" and json.loads(cef["parameter"]) == {"severity": "high"}
+    assert cef["lauf_id"] == RUN_ID and cef["schritt_id"] == f"{RUN_ID}/2" and cef["beleg_ids"] == [f"{RUN_ID}/1"]
+    assert cef["ablauf"] == "2026-10-21T08:00:00Z" and cef["freigaben_noetig"] == 2 and cef["policy_version"] == "v3"
+    assert any(n["title"].startswith("Freigabe ausstehend: update_severity") for n in platform["notes"])
+
+
+# --- AC-08 ------------------------------------------------------------------
+
+@pytest.mark.parametrize("beleg_ids", [["tb-forged"], [f"{RUN_ID}/2"], [f"{RUN_ID}/1", "made-up"]])
+def test_ac08_invented_beleg_id_is_refused_before_the_policy_manager_is_asked(platform, llm, monkeypatch, beleg_ids):
+    define_agent(platform, provider="local")
+    llm["responses"] = effect_script("update_severity", beleg_ids=beleg_ids)
+    stub = StubPolicyClient()                                         # would ALLOW if it were asked
+    c = policy_connector(monkeypatch, stub)
+    status, result = run(c)
+    assert status is True, result.message
+    assert stub.requests == []                                        # the Policy Manager was never asked
+    assert platform["severity"] == []
+    obs = step_log(result)[1]["observation"]
+    assert obs.startswith("ERROR: beleg_id ") and "did not originate in this run" in obs
+    assert "no policy request was made (RT-W05)" in obs and f"Valid evidence: {RUN_ID}/1." in obs
