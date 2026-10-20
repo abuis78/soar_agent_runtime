@@ -217,11 +217,14 @@ def test_ac11_invalid_params_json_never_calls_a_tool(platform, llm, airgap, fina
 
 # --- AC-12 ------------------------------------------------------------------
 
-def test_ac12_every_step_is_audited_with_lauf_id_and_schritt_id(platform, llm):
+def test_ac12_every_step_is_audited_with_lauf_id_and_schritt_id(platform, llm, monkeypatch):
     define_agent(platform, provider="local")
+    monkeypatch.setattr("soar_agent_runtime_connector.new_run_id", lambda: "rt-test")
     llm["responses"] = [
         "THOUGHT: a\nACTION: get_container_info",
-        'THOUGHT: b\nACTION: update_severity\nPARAMS: {"severity": "high"}',
+        # RT-W05 (3.3): an effecting call cites evidence from this run - step 1 here.
+        'THOUGHT: b\nACTION: update_severity\nPARAMS: {"severity": "high", "begruendung": "beacon confirmed", '
+        '"gegenargumente": "could be a scanner", "beleg_ids": ["rt-test/1"]}',
         f"FINAL_ANSWER: {VALID_VERDICT}",
     ]
     c = make_connector(airgap_mode=True)

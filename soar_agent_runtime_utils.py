@@ -444,6 +444,14 @@ class ToolRegistry:
     BROKER_TOOL = "broker_invoke"
     LEGACY_SPL_TOOL = "splunk_search"
     DEPRECATED_NOTE = " (deprecated: prefer broker_invoke templates)"
+    # RT-W05: every effecting tool needs a justification, counter-arguments and
+    # evidence that originated in this run (checked locally, OQ-8) before any
+    # policy request is made. Shown in the prompt only in airgap_mode (E4).
+    EFFECT_PARAMS = {
+        "begruendung": "Why this action is needed (text)",
+        "gegenargumente": "What speaks against it (text)",
+        "beleg_ids": "JSON list of evidence ids from this run (aufruf_id of a broker result or schritt_id of an earlier step)",
+    }
     # Broker codes that mean "data gap, no other access path" (RT-L06).
     BROKER_GAP_CODES = frozenset({"UNREACHABLE", "TIMEOUT", "BAD_RESPONSE", "SOURCE_ERROR",
                                   "CATALOG_UNAVAILABLE", "AUDIT_UNAVAILABLE"})
@@ -481,6 +489,7 @@ class ToolRegistry:
         self.broker_status = ""               # "" = not configured, "ok", "halted" or an error code
         self.broker_detail = ""
         self.evidence: set[str] = set()       # aufruf_ids of this run (RT-L04 -> RT-P06)
+        self.step_ids: set[str] = set()       # schritt_ids seen so far (own evidence, RT-W05)
         self.halted = False                   # set by a HALTED answer (RT-L05 / RT-B01)
         self.current_step = 0
         self.current_step_id = ""
@@ -518,9 +527,37 @@ class ToolRegistry:
         """Called by the loop before each tool call; forwarded as broker context (RT-L01)."""
         self.current_step = int(step)
         self.current_step_id = step_id
+        if step_id:
+            self.step_ids.add(step_id)
 
     def evidence_ids(self) -> set[str]:
         return set(self.evidence)
+
+    def valid_evidence(self) -> set[str]:
+        """Evidence an effecting call may cite now: broker aufruf_ids and the
+        schritt_ids of earlier steps. The current step cannot be its own evidence."""
+        return self.evidence | (self.step_ids - {self.current_step_id})
+
+    def _check_effect_params(self, tool_name: str, params: dict) -> str | None:
+        """RT-W05 / AC-08: validate the mandatory fields of an effecting call.
+        Returns an ERROR observation, or None when the call may go on to the gate."""
+        params = params if isinstance(params, dict) else {}
+        missing = [k for k in ("begruendung", "gegenargumente")
+                   if not isinstance(params.get(k), str) or not params[k].strip()]
+        beleg_ids = params.get("beleg_ids")
+        if not isinstance(beleg_ids, list) or not beleg_ids:
+            missing.append("beleg_ids")
+        if missing:
+            return (f"ERROR: Tool '{tool_name}' has an effect and needs {', '.join(repr(m) for m in missing)}: "
+                    "begruendung (text), gegenargumente (text), beleg_ids (non-empty JSON list of this run's "
+                    "aufruf_id or earlier schritt_id values). Nothing was executed.")
+        valid = self.valid_evidence()
+        bad = [str(b) for b in beleg_ids if not isinstance(b, str) or b not in valid]
+        if bad:
+            return (f"ERROR: beleg_id {', '.join(repr(b) for b in bad)} did not originate in this run; "
+                    f"'{tool_name}' was not executed and no policy request was made (RT-W05). "
+                    f"Valid evidence: {', '.join(sorted(valid)) or 'none yet'}.")
+        return None
 
     def _is_allowed(self, tool_name: str) -> bool:
         if tool_name == self.BROKER_TOOL:
@@ -570,7 +607,10 @@ class ToolRegistry:
             if name == self.BROKER_TOOL:
                 continue  # described from the broker catalogue below, never statically
             if defn := self.TOOL_DEFINITIONS.get(name):
-                params = ", ".join(f"{k}: {v}" for k, v in defn["parameters"].items())
+                parameters = dict(defn["parameters"])
+                if self.airgap and defn.get("wirkt", True):
+                    parameters.update(self.EFFECT_PARAMS)  # RT-W05, airgap only (E4)
+                params = ", ".join(f"{k}: {v}" for k, v in parameters.items())
                 note = self.DEPRECATED_NOTE if name == self.LEGACY_SPL_TOOL else ""
                 lines.append(f"- {name}({params}): {defn['description']}{note}")
         if block := self._broker_prompt_block():
@@ -588,6 +628,11 @@ class ToolRegistry:
             return result
         if not (handler := getattr(self, f"_tool_{tool_name}", None)):
             return f"ERROR: Tool '{tool_name}' is registered but not implemented."
+        if self.airgap and self.has_effect(tool_name):
+            # RT-W05: evidence is checked here, before any policy request (3.4).
+            if error := self._check_effect_params(tool_name, params):
+                self._emit_action(tool_name, error)
+                return error
         try:
             result = handler(params)
         except Exception as e:
