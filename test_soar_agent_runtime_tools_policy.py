@@ -295,6 +295,49 @@ def test_prompt_marks_unsicherheiten_and_konfidenz_optional():
     assert "unsicherheiten: optional" in line and "konfidenz: optional" in line
 
 
+# --- RT-W11: no path around the gate ------------------------------------------------------
+
+def test_direct_handler_call_in_airgap_is_refused(rules):
+    reg = registry()
+    result = reg._tool_update_severity({"severity": "critical"})
+    assert result == "ERROR: 'update_severity' runs only through the policy gate in airgap_mode (RT-W11); nothing was changed."
+    assert rules.calls == [] and reg._active_decision == ""
+
+
+def test_active_decision_exists_only_while_the_allowed_handler_runs(rules):
+    seen = []
+    reg = registry()
+    rules.update_container = lambda **kw: seen.append(reg._active_decision)
+    assert reg.execute("update_severity", GOOD).startswith("Container severity updated")
+    assert seen == ["pm-stub-1"] and reg._active_decision == ""
+
+
+def test_active_decision_is_cleared_after_a_failing_handler(rules):
+    def boom(**kw):
+        raise RuntimeError("down")
+    rules.update_container = boom
+    reg = registry()
+    reg.execute("update_severity", GOOD)
+    assert reg._active_decision == ""
+    assert reg._tool_update_severity({"severity": "low"}).startswith("ERROR: 'update_severity' runs only")
+
+
+def test_outside_airgap_direct_handler_still_works(rules):
+    reg = registry(airgap=False)
+    assert reg._tool_update_severity({"severity": "low"}) == "Container severity updated to: low"
+
+
+def test_every_effecting_handler_is_guarded_and_update_container_has_one_call_site():
+    import inspect
+    import soar_agent_runtime_utils as u
+    source = inspect.getsource(u)
+    assert source.count("ph_rules.update_container(") == 1
+    assert "ph_rules.update_container(" in inspect.getsource(ToolRegistry._tool_update_severity)
+    for name, defn in ToolRegistry.TOOL_DEFINITIONS.items():
+        if defn.get("wirkt", True) and (handler := getattr(ToolRegistry, f"_tool_{name}", None)):
+            assert "_require_decision(" in inspect.getsource(handler), name
+
+
 # --- loop: audit carries entscheidung_id, policy HALTED ends the run ----------------------
 
 class FakeLLM:

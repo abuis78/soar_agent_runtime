@@ -507,6 +507,7 @@ class ToolRegistry:
         self.current_step_id = ""
         self.last_call_id = ""                # aufruf_id of the most recent execute()
         self.last_decision_id = ""            # entscheidung_id of the most recent execute()
+        self._active_decision = ""            # set only while an ALLOWed handler runs (RT-W11)
         # Policy Manager gate (RT-W03/W06): in airgap_mode an effecting tool
         # runs only after decide(). No client configured = every effecting
         # action denied (fail-closed), outside airgap the gate is not used (E4).
@@ -717,10 +718,13 @@ class ToolRegistry:
         decision = self.policy.decide(request)
         self.last_decision_id = decision.decision_id
         if decision.allowed:
+            self._active_decision = decision.decision_id
             try:
                 result = handler(params)
             except Exception as e:
                 result = f"ERROR executing {tool_name}: {_scrub_exc(e)}"
+            finally:
+                self._active_decision = ""
             return f"{result} (entscheidung_id={decision.decision_id})"
         if decision.needs_approval:
             recorded, detail = self._record_proposal(tool_name, request, decision)
@@ -896,7 +900,17 @@ class ToolRegistry:
         except Exception as e:
             return f"Failed to add note: {_scrub_exc(e)}"
 
+    def _require_decision(self, tool_name: str) -> str | None:
+        """RT-W11: in airgap_mode an effecting handler runs only inside the gate
+        with an ALLOW decision, whoever calls it. Returns an ERROR or None."""
+        if self.airgap and not self._active_decision:
+            return (f"ERROR: '{tool_name}' runs only through the policy gate in airgap_mode (RT-W11); "
+                    "nothing was changed.")
+        return None
+
     def _tool_update_severity(self, params: dict) -> str:
+        if error := self._require_decision("update_severity"):
+            return error
         severity = params.get("severity", "").lower()
         valid = ["low", "medium", "high", "critical"]
         if severity not in valid:
