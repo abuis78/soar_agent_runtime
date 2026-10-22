@@ -16,6 +16,7 @@ halt state counts as halted.
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field
 from typing import Any, Optional, Protocol
 
@@ -371,15 +372,28 @@ def build_policy_client(mode: str, *, policy_path: str = "", approvals_path: str
         return NoPolicyClient(f"policy_mode 'embedded' needs {', '.join(missing)}; every effecting action is denied",
                               CODE_NO_POLICY_MODE)
     try:
-        from policy_client.embedded import EmbeddedPolicyClient  # bundled wheel (3.1b)
-        from policy_core.model import DecisionRequest
+        from policy_client.base import DecisionRequest  # bundled policy_manager wheel (3.1b)
+        from policy_client.embedded import EmbeddedPolicyClient
     except Exception as exc:  # ImportError or a broken package: fail closed
         return NoPolicyClient(f"policy_client package not available ({type(exc).__name__}); "
                               "every effecting action is denied", CODE_UNAVAILABLE)
+    kwargs: dict[str, Any] = {"policy_path": policy_path.strip(), "approvals_path": approvals_path.strip(),
+                              "halt_path": halt_path.strip()}
+    # The audit file arrives with Policy Manager P3; pass it only to a client that takes it,
+    # so the same app works with the P1 wheel (no audit kwargs) and later ones.
+    if _accepts(EmbeddedPolicyClient, "audit_path"):
+        kwargs["audit_path"] = (audit_path or "").strip() or None
+        kwargs["audit_client"] = audit_client
     try:
-        client = EmbeddedPolicyClient(policy_path=policy_path.strip(), approvals_path=approvals_path.strip(),
-                                      halt_path=halt_path.strip(), audit_path=(audit_path or "").strip() or None,
-                                      audit_client=audit_client)
+        client = EmbeddedPolicyClient(**kwargs)
     except Exception as exc:
         return NoPolicyClient(f"policy client could not start ({type(exc).__name__})", CODE_UNAVAILABLE)
     return PolicyClientAdapter(client, DecisionRequest, POLICY_MODE_EMBEDDED)
+
+
+def _accepts(cls: Any, name: str) -> bool:
+    """True when cls(...) takes keyword ``name``; False when unknown or not introspectable."""
+    try:
+        return name in inspect.signature(cls).parameters
+    except (TypeError, ValueError):
+        return False

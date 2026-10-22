@@ -119,6 +119,7 @@ def test_factory_without_usable_mode_returns_no_policy_client(mode):
 
 def test_factory_embedded_without_package_is_unavailable(monkeypatch):
     monkeypatch.setitem(sys.modules, "policy_client", None)   # import -> ImportError
+    monkeypatch.setitem(sys.modules, "policy_client.base", None)
     monkeypatch.setitem(sys.modules, "policy_client.embedded", None)
     gate = build_policy_client("embedded", policy_path="/p.json", approvals_path="/a.json", halt_path="/h.json")
     assert isinstance(gate, NoPolicyClient) and gate.code == CODE_UNAVAILABLE
@@ -209,29 +210,62 @@ def test_adapter_treats_malformed_package_answer_as_deny():
     assert gate.decide(REQ).code == CODE_INVALID_RESPONSE
 
 
-def test_factory_builds_adapter_from_installed_package(monkeypatch):
+def _install_fake_package(monkeypatch, embedded_cls):
+    pkg = types.ModuleType("policy_client")
+    base = types.ModuleType("policy_client.base")
+    base.DecisionRequest = _FakeRequestType
+    emb = types.ModuleType("policy_client.embedded")
+    emb.EmbeddedPolicyClient = embedded_cls
+    for name, mod in (("policy_client", pkg), ("policy_client.base", base), ("policy_client.embedded", emb)):
+        monkeypatch.setitem(sys.modules, name, mod)
+
+
+def test_factory_builds_adapter_from_p1_package_without_audit_kwargs(monkeypatch):
     built = {}
 
-    class FakeEmbedded(_FakePolicyClient):
-        def __init__(self, **kwargs):
+    class FakeEmbeddedP1(_FakePolicyClient):
+        def __init__(self, policy_path, approvals_path, halt_path, ttl=600.0):
             super().__init__()
-            built.update(kwargs)
+            built.update(policy_path=policy_path, approvals_path=approvals_path, halt_path=halt_path)
 
-    pkg = types.ModuleType("policy_client")
-    emb = types.ModuleType("policy_client.embedded")
-    emb.EmbeddedPolicyClient = FakeEmbedded
-    core = types.ModuleType("policy_core")
-    model = types.ModuleType("policy_core.model")
-    model.DecisionRequest = _FakeRequestType
-    for name, mod in (("policy_client", pkg), ("policy_client.embedded", emb),
-                      ("policy_core", core), ("policy_core.model", model)):
-        monkeypatch.setitem(sys.modules, name, mod)
-    gate = build_policy_client("embedded", policy_path="/etc/pm/policy.json",
-                               approvals_path="/var/pm/approvals.json", halt_path="/var/pm/halt.json")
+    _install_fake_package(monkeypatch, FakeEmbeddedP1)
+    gate = build_policy_client("embedded", policy_path="/etc/pm/policy.json", approvals_path="/var/pm/approvals.json",
+                               halt_path="/var/pm/halt.json", audit_path="/var/pm/audit.jsonl")
     assert isinstance(gate, PolicyClientAdapter) and gate.mode == "embedded"
     assert built == {"policy_path": "/etc/pm/policy.json", "approvals_path": "/var/pm/approvals.json",
-                     "halt_path": "/var/pm/halt.json", "audit_path": None, "audit_client": "soar_agent_runtime"}
+                     "halt_path": "/var/pm/halt.json"}
     assert gate.decide(REQ).allowed
+
+
+def test_factory_passes_audit_kwargs_to_a_package_that_takes_them(monkeypatch):
+    built = {}
+
+    class FakeEmbeddedP3(_FakePolicyClient):
+        def __init__(self, policy_path, approvals_path, halt_path, ttl=600.0, audit_path=None, audit_client=""):
+            super().__init__()
+            built.update(policy_path=policy_path, approvals_path=approvals_path, halt_path=halt_path,
+                         audit_path=audit_path, audit_client=audit_client)
+
+    _install_fake_package(monkeypatch, FakeEmbeddedP3)
+    gate = build_policy_client("embedded", policy_path="/etc/pm/policy.json", approvals_path="/var/pm/approvals.json",
+                               halt_path="/var/pm/halt.json", audit_path="/var/pm/audit.jsonl")
+    assert isinstance(gate, PolicyClientAdapter)
+    assert built == {"policy_path": "/etc/pm/policy.json", "approvals_path": "/var/pm/approvals.json",
+                     "halt_path": "/var/pm/halt.json", "audit_path": "/var/pm/audit.jsonl",
+                     "audit_client": "soar_agent_runtime"}
+    assert build_policy_client("embedded", policy_path="/p", approvals_path="/a", halt_path="/h").decide(REQ).allowed
+    assert built["audit_path"] is None   # empty audit_path is passed as None
+
+
+def test_factory_without_embedded_client_in_package_is_unavailable(monkeypatch):
+    pkg = types.ModuleType("policy_client")
+    base = types.ModuleType("policy_client.base")
+    base.DecisionRequest = _FakeRequestType
+    monkeypatch.setitem(sys.modules, "policy_client", pkg)
+    monkeypatch.setitem(sys.modules, "policy_client.base", base)
+    monkeypatch.setitem(sys.modules, "policy_client.embedded", None)
+    gate = build_policy_client("embedded", policy_path="/p", approvals_path="/a", halt_path="/h")
+    assert isinstance(gate, NoPolicyClient) and gate.code == CODE_UNAVAILABLE
 
 
 # -- stub used by 3.3-3.6 --------------------------------------------------------------
