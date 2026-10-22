@@ -378,7 +378,7 @@
             "order": 27
         },
         "policy_mode": {
-            "description": "Policy Manager mode for effecting actions (RT-W03): 'embedded' (policy_client in-process) or 'service' (Phase 4). Empty = every effecting action is denied in airgap_mode",
+            "description": "Policy Manager mode for effecting actions (RT-W03): 'embedded' (policy_client in-process, policy_path + policy_state_dir) or 'service' (Policy Manager service over mTLS, policy_service_url + certificate fields). Empty = every effecting action is denied in airgap_mode",
             "data_type": "string",
             "required": false,
             "value_list": [
@@ -400,6 +400,37 @@
             "data_type": "string",
             "required": false,
             "order": 30
+        },
+        "policy_service_url": {
+            "description": "Policy Manager service base URL, https only (mTLS, RT-W01). Only policy_mode 'service'",
+            "data_type": "string",
+            "required": false,
+            "order": 31
+        },
+        "policy_timeout_s": {
+            "description": "Timeout in seconds for every Policy Manager service call; on timeout the action is denied, no fallback (RT-W04). Only policy_mode 'service'",
+            "data_type": "numeric",
+            "required": false,
+            "default": 5,
+            "order": 32
+        },
+        "policy_client_cert": {
+            "description": "Path on the SOAR host to the client certificate (PEM) presented to the Policy Manager service; its CN is the client identity. Only policy_mode 'service'",
+            "data_type": "string",
+            "required": false,
+            "order": 33
+        },
+        "policy_client_key": {
+            "description": "Path on the SOAR host to the private key (PEM) for the Policy Manager client certificate; the key never leaves the host. Only policy_mode 'service'",
+            "data_type": "string",
+            "required": false,
+            "order": 34
+        },
+        "policy_ca": {
+            "description": "Path on the SOAR host to the CA bundle (PEM) that signed the Policy Manager server certificate. Only policy_mode 'service'",
+            "data_type": "string",
+            "required": false,
+            "order": 35
         }
     },
     "actions": [
