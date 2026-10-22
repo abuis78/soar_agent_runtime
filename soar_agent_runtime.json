@@ -39,7 +39,7 @@
             },
             {
                 "module": "certifi",
-                "input_file": "wheels/py313/certifi-2026.10.18-py3-none-any.whl"
+                "input_file": "wheels/py313/certifi-2026.10.19-py3-none-any.whl"
             },
             {
                 "module": "cffi",
