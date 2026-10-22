@@ -8,6 +8,7 @@ Without the package the module is skipped; the stub-based tests cover the gate l
 from __future__ import annotations
 
 import json
+import pathlib
 import re
 
 import pytest
@@ -80,11 +81,12 @@ def test_unknown_category_falls_to_the_default_gate_deny(state):
     assert d.denied and not d.allowed and "base=DENY" in d.reason_text()
 
 
-def test_missing_policy_file_denies_everything(state):
+def test_missing_policy_file_denies_everything_and_is_unhealthy(state):
     state["policy_path"] = str(state["dir"] / "nope.json")
     gate = gate_for(state)
     assert gate.decide(request("Triage")).denied
-    assert gate.health()[0] is True        # health is the halt check; a missing policy shows up as DENY per action
+    ok, detail = gate.health()
+    assert ok is False and detail.startswith("policy embedded: policy file not readable (FileNotFoundError)")
 
 
 def test_halt_file_halts_agent_requests_and_is_visible_in_health(state):
@@ -117,11 +119,12 @@ def test_approval_gate_opens_an_approval_and_consume_without_approvals_fails(sta
     assert (state["dir"] / "approvals.json").is_file()
 
 
-def test_approval_gate_without_initiator_never_allows(state):
+def test_approval_gate_without_initiator_is_denied_with_the_package_code(state):
     # P1 answers with the approval gate, code NO_INITIATOR and no freigabe_id; the runtime
-    # treats an approval gate without freigabe_id as DENY (nothing is pending, nothing runs).
+    # reports DENY with that code (nothing is pending, nothing runs).
     d = gate_for(state).decide(request("Containment", initiator=""))
     assert d.denied and not d.needs_approval and not d.allowed
+    assert d.code == "NO_INITIATOR" and "base=APPROVE_2PERSON" in d.reason_text()
 
 
 # --- through the connector: asset fields -> real gate -> effecting tool ---------------
@@ -154,3 +157,7 @@ def test_airgap_test_connectivity_reports_the_real_gate(platform, llm, monkeypat
     (state["dir"] / "halt.json").write_text(json.dumps({"angehalten": True, "grund": "drill"}))
     assert c._handle_test_connectivity({}) is True
     assert '"policy": "OK: policy embedded healthy, HALTED (drill)"' in c.action_results[-1].message
+    pathlib.Path(state["policy_path"]).write_text("[]")
+    assert c._handle_test_connectivity({}) is False
+    msg = c.action_results[-1].message
+    assert msg.startswith("Policy check failed (airgap).") and '"policy": "ERROR: policy embedded: policy file is not a JSON object' in msg
