@@ -7,7 +7,7 @@ Usage:
 
 SOAR installs bundled wheels with ``pip --no-deps``, so every transitive
 dependency must be present. Pins live in requirements-py313.txt; wheels go to
-wheels/py313/. The pure-Python ai_soc_telemetry wheel stays under wheels/py3/.
+wheels/py313/. Pure-Python local wheels (ai_soc_telemetry, policy_manager) stay under wheels/py3/.
 """
 
 from __future__ import annotations
@@ -23,7 +23,12 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 APP_JSON = ROOT / "soar_agent_runtime.json"
 REQUIREMENTS = ROOT / "requirements-py313.txt"
 WHEEL_DIR = ROOT / "wheels" / "py313"
-EXTRA_WHEELS = [ROOT / "wheels" / "py3" / "ai_soc_telemetry-0.1.0-py3-none-any.whl"]
+# Local (non-PyPI) pure-Python wheels, bundled as-is. policy_manager is built from the
+# PolicyManager repo: scripts/build_wheel.sh --copy-to <this app>/wheels/py3
+EXTRA_WHEELS = [
+    ROOT / "wheels" / "py3" / "ai_soc_telemetry-0.1.0-py3-none-any.whl",
+    ROOT / "wheels" / "py3" / "policy_manager-0.1.0-py3-none-any.whl",
+]
 DEP_KEY = "pip313_dependencies"
 PIP_ARGS = [
     "--only-binary=:all:",

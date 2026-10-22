@@ -16,6 +16,8 @@ import pytest
 ROOT = pathlib.Path(__file__).resolve().parent
 APP = json.loads((ROOT / "soar_agent_runtime.json").read_text())
 WHEELS = APP["pip313_dependencies"]["wheel"]
+# Pure-Python wheels that are not on PyPI (ai_soc_telemetry, policy_manager) live in wheels/py3/.
+LOCAL_WHEELS = sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "wheels" / "py3").glob("*.whl"))
 WHEEL_RE = re.compile(r"^(?P<name>[^-]+)-(?P<version>[^-]+)(-[^-]+)?-(?P<py>[^-]+)-(?P<abi>[^-]+)-(?P<plat>[^-]+)\.whl$")
 
 
@@ -45,8 +47,13 @@ def test_every_listed_wheel_exists_and_every_bundled_wheel_is_listed():
     for path in listed:
         assert (ROOT / path).is_file(), path
     on_disk = {p.relative_to(ROOT).as_posix() for p in (ROOT / "wheels" / "py313").glob("*.whl")}
-    on_disk.add("wheels/py3/ai_soc_telemetry-0.1.0-py3-none-any.whl")
+    on_disk.update(LOCAL_WHEELS)
     assert on_disk == listed
+
+
+def test_local_wheels_are_bundled():
+    assert LOCAL_WHEELS == ["wheels/py3/ai_soc_telemetry-0.1.0-py3-none-any.whl",
+                            "wheels/py3/policy_manager-0.1.0-py3-none-any.whl"]
 
 
 def test_every_pin_is_bundled_with_the_pinned_version():
@@ -57,7 +64,7 @@ def test_every_pin_is_bundled_with_the_pinned_version():
         bundled[m["name"].lower().replace("_", "-")] = m["version"]
     for name, version in _pins().items():
         assert bundled.get(name) == version, (name, version, bundled.get(name))
-    assert len(WHEELS) == len(_pins()) + 1  # + ai_soc_telemetry
+    assert len(WHEELS) == len(_pins()) + len(LOCAL_WHEELS)
 
 
 @pytest.mark.parametrize("entry", WHEELS, ids=lambda e: e["module"])
