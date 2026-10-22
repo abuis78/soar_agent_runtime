@@ -120,7 +120,7 @@ def test_factory_without_usable_mode_returns_no_policy_client(mode):
     assert isinstance(gate, NoPolicyClient)
     assert gate.decide(REQ).denied
     if mode == "service":
-        assert gate.code == CODE_UNAVAILABLE and "Phase 4" in gate.reason
+        assert gate.code == CODE_NO_POLICY_MODE and "policy_service_url" in gate.reason  # fields missing (4.1)
     elif mode == "EMBEDDED ":
         assert "policy_path" in gate.reason  # normalised mode, files missing (E11)
 
@@ -240,13 +240,20 @@ def test_adapter_treats_malformed_package_answer_as_deny():
     assert gate.decide(REQ).code == CODE_INVALID_RESPONSE
 
 
-def _install_fake_package(monkeypatch, embedded_cls):
+def _install_fake_package(monkeypatch, embedded_cls=None, service_cls=None):
+    """Fake policy_client package: P1 layout (no service module) unless service_cls is given."""
     pkg = types.ModuleType("policy_client")
     base = types.ModuleType("policy_client.base")
     base.DecisionRequest = _FakeRequestType
     emb = types.ModuleType("policy_client.embedded")
-    emb.EmbeddedPolicyClient = embedded_cls
-    for name, mod in (("policy_client", pkg), ("policy_client.base", base), ("policy_client.embedded", emb)):
+    emb.EmbeddedPolicyClient = embedded_cls or _FakePolicyClient
+    modules = {"policy_client": pkg, "policy_client.base": base, "policy_client.embedded": emb,
+               "policy_client.service": None}
+    if service_cls is not None:
+        svc = types.ModuleType("policy_client.service")
+        svc.ServicePolicyClient = service_cls
+        modules["policy_client.service"] = svc
+    for name, mod in modules.items():
         monkeypatch.setitem(sys.modules, name, mod)
 
 
@@ -297,6 +304,87 @@ def test_factory_without_embedded_client_in_package_is_unavailable(monkeypatch):
     monkeypatch.setitem(sys.modules, "policy_client.embedded", None)
     gate = build_policy_client("embedded", policy_path="/p", approvals_path="/a", halt_path="/h")
     assert isinstance(gate, NoPolicyClient) and gate.code == CODE_UNAVAILABLE
+
+
+# -- factory: service mode (4.1, RT-W04) ------------------------------------------------
+
+SERVICE = dict(service_url="https://pm.example:8443/", client_cert="/etc/pm/rt.crt",
+               client_key="/etc/pm/rt.key", ca="/etc/pm/ca.pem")
+
+
+class _FakeServiceClient(_FakePolicyClient):
+    built: dict = {}
+
+    def __init__(self, url, cert, key, ca, timeout_s=5.0):
+        super().__init__()
+        type(self).built = dict(url=url, cert=cert, key=key, ca=ca, timeout_s=timeout_s)
+
+
+def test_factory_builds_service_adapter_from_the_package_client(monkeypatch):
+    _install_fake_package(monkeypatch, service_cls=_FakeServiceClient)
+    gate = build_policy_client("service", service_timeout_s=3, **SERVICE)
+    assert isinstance(gate, PolicyClientAdapter) and gate.mode == "service" and gate.policy_path == ""
+    assert _FakeServiceClient.built == {"url": "https://pm.example:8443/", "cert": "/etc/pm/rt.crt",
+                                        "key": "/etc/pm/rt.key", "ca": "/etc/pm/ca.pem", "timeout_s": 3.0}
+    assert gate.decide(REQ).allowed and gate.decide(REQ).decision_id == "e-7"
+    assert gate.health() == (True, "policy service healthy, not halted")   # no policy file check in service mode
+
+
+@pytest.mark.parametrize("timeout", [None, 0, -1])
+def test_factory_service_timeout_defaults_to_five_seconds(monkeypatch, timeout):
+    _install_fake_package(monkeypatch, service_cls=_FakeServiceClient)
+    build_policy_client("service", service_timeout_s=timeout, **SERVICE)
+    assert _FakeServiceClient.built["timeout_s"] == 5.0
+
+
+@pytest.mark.parametrize("drop", ["service_url", "client_cert", "client_key", "ca"])
+def test_factory_service_without_a_field_denies_and_names_it(monkeypatch, drop):
+    _install_fake_package(monkeypatch, service_cls=_FakeServiceClient)
+    gate = build_policy_client("service", **{**SERVICE, drop: " "})
+    assert isinstance(gate, NoPolicyClient) and gate.code == CODE_NO_POLICY_MODE
+    expected = {"service_url": "policy_service_url", "client_cert": "policy_client_cert",
+                "client_key": "policy_client_key", "ca": "policy_ca"}[drop]
+    assert expected in gate.reason and gate.decide(REQ).denied
+
+
+def test_factory_service_requires_https(monkeypatch):
+    _install_fake_package(monkeypatch, service_cls=_FakeServiceClient)
+    gate = build_policy_client("service", **{**SERVICE, "service_url": "http://pm.example:8443"})
+    assert isinstance(gate, NoPolicyClient) and gate.code == CODE_NO_POLICY_MODE and "https://" in gate.reason
+
+
+def test_factory_service_without_service_module_is_unavailable(monkeypatch):
+    _install_fake_package(monkeypatch)   # P1 wheel layout: embedded only
+    gate = build_policy_client("service", **SERVICE)
+    assert isinstance(gate, NoPolicyClient) and gate.code == CODE_UNAVAILABLE
+    assert "policy_client.service" in gate.reason and "P3" in gate.reason
+    assert gate.decide(REQ).code == CODE_UNAVAILABLE and gate.health()[0] is False
+
+
+def test_factory_service_constructor_failure_is_unavailable(monkeypatch):
+    class Broken(_FakeServiceClient):
+        def __init__(self, *a, **k):
+            raise OSError("no such cert")
+
+    _install_fake_package(monkeypatch, service_cls=Broken)
+    gate = build_policy_client("service", **SERVICE)
+    assert isinstance(gate, NoPolicyClient) and gate.code == CODE_UNAVAILABLE and "OSError" in gate.reason
+
+
+def test_service_adapter_fails_closed_without_fallback(monkeypatch):
+    """RT-W04: a failing service client is DENY UNAVAILABLE and halted; nothing falls back to embedded."""
+    class Unreachable(_FakeServiceClient):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.fail = True
+
+    _install_fake_package(monkeypatch, service_cls=Unreachable)
+    gate = build_policy_client("service", **SERVICE)
+    assert isinstance(gate, PolicyClientAdapter) and gate.mode == "service"
+    assert gate.decide(REQ).code == CODE_UNAVAILABLE
+    assert gate.halt_status().halted is True
+    assert gate.consume("f-1", REQ).ok is False
+    assert gate.health()[0] is False
 
 
 # -- stub used by 3.3-3.6 --------------------------------------------------------------

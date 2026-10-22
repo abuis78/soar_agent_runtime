@@ -375,23 +375,29 @@ class StubPolicyClient:
 
 # -- Factory --------------------------------------------------------------------
 
+SERVICE_TIMEOUT_DEFAULT_S = 5.0
+
+
 def build_policy_client(mode: str, *, policy_path: str = "", approvals_path: str = "",
                         halt_path: str = "", audit_path: str = "",
-                        audit_client: str = AUDIT_CLIENT) -> PolicyGate:
+                        audit_client: str = AUDIT_CLIENT, service_url: str = "",
+                        service_timeout_s: float | None = None, client_cert: str = "",
+                        client_key: str = "", ca: str = "") -> PolicyGate:
     """Return a PolicyGate for the asset configuration. Never raises.
 
     ``embedded`` needs the policy file plus approval and halt files (E11).
-    ``service`` is Phase 4 (RT-W04) and is refused here, so nothing runs
-    against a half-built path. Anything else is RT-W03: policy_mode missing
-    or invalid, every effecting action denied.
+    ``service`` needs the https URL plus client certificate, key and CA for
+    mTLS and uses the package's own client (RT-W01, RT-W04): unreachable or
+    slow means DENY, never a fallback to embedded logic. Anything else is
+    RT-W03: policy_mode missing or invalid, every effecting action denied.
     """
     mode = (mode or "").strip().lower()
     if mode not in POLICY_MODES:
         return NoPolicyClient(f"policy_mode missing or invalid ({mode!r}); set it to "
-                              f"'{POLICY_MODE_EMBEDDED}' - every effecting action is denied (RT-W03)")
+                              f"'{POLICY_MODE_EMBEDDED}' or '{POLICY_MODE_SERVICE}' - "
+                              "every effecting action is denied (RT-W03)")
     if mode == POLICY_MODE_SERVICE:
-        return NoPolicyClient("policy_mode 'service' is not supported by this app version yet "
-                              "(Phase 4, RT-W04); use 'embedded'", CODE_UNAVAILABLE)
+        return _build_service_client(service_url, service_timeout_s, client_cert, client_key, ca)
     missing = [name for name, value in (("policy_path", policy_path), ("policy_approvals_path", approvals_path),
                                         ("policy_halt_path", halt_path)) if not (value or "").strip()]
     if missing:
@@ -415,6 +421,32 @@ def build_policy_client(mode: str, *, policy_path: str = "", approvals_path: str
     except Exception as exc:
         return NoPolicyClient(f"policy client could not start ({type(exc).__name__})", CODE_UNAVAILABLE)
     return PolicyClientAdapter(client, DecisionRequest, POLICY_MODE_EMBEDDED, policy_path=kwargs["policy_path"])
+
+
+def _build_service_client(url: str, timeout_s: float | None, cert: str, key: str, ca: str) -> PolicyGate:
+    """policy_mode 'service' (4.1): the package's ServicePolicyClient over mTLS."""
+    fields = {"policy_service_url": url, "policy_client_cert": cert, "policy_client_key": key, "policy_ca": ca}
+    missing = [name for name, value in fields.items() if not (value or "").strip()]
+    if missing:
+        return NoPolicyClient(f"policy_mode 'service' needs {', '.join(missing)}; every effecting action is denied",
+                              CODE_NO_POLICY_MODE)
+    url = url.strip()
+    if not url.lower().startswith("https://"):
+        return NoPolicyClient("policy_service_url must start with https:// (mTLS, RT-W01); "
+                              "every effecting action is denied", CODE_NO_POLICY_MODE)
+    try:
+        from policy_client.base import DecisionRequest
+        from policy_client.service import ServicePolicyClient   # Policy Manager P3 or later
+    except Exception as exc:  # P1 wheel has no service module: fail closed, say why
+        return NoPolicyClient("policy_client.service not in the bundled policy_manager wheel "
+                              f"(needs Policy Manager P3, {type(exc).__name__}); every effecting action is denied",
+                              CODE_UNAVAILABLE)
+    timeout = SERVICE_TIMEOUT_DEFAULT_S if timeout_s is None or timeout_s <= 0 else float(timeout_s)
+    try:
+        client = ServicePolicyClient(url, cert.strip(), key.strip(), ca.strip(), timeout_s=timeout)
+    except Exception as exc:
+        return NoPolicyClient(f"policy service client could not start ({type(exc).__name__})", CODE_UNAVAILABLE)
+    return PolicyClientAdapter(client, DecisionRequest, POLICY_MODE_SERVICE)
 
 
 def _accepts(cls: Any, name: str) -> bool:
