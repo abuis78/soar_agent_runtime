@@ -146,10 +146,15 @@ class PolicyDecision:
         approval_id = str(data.get("freigabe_id") or "")
         if gate == GATE_ALLOW and not decision_id:
             return cls.deny(CODE_INVALID_RESPONSE, "ALLOW without entscheidung_id")
-        if gate in APPROVAL_GATES and not approval_id:
-            # The proposal artifact needs the freigabe_id (RT-W06/W07).
-            return cls.deny(CODE_INVALID_RESPONSE, f"{gate} without freigabe_id", decision_id)
         reasons = data.get("begruendung")
+        reasons = tuple(r for r in reasons if isinstance(r, dict)) if isinstance(reasons, list) else ()
+        if gate in APPROVAL_GATES and not approval_id:
+            # No approval was opened, so nothing is pending and nothing may run (RT-W06/W07).
+            # Keep the package's code and reasons (e.g. NO_INITIATOR); only a silent answer is malformed.
+            code = str(data.get("code") or "")
+            if code:
+                return cls(gate=GATE_DENY, decision_id=decision_id, reasons=reasons, code=code)
+            return cls.deny(CODE_INVALID_RESPONSE, f"{gate} without freigabe_id", decision_id)
         return cls(
             gate=gate,
             decision_id=decision_id,
@@ -157,7 +162,7 @@ class PolicyDecision:
             approvals_needed=_opt_int(data.get("freigaben_noetig")) or 0,
             expires_at=str(data.get("ablauf") or ""),
             policy_version=str(data.get("policy_version") or ""),
-            reasons=tuple(r for r in reasons if isinstance(r, dict)) if isinstance(reasons, list) else (),
+            reasons=reasons,
             code=str(data.get("code") or ""),
         )
 

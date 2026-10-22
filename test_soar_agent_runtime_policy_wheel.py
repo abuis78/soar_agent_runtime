@@ -117,11 +117,12 @@ def test_approval_gate_opens_an_approval_and_consume_without_approvals_fails(sta
     assert (state["dir"] / "approvals.json").is_file()
 
 
-def test_approval_gate_without_initiator_never_allows(state):
+def test_approval_gate_without_initiator_is_denied_with_the_package_code(state):
     # P1 answers with the approval gate, code NO_INITIATOR and no freigabe_id; the runtime
-    # treats an approval gate without freigabe_id as DENY (nothing is pending, nothing runs).
+    # reports DENY with that code (nothing is pending, nothing runs).
     d = gate_for(state).decide(request("Containment", initiator=""))
     assert d.denied and not d.needs_approval and not d.allowed
+    assert d.code == "NO_INITIATOR" and "base=APPROVE_2PERSON" in d.reason_text()
 
 
 # --- through the connector: asset fields -> real gate -> effecting tool ---------------

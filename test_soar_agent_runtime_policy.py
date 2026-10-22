@@ -72,6 +72,14 @@ def test_approval_gate_needs_freigabe_id(gate):
     assert bad.denied and bad.code == CODE_INVALID_RESPONSE and bad.decision_id == "e-2"
 
 
+@pytest.mark.parametrize("gate", APPROVAL_GATES)
+def test_approval_gate_without_freigabe_id_keeps_the_package_code(gate):
+    held = PolicyDecision.from_wire({"gate": gate, "entscheidung_id": "e-3", "code": "NO_INITIATOR",
+                                     "begruendung": [{"regel": "policy_layer", "grund": "base=APPROVE_2PERSON"}]})
+    assert held.denied and not held.needs_approval and not held.allowed
+    assert held.code == "NO_INITIATOR" and held.decision_id == "e-3" and held.reason_text() == "base=APPROVE_2PERSON"
+
+
 @pytest.mark.parametrize("payload", [None, "ALLOW", {}, {"gate": "MAYBE"}, {"gate": 1}, []])
 def test_malformed_decisions_are_deny(payload):
     d = PolicyDecision.from_wire(payload)
