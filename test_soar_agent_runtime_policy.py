@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import pytest
 
 from soar_agent_runtime_policy import (
+    ACTION_SEQUENCE,
     APPROVAL_GATES,
     CODE_HALTED,
     CODE_INVALID_RESPONSE,
@@ -18,6 +19,7 @@ from soar_agent_runtime_policy import (
     GATE_APPROVE_2PERSON,
     GATE_DENY,
     ApprovalState,
+    CatalogBlock,
     ConsumeState,
     HaltState,
     NoPolicyClient,
@@ -26,6 +28,8 @@ from soar_agent_runtime_policy import (
     PolicyRequest,
     StubPolicyClient,
     build_policy_client,
+    parse_catalog,
+    sequence_step,
 )
 
 REQ = PolicyRequest(kind="update_severity", params={"severity": "high"}, targets=("container:4711",),
@@ -385,6 +389,96 @@ def test_service_adapter_fails_closed_without_fallback(monkeypatch):
     assert gate.halt_status().halted is True
     assert gate.consume("f-1", REQ).ok is False
     assert gate.health()[0] is False
+
+
+# -- action catalogue and sequences (4.2-1, RT-W09, AC-09) ------------------------------
+
+BLOCK_WIRE = {"id": "isolate_endpoint", "version": 2, "zweck": "Endpoint isolieren", "kategorie": "Isolation",
+              "zieltypen": ["device"], "parameter": {"dauer_h": "Dauer in Stunden"}, "mindeststufe": 3,
+              "umkehrbar": False, "ruecknahme": "unisolate_endpoint", "mindest_gate": "APPROVE_2PERSON"}
+
+
+def test_sequence_request_puts_steps_into_aktion_schritte():
+    req = PolicyRequest(kind=ACTION_SEQUENCE, initiator="rc", agent_id="rc", run_id="rt-1", step_id="rt-1/2",
+                        targets=("srv-1", "srv-2"), evidence_ids=("tb-1",),
+                        steps=(sequence_step("isolate_endpoint", ["srv-1"], {"dauer_h": 4}),
+                               sequence_step("disable_account", ("u-7",))))
+    wire = req.to_wire()
+    assert wire["aktion"]["art"] == "folge" and wire["aktion"]["ziel"] == ["srv-1", "srv-2"]
+    assert wire["aktion"]["schritte"] == [
+        {"baustein": "isolate_endpoint", "ziel": ["srv-1"], "parameter": {"dauer_h": 4}},
+        {"baustein": "disable_account", "ziel": ["u-7"], "parameter": {}}]
+    assert "schritte" not in REQ.to_wire()["aktion"]   # single built-in action: no steps on the wire
+
+
+def test_sequence_step_normalises_malformed_input():
+    assert sequence_step(None, "srv-1", "x") == {"baustein": "", "ziel": [], "parameter": {}}   # str is not a list
+    assert sequence_step(None, ["srv-1"], "x") == {"baustein": "", "ziel": ["srv-1"], "parameter": {}}
+    assert sequence_step("b", None, None) == {"baustein": "b", "ziel": [], "parameter": {}}
+
+
+def test_catalog_block_parses_the_aktionen_fields():
+    b = CatalogBlock.from_wire(BLOCK_WIRE)
+    assert b == CatalogBlock(id="isolate_endpoint", version=2, purpose="Endpoint isolieren", category="Isolation",
+                             target_types=("device",), parameters={"dauer_h": "Dauer in Stunden"}, min_stage=3,
+                             reversible=False, undo="unisolate_endpoint", min_gate="APPROVE_2PERSON")
+    minimal = CatalogBlock.from_wire({"id": "x"})
+    assert (minimal.min_stage, minimal.reversible, minimal.min_gate, minimal.parameters) == (0, False, "", {})
+
+
+@pytest.mark.parametrize("bad", [
+    "isolate_endpoint", {}, {"id": ""}, {"id": 7}, {"id": "x", "mindeststufe": 5}, {"id": "x", "mindeststufe": "hoch"},
+    {"id": "x", "mindest_gate": "MAYBE"}, {"id": "x", "version": "v2"},
+])
+def test_catalog_block_drops_unusable_entries(bad):
+    assert CatalogBlock.from_wire(bad) is None
+
+
+def test_catalog_block_never_claims_reversibility_without_true():
+    assert CatalogBlock.from_wire({"id": "x", "umkehrbar": "yes"}).reversible is False
+    assert CatalogBlock.from_wire({"id": "x", "umkehrbar": 1}).reversible is False
+    assert CatalogBlock.from_wire({"id": "x", "umkehrbar": True}).reversible is True
+
+
+def test_parse_catalog_keeps_order_and_skips_bad_items():
+    items = [BLOCK_WIRE, "junk", {"id": "disable_account", "zieltypen": "user"}, None]
+    assert [b.id for b in parse_catalog(items)] == ["isolate_endpoint", "disable_account"]
+    assert parse_catalog(items)[1].target_types == ()
+    assert parse_catalog({"aktionen": [BLOCK_WIRE]}) == [] and parse_catalog(None) == []
+
+
+def test_reason_text_names_the_step_of_sequence_reasons():
+    d = PolicyDecision.from_wire({"gate": "DENY", "code": "BLOCK_NOT_ALLOWED", "begruendung": [
+        {"regel": "katalog", "gate": "DENY", "grund": "x not in catalogue", "schritt": 1},
+        {"regel": "halt", "gate": "ALLOW", "grund": "not halted"}]})
+    assert d.reason_text() == "x not in catalogue (schritt 1); not halted"
+
+
+def test_adapter_actions_parse_the_package_answer():
+    class WithActions(_FakePolicyClient):
+        def actions(self, agent_id):
+            self.calls.append(("actions", agent_id))
+            return [BLOCK_WIRE, {"id": ""}]
+
+    client = WithActions()
+    gate = PolicyClientAdapter(client, _FakeRequestType, "service")
+    assert [b.id for b in gate.actions("rc")] == ["isolate_endpoint"] and ("actions", "rc") in client.calls
+
+
+def test_adapter_actions_is_empty_for_a_p1_client_or_a_failure():
+    assert PolicyClientAdapter(_FakePolicyClient(), _FakeRequestType, "embedded").actions("rc") == []   # no actions()
+    class Failing(_FakePolicyClient):
+        def actions(self, agent_id):
+            raise RuntimeError("boom")
+    assert PolicyClientAdapter(Failing(), _FakeRequestType, "embedded").actions("rc") == []
+
+
+def test_no_policy_client_and_stub_serve_the_catalogue():
+    assert NoPolicyClient("x").actions("rc") == []
+    block = CatalogBlock.from_wire(BLOCK_WIRE)
+    stub = StubPolicyClient(blocks=[block])
+    assert stub.actions("rc") == [block] and stub.actions_asked == ["rc"]
+    assert StubPolicyClient().actions("rc") == []
 
 
 # -- stub used by 3.3-3.6 --------------------------------------------------------------

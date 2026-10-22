@@ -32,6 +32,11 @@ POLICY_MODE_EMBEDDED = "embedded"
 POLICY_MODE_SERVICE = "service"
 POLICY_MODES = (POLICY_MODE_EMBEDDED, POLICY_MODE_SERVICE)
 
+# aktion.art of a sequence of catalogue building blocks (RT-W09, PM P4): a single
+# block is a sequence with one step; the Policy Manager decides it as one request.
+ACTION_SEQUENCE = "folge"
+STAGES = range(0, 5)
+
 # Runtime-side codes. Rule codes (NO_EVIDENCE, HALTED, ...) come from the
 # Policy Manager and are passed through unchanged.
 CODE_NO_POLICY_MODE = "NO_POLICY_MODE"
@@ -85,10 +90,13 @@ class PolicyRequest:
     evidence_ids: tuple[str, ...] = ()          # beleg_ids (checked locally before decide, OQ-8)
     judgement: dict = field(default_factory=dict)  # urteil: begruendung, gegenargumente, ...
     artifact_values: tuple[str, ...] = ()       # artefakt_werte
+    steps: tuple[dict, ...] = ()                # aktion.schritte, only for kind == ACTION_SEQUENCE
 
     def to_wire(self) -> dict:
         action = {"art": self.kind, "kategorie": self.category, "playbook": self.playbook,
                   "ziel": list(self.targets), "parameter": dict(self.params)}
+        if self.steps:
+            action["schritte"] = [sequence_step(**s) if "block" in s else dict(s) for s in self.steps]
         context: dict[str, Any] = {
             "principal_type": self.principal_type, "initiator": self.initiator,
             "agent_id": self.agent_id, "lauf_id": self.run_id, "schritt_id": self.step_id,
@@ -102,6 +110,68 @@ class PolicyRequest:
             context["agent_konfidenz"] = self.confidence
         # Reversibility is deliberately not sent (RT-W08).
         return {"aktion": action, "kontext": context}
+
+
+def sequence_step(block: str, targets: Any = (), params: Any = None) -> dict:
+    """One step of a Maßnahmenfolge in wire form (aktion.schritte[], PM P4)."""
+    return {"baustein": str(block or ""), "ziel": list(_str_tuple(targets)),
+            "parameter": dict(params) if isinstance(params, dict) else {}}
+
+
+# -- Action catalogue (RT-W09) --------------------------------------------------
+
+@dataclass(frozen=True)
+class CatalogBlock:
+    """A building block released for this agent (GET /v1/aktionen, PM-F12).
+
+    Field names follow the Policy Manager answer; ``from_wire`` drops an entry
+    that has no id or an unusable stage or gate, so a malformed catalogue can
+    only hide blocks, never show more.
+    """
+    id: str
+    version: int = 0
+    purpose: str = ""                  # zweck
+    category: str = ""                 # kategorie
+    target_types: tuple[str, ...] = ()  # zieltypen
+    parameters: dict = field(default_factory=dict)  # parameter (name -> description or spec)
+    min_stage: int = 0                 # mindeststufe
+    reversible: bool = False           # umkehrbar (effective value, policy already applied)
+    undo: str = ""                     # ruecknahme (block id)
+    min_gate: str = ""                 # mindest_gate
+
+    @classmethod
+    def from_wire(cls, data: Any) -> Optional["CatalogBlock"]:
+        if not isinstance(data, dict):
+            return None
+        block_id = data.get("id")
+        if not isinstance(block_id, str) or not block_id.strip():
+            return None
+        stage = _opt_int(data.get("mindeststufe", 0))
+        version = _opt_int(data.get("version", 0))
+        gate = str(data.get("mindest_gate") or "")
+        if stage is None or stage not in STAGES or version is None or (gate and gate not in GATES):
+            return None
+        params = data.get("parameter")
+        return cls(
+            id=block_id.strip(),
+            version=version,
+            purpose=str(data.get("zweck") or ""),
+            category=str(data.get("kategorie") or ""),
+            target_types=_str_tuple(data.get("zieltypen")),
+            parameters=dict(params) if isinstance(params, dict) else {},
+            min_stage=stage,
+            reversible=data.get("umkehrbar") is True,
+            undo=str(data.get("ruecknahme") or ""),
+            min_gate=gate,
+        )
+
+
+def parse_catalog(items: Any) -> list[CatalogBlock]:
+    """Blocks from a ``/v1/aktionen`` list; anything unusable is left out, order kept."""
+    if not isinstance(items, (list, tuple)):
+        return []
+    blocks = (CatalogBlock.from_wire(item) for item in items)
+    return [b for b in blocks if b is not None]
 
 
 # -- Results --------------------------------------------------------------------
@@ -168,7 +238,13 @@ class PolicyDecision:
         )
 
     def reason_text(self) -> str:
-        parts = [str(r.get("grund") or r.get("regel") or "") for r in self.reasons]
+        parts = []
+        for r in self.reasons:
+            text = str(r.get("grund") or r.get("regel") or "")
+            step = _opt_int(r.get("schritt"))
+            if text and step is not None:
+                text = f"{text} (schritt {step})"   # sequence reasons name their step (PM P4)
+            parts.append(text)
         return "; ".join(p for p in parts if p)
 
 
@@ -233,6 +309,7 @@ class PolicyGate(Protocol):
     def consume(self, approval_id: str, request: PolicyRequest) -> ConsumeState: ...
     def halt_status(self) -> HaltState: ...
     def health(self) -> tuple[bool, str]: ...
+    def actions(self, agent_id: str) -> list[CatalogBlock]: ...
 
 
 class NoPolicyClient:
@@ -261,6 +338,9 @@ class NoPolicyClient:
 
     def health(self) -> tuple[bool, str]:
         return False, self.reason
+
+    def actions(self, agent_id: str) -> list[CatalogBlock]:
+        return []
 
 
 class PolicyClientAdapter:
@@ -306,6 +386,17 @@ class PolicyClientAdapter:
         except Exception as exc:
             return HaltState(halted=True, reason=f"policy client failed: {type(exc).__name__}")
 
+    def actions(self, agent_id: str) -> list[CatalogBlock]:
+        """Blocks released for the agent (RT-W09). A package without actions()
+        (P1 wheel) or any failure means no catalogue, never a traceback."""
+        fetch = getattr(self._client, "actions", None)
+        if fetch is None:
+            return []
+        try:
+            return parse_catalog(fetch(agent_id))
+        except Exception:
+            return []
+
     def health(self) -> tuple[bool, str]:
         problem = self._policy_file_problem()
         if problem:
@@ -343,13 +434,16 @@ class StubPolicyClient:
     mode = POLICY_MODE_EMBEDDED
 
     def __init__(self, decision: PolicyDecision | None = None, *, halted: bool = False,
-                 consume_ok: bool = True, healthy: bool = True) -> None:
+                 consume_ok: bool = True, healthy: bool = True,
+                 blocks: list[CatalogBlock] | None = None) -> None:
         self.decision = decision or PolicyDecision(gate=GATE_ALLOW, decision_id="pm-stub-1")
         self.halted = halted
         self.consume_ok = consume_ok
         self.healthy = healthy
+        self.blocks = list(blocks or [])      # catalogue returned by actions() (4.2)
         self.requests: list[PolicyRequest] = []
         self.consumed: list[str] = []
+        self.actions_asked: list[str] = []
 
     def decide(self, request: PolicyRequest) -> PolicyDecision:
         self.requests.append(request)
@@ -371,6 +465,10 @@ class StubPolicyClient:
 
     def health(self) -> tuple[bool, str]:
         return (True, "policy stub healthy") if self.healthy else (False, "policy stub unhealthy")
+
+    def actions(self, agent_id: str) -> list[CatalogBlock]:
+        self.actions_asked.append(agent_id)
+        return list(self.blocks)
 
 
 # -- Factory --------------------------------------------------------------------
