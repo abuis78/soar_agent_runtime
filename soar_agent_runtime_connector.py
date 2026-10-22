@@ -490,6 +490,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
             domain=domain,
         )
         tools.load_broker_tools()  # RT-L03: templates once per run
+        tools.load_catalog()       # RT-W09: building blocks once per run (empty outside airgap)
         if tools.halted:
             # RT-B01 / RT-L05: halt state known before the first step -> do not start.
             return action_result.set_status(

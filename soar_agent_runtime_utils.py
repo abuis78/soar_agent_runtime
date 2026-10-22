@@ -12,9 +12,12 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 from soar_agent_runtime_policy import (
+    ACTION_SEQUENCE,
     CODE_HALTED as POLICY_CODE_HALTED,
+    CatalogBlock,
     NoPolicyClient,
     PolicyRequest,
+    sequence_step,
 )
 
 try:
@@ -444,10 +447,23 @@ class ToolRegistry:
                 "vorlage_id": "template id from the list below",
                 "parameter":  "JSON object with the template parameters"
             }
+        },
+        # RT-W09: building blocks from the Policy Manager's action catalogue.
+        # One step is a single measure, several steps are a Maßnahmenfolge;
+        # either way the Policy Manager decides it as ONE request (AC-09).
+        # Available as soon as the catalogue lists blocks for this agent (E14).
+        "catalog_invoke": {
+            "description": "Propose one or more catalogue building blocks (see 'Catalogue building blocks' below) as one measure sequence; decided by the Policy Manager, executed by a follow-up playbook, never by this run",
+            "wirkt": True,
+            "quelle": "katalog",
+            "parameters": {
+                "schritte": "JSON list of steps [{\"baustein\": \"<block id>\", \"ziel\": [\"<target>\", ...], \"parameter\": {...}}]"
+            }
         }
     }
 
     BROKER_TOOL = "broker_invoke"
+    CATALOG_TOOL = "catalog_invoke"
     LEGACY_SPL_TOOL = "splunk_search"
     DEPRECATED_NOTE = " (deprecated: prefer broker_invoke templates)"
     # RT-W05: every effecting tool needs a justification, counter-arguments and
@@ -499,6 +515,9 @@ class ToolRegistry:
         self.broker_katalog_version = ""
         self.broker_status = ""               # "" = not configured, "ok", "halted" or an error code
         self.broker_detail = ""
+        self.catalog: dict[str, CatalogBlock] = {}   # block id -> block visible at this stage (RT-W09)
+        self.catalog_hidden: list[CatalogBlock] = []  # released, but need a higher stufe
+        self._gated: tuple | None = None      # (request, decision) while an ALLOWed handler runs
         self.evidence: set[str] = set()       # aufruf_ids of this run (RT-L04 -> RT-P06)
         self.step_ids: set[str] = set()       # schritt_ids seen so far (own evidence, RT-W05)
         self.halted = False                   # set by a HALTED answer (RT-L05 / RT-B01)
@@ -546,6 +565,81 @@ class ToolRegistry:
             f"[broker] {len(self.broker_tools)} template(s) available (catalog {answer.katalog_version}).")
         return True
 
+    # -- Action catalogue (RT-W09) --------------------------------------------
+
+    def load_catalog(self) -> bool:
+        """Fetch the building blocks released for this agent, once per run.
+
+        Blocks above the run's stufe are hidden (unknown stufe counts as 0,
+        E12: no target-type filter). Outside airgap_mode the gate is
+        NoPolicyClient and the catalogue stays empty (AC-15).
+        """
+        self.catalog, self.catalog_hidden = {}, []
+        try:
+            blocks = self.policy.actions(self.agent_id)
+        except Exception as e:  # the gate should never raise; stay fail-closed anyway
+            self.connector.save_progress(f"[policy] catalogue unavailable: {_scrub_exc(e)}")
+            return False
+        stage = self.stage if self.stage is not None else 0
+        for block in blocks:
+            if block.min_stage <= stage:
+                self.catalog[block.id] = block
+            else:
+                self.catalog_hidden.append(block)
+        if self.catalog or self.catalog_hidden:
+            self.connector.save_progress(
+                f"[policy] catalogue: {len(self.catalog)} block(s) available at stufe {stage}, "
+                f"{len(self.catalog_hidden)} hidden (higher stufe).")
+        return bool(self.catalog)
+
+    def _catalog_prompt_block(self) -> str:
+        if not self.catalog and not self.catalog_hidden:
+            return ""
+        defn = self.TOOL_DEFINITIONS[self.CATALOG_TOOL]
+        parameters = dict(defn["parameters"])
+        parameters.update(self.EFFECT_PARAMS)
+        params = ", ".join(f"{k}: {v}" for k, v in parameters.items())
+        lines = [f"- {self.CATALOG_TOOL}({params}): {defn['description']}",
+                 f"  Catalogue building blocks (stufe {self.stage if self.stage is not None else 'unknown=0'}):"]
+        for b in self.catalog.values():
+            plist = "; ".join(f"{n} ({p})" if isinstance(p, str) else str(n) for n, p in b.parameters.items())
+            lines.append(
+                f"  - {b.id} v{b.version}: {b.purpose or 'no description'}. kategorie {b.category or 'n/a'}, "
+                f"zieltypen {', '.join(b.target_types) or 'any'}, mindest_gate {b.min_gate or 'n/a'}, "
+                f"umkehrbar {'ja' if b.reversible else 'nein'}"
+                + (f", ruecknahme {b.undo}" if b.undo else "") + f". Parameters: {plist or 'none'}")
+        if self.catalog_hidden:
+            hidden = ", ".join(f"{b.id} (stufe>={b.min_stage})" for b in self.catalog_hidden)
+            lines.append(f"  Not available at this stufe: {hidden}. Use report_gap if a measure is needed anyway.")
+        return "\n".join(lines)
+
+    def _check_catalog_steps(self, params: dict) -> str | None:
+        """schritte must name visible blocks with targets; otherwise ERROR, no policy request."""
+        steps = params.get("schritte")
+        if not isinstance(steps, list) or not steps:
+            return (f"ERROR: '{self.CATALOG_TOOL}' needs 'schritte', a non-empty JSON list of "
+                    "{\"baustein\", \"ziel\", \"parameter\"} objects. Nothing was proposed and no policy request was made.")
+        problems = []
+        for i, step in enumerate(steps):
+            if not isinstance(step, dict):
+                problems.append(f"step {i} is not an object")
+                continue
+            block = step.get("baustein")
+            if not isinstance(block, str) or block not in self.catalog:
+                hidden = next((b for b in self.catalog_hidden if b.id == block), None)
+                problems.append(f"step {i}: baustein {block!r} "
+                                + (f"needs stufe>={hidden.min_stage}" if hidden else "is not in the catalogue"))
+            targets = step.get("ziel")
+            if not isinstance(targets, list) or not targets or not all(isinstance(z, str) and z for z in targets):
+                problems.append(f"step {i}: ziel must be a non-empty list of strings")
+            if "parameter" in step and not isinstance(step.get("parameter"), dict):
+                problems.append(f"step {i}: parameter must be an object")
+        if problems:
+            known = ", ".join(sorted(self.catalog)) or "none"
+            return (f"ERROR: {'; '.join(problems)}. Available blocks: {known}. "
+                    "Nothing was proposed and no policy request was made.")
+        return None
+
     def set_step(self, step: int, step_id: str) -> None:
         """Called by the loop before each tool call; forwarded as broker context (RT-L01)."""
         self.current_step = int(step)
@@ -585,6 +679,8 @@ class ToolRegistry:
     def _is_allowed(self, tool_name: str) -> bool:
         if tool_name == self.BROKER_TOOL:
             return bool(self.broker_tools)
+        if tool_name == self.CATALOG_TOOL:
+            return bool(self.catalog)     # E14: released blocks are the allowlist
         return tool_name in self.allowed_tools
 
     @staticmethod
@@ -627,8 +723,8 @@ class ToolRegistry:
     def get_tool_descriptions(self) -> str:
         lines = []
         for name in self.allowed_tools:
-            if name == self.BROKER_TOOL:
-                continue  # described from the broker catalogue below, never statically
+            if name in (self.BROKER_TOOL, self.CATALOG_TOOL):
+                continue  # described from the broker / action catalogue below, never statically
             if defn := self.TOOL_DEFINITIONS.get(name):
                 parameters = dict(defn["parameters"])
                 if self.airgap and defn.get("wirkt", True):
@@ -637,6 +733,8 @@ class ToolRegistry:
                 note = self.DEPRECATED_NOTE if name == self.LEGACY_SPL_TOOL else ""
                 lines.append(f"- {name}({params}): {defn['description']}{note}")
         if block := self._broker_prompt_block():
+            lines.append(block)
+        if block := self._catalog_prompt_block():
             lines.append(block)
         return "\n".join(lines)
 
@@ -656,6 +754,8 @@ class ToolRegistry:
             # RT-W05: evidence is checked here, before any policy request.
             if error := self._check_effect_params(tool_name, params):
                 self._emit_action(tool_name, error)
+                return error
+            if tool_name == self.CATALOG_TOOL and (error := self._check_catalog_steps(params)):
                 return error
             result = self._gate_effect(tool_name, handler, params)
             self._emit_action(tool_name, result)
@@ -694,11 +794,20 @@ class ToolRegistry:
                      "unsicherheiten": str(params.get("unsicherheiten") or "")}
         if confidence is not None:
             judgement["konfidenz"] = confidence
+        kind, category, targets = tool_name, _ACTION_TELEMETRY.get(tool_name, ""), (f"container:{self.container_id}",)
+        steps: tuple[dict, ...] = ()
+        if tool_name == self.CATALOG_TOOL:
+            # RT-W09 / AC-09: the whole sequence is one request; categories come from the catalogue.
+            steps = tuple(sequence_step(s.get("baustein"), s.get("ziel"), s.get("parameter"))
+                          for s in action_params.pop("schritte", []))
+            kind, category = ACTION_SEQUENCE, ""
+            targets = tuple(dict.fromkeys(z for s in steps for z in s["ziel"]))
         return PolicyRequest(
-            kind=tool_name,
-            category=_ACTION_TELEMETRY.get(tool_name, ""),
-            targets=(f"container:{self.container_id}",),
+            kind=kind,
+            category=category,
+            targets=targets,
             params=action_params,
+            steps=steps,
             initiator=self.agent_id,
             agent_id=self.agent_id,
             run_id=self.run_id,
@@ -718,13 +827,13 @@ class ToolRegistry:
         decision = self.policy.decide(request)
         self.last_decision_id = decision.decision_id
         if decision.allowed:
-            self._active_decision = decision.decision_id
+            self._active_decision, self._gated = decision.decision_id, (request, decision)
             try:
                 result = handler(params)
             except Exception as e:
                 result = f"ERROR executing {tool_name}: {_scrub_exc(e)}"
             finally:
-                self._active_decision = ""
+                self._active_decision, self._gated = "", None
             return f"{result} (entscheidung_id={decision.decision_id})"
         if decision.needs_approval:
             recorded, detail = self._record_proposal(tool_name, request, decision)
@@ -743,8 +852,16 @@ class ToolRegistry:
                 f"{' (' + reason + ')' if reason else ''}; '{tool_name}' was not executed.")
 
     def _record_proposal(self, tool_name: str, request: PolicyRequest, decision) -> tuple[bool, str]:
-        """Artifact + note with the data a follow-up playbook needs (RT-W07)."""
+        """Artifact + note with the data a follow-up playbook needs (RT-W07).
+
+        Approval gates record the pending freigabe_id; an ALLOWed catalogue
+        sequence is recorded the same way with gate ALLOW and no freigabe_id,
+        and the playbook executes it without consume (E13).
+        """
         target = request.params.get("severity") or ", ".join(request.targets)
+        blocks = ", ".join(s["baustein"] for s in request.steps)
+        name = f"{tool_name} -> {target}" if not blocks else f"folge: {blocks} -> {target}"
+        allowed = decision.gate == "ALLOW"
         cef = {
             "freigabe_id": decision.approval_id,
             "entscheidung_id": decision.decision_id,
@@ -762,12 +879,14 @@ class ToolRegistry:
             "beleg_ids": list(request.evidence_ids),
             "policy_version": decision.policy_version,
         }
+        if request.steps:
+            cef["schritte"] = json.dumps(list(request.steps), sort_keys=True, default=str)
         artifact = {
             "container_id": self.container_id,
             "label": self.PROPOSAL_LABEL,
-            "name": f"{tool_name} -> {target}",
+            "name": name,
             "type": self.PROPOSAL_LABEL,
-            "source_data_identifier": f"{decision.approval_id}:{request.step_id}",
+            "source_data_identifier": f"{decision.approval_id or decision.decision_id}:{request.step_id}",
             "cef": cef,
             "run_automation": False,
         }
@@ -781,17 +900,20 @@ class ToolRegistry:
             import phantom.rules as ph_rules
             ph_rules.add_note(
                 container=self.container_id, note_type="general",
-                title=f"Freigabe ausstehend: {tool_name} -> {target}",
-                content=(f"Agent `{request.agent_id}` schlaegt `{tool_name}` vor (Lauf `{request.run_id}`, "
+                title=("Freigegeben (ALLOW): " if allowed else "Freigabe ausstehend: ") + name,
+                content=(f"Agent `{request.agent_id}` schlaegt `{name}` vor (Lauf `{request.run_id}`, "
                          f"Schritt `{request.step_id}`).\n\n"
-                         f"- Gate: {decision.gate} ({decision.approvals_needed or 1} Freigabe(n))\n"
-                         f"- freigabe_id: `{decision.approval_id}`\n"
-                         f"- entscheidung_id: `{decision.decision_id}`\n"
-                         f"- Parameter: `{cef['parameter']}`\n"
-                         f"- Begruendung: {cef['begruendung']}\n"
+                         + ("- Gate: ALLOW\n" if allowed else
+                            f"- Gate: {decision.gate} ({decision.approvals_needed or 1} Freigabe(n))\n"
+                            f"- freigabe_id: `{decision.approval_id}`\n")
+                         + f"- entscheidung_id: `{decision.decision_id}`\n"
+                         + (f"- Schritte: `{cef['schritte']}`\n" if request.steps else
+                            f"- Parameter: `{cef['parameter']}`\n")
+                         + f"- Begruendung: {cef['begruendung']}\n"
                          f"- Gegenargumente: {cef['gegenargumente']}\n"
                          f"- Belege: {', '.join(request.evidence_ids)}\n\n"
-                         f"Ausfuehrung nur durch das Folge-Playbook nach `consume(freigabe_id)`."),
+                         + ("Ausfuehrung durch das Folge-Playbook (kein consume noetig)." if allowed else
+                            "Ausfuehrung nur durch das Folge-Playbook nach `consume(freigabe_id)`.")),
             )
         except Exception as e:
             # The artifact is the contract (RT-W07); a failed note is reported, not fatal.
@@ -921,6 +1043,20 @@ class ToolRegistry:
             return f"Container severity updated to: {severity}"
         except Exception as e:
             return f"Failed to update severity: {_scrub_exc(e)}"
+
+    def _tool_catalog_invoke(self, params: dict) -> str:
+        """ALLOW for a catalogue sequence (E13): record it for the follow-up
+        playbook; the runtime itself never runs a building block (RT-W11)."""
+        if error := self._require_decision(self.CATALOG_TOOL):
+            return error
+        if not self._gated:
+            return f"ERROR: '{self.CATALOG_TOOL}' has no decision context; nothing was proposed."
+        request, decision = self._gated
+        recorded, detail = self._record_proposal(self.CATALOG_TOOL, request, decision)
+        if not recorded:
+            return f"ERROR: proposal not recorded ({detail}); nothing will be executed."
+        return (f"ALLOWED: {len(request.steps)} step(s) recorded for the follow-up playbook "
+                f"({', '.join(s['baustein'] for s in request.steps)}); not executed by this run")
 
     MAX_ARTIFACTS_SHOWN = 5
 

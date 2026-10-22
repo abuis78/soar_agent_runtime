@@ -23,8 +23,8 @@ import pytest
 import soar_agent_runtime_connector as connector_module
 import soar_agent_runtime_utils as utils
 from soar_agent_runtime_connector import SoarAgentRuntimeConnector
-from soar_agent_runtime_policy import (GATE_APPROVE_2PERSON, GATE_DENY, PolicyClientAdapter, PolicyDecision,
-                                       StubPolicyClient)
+from soar_agent_runtime_policy import (GATE_APPROVE_2PERSON, GATE_DENY, CatalogBlock, PolicyClientAdapter,
+                                       PolicyDecision, StubPolicyClient)
 
 LOCAL_URL = "http://llm.internal:11434/v1"
 RUN_ID_RE = r"^rt-\d{8}T\d{6}Z-[0-9a-f]{8}$"
@@ -479,8 +479,16 @@ RUN_ID = "rt-ac3"
 # fails test_ac05 until it gets a row here.
 EFFECT_CALLS = {
     "update_severity": ({"severity": "high"}, lambda platform: platform["severity"], [(11, "high")]),
+    # catalogue sequence (4.2): ALLOW records a proposal note for the follow-up playbook (E13),
+    # the platform itself is never touched by the run.
+    "catalog_invoke": ({"schritte": [{"baustein": "isolate_endpoint", "ziel": ["srv-1"], "parameter": {"dauer_h": 4}}]},
+                       lambda platform: [n["title"] for n in platform["notes"] if n["title"].startswith("Freigegeben")],
+                       ["Freigegeben (ALLOW): folge: isolate_endpoint -> srv-1"]),
 }
 EFFECTING_TOOLS = sorted(n for n, d in utils.ToolRegistry.TOOL_DEFINITIONS.items() if d.get("wirkt", True))
+EXPECTED_KIND = {"catalog_invoke": "folge"}      # aktion.art on the wire (RT-W09)
+CATALOG = [CatalogBlock(id="isolate_endpoint", version=2, purpose="Isolate an endpoint", category="Isolation",
+                        target_types=("device",), parameters={"dauer_h": "hours"}, min_gate="APPROVE_2PERSON")]
 JUDGEMENT = {"begruendung": "beacon confirmed by step 1", "gegenargumente": "could be a scanner",
              "beleg_ids": [f"{RUN_ID}/1"]}
 
@@ -519,13 +527,13 @@ def test_ac05_effecting_tool_does_nothing_without_an_allow_decision(platform, ll
     define_agent(platform, provider="local", allowed_tools=[tool, "get_container_info"])
     llm["responses"] = effect_script(tool)
     stub = StubPolicyClient(PolicyDecision(gate=GATE_DENY, decision_id="pm-deny", code="RISK_TOO_HIGH",
-                                           reasons=({"regel": "R7", "grund": "score 90 > 60"},)))
+                                           reasons=({"regel": "R7", "grund": "score 90 > 60"},)), blocks=CATALOG)
     c = policy_connector(monkeypatch, stub)
     status, result = run(c)
     assert status is True, result.message
     _, read, _ = EFFECT_CALLS[tool]
-    assert read(platform) == []                                       # no platform change
-    assert len(stub.requests) == 1 and stub.requests[0].kind == tool  # the gate was asked exactly once
+    assert read(platform) == [] and proposals(c) == []                # no platform change, no proposal
+    assert len(stub.requests) == 1 and stub.requests[0].kind == EXPECTED_KIND.get(tool, tool)  # asked exactly once
     obs = step_log(result)[1]["observation"]
     assert obs.startswith("POLICY DENIED code=RISK_TOO_HIGH (score 90 > 60)") and f"'{tool}' was not executed" in obs
 
@@ -534,15 +542,17 @@ def test_ac05_effecting_tool_does_nothing_without_an_allow_decision(platform, ll
 def test_ac05_effecting_tool_runs_exactly_once_on_allow_and_the_audit_names_the_decision(platform, llm, monkeypatch, tool):
     define_agent(platform, provider="local", allowed_tools=[tool, "get_container_info"])
     llm["responses"] = effect_script(tool)
-    stub = StubPolicyClient()                                         # ALLOW, entscheidung_id pm-stub-1
+    stub = StubPolicyClient(blocks=CATALOG)                           # ALLOW, entscheidung_id pm-stub-1
     c = policy_connector(monkeypatch, stub)
     status, result = run(c)
     assert status is True, result.message
     _, read, expected = EFFECT_CALLS[tool]
     assert read(platform) == expected
+    assert platform["severity"] == ([(11, "high")] if tool == "update_severity" else [])
     assert step_log(result)[1]["observation"].endswith("(entscheidung_id=pm-stub-1)")
     req, = stub.requests
-    assert (req.kind, req.run_id, req.step_id, req.evidence_ids) == (tool, RUN_ID, f"{RUN_ID}/2", (f"{RUN_ID}/1",))
+    assert (req.kind, req.run_id, req.step_id, req.evidence_ids) == (EXPECTED_KIND.get(tool, tool), RUN_ID,
+                                                                       f"{RUN_ID}/2", (f"{RUN_ID}/1",))
     assert req.judgement["begruendung"] == JUDGEMENT["begruendung"] and "beleg_ids" not in req.params
     done = [e for e in audit_events(c) if e["schritt_id"] == f"{RUN_ID}/2" and e["phase"] == "erledigt"]
     assert done and done[0]["entscheidung_id"] == "pm-stub-1"

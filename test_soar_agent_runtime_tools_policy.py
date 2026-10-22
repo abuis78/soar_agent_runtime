@@ -7,6 +7,7 @@ schritt_id). The check runs locally (OQ-8) before anything else happens.
 
 from __future__ import annotations
 
+import json
 import sys
 import types
 
@@ -17,6 +18,7 @@ from soar_agent_runtime_policy import (
     CODE_HALTED,
     CODE_NO_POLICY_MODE,
     GATE_APPROVE_2PERSON,
+    CatalogBlock,
     PolicyDecision,
     StubPolicyClient,
 )
@@ -409,3 +411,155 @@ def test_loop_continues_after_a_held_proposal(rules):
     assert result["final_answer"] == "proposed" and result["steps_taken"] == 3   # AC-07: no waiting
     assert "HELD: 'update_severity'" in llm.seen[2][-1]["content"]
     assert rules.calls == [] and len(reg._artifacts) == 1
+
+
+# --- action catalogue: catalog_invoke (4.2-2; RT-W09, AC-09, E12-E14) ---------------------
+
+ISOLATE = CatalogBlock(id="isolate_endpoint", version=2, purpose="Isolate an endpoint", category="Isolation",
+                       target_types=("device",), parameters={"dauer_h": "hours"}, min_stage=1,
+                       reversible=False, undo="unisolate_endpoint", min_gate="APPROVE_2PERSON")
+DISABLE = CatalogBlock(id="disable_account", version=1, purpose="Disable an account", category="Identity",
+                       target_types=("user",), min_stage=0, reversible=True, min_gate="APPROVE_1CLICK")
+WIPE = CatalogBlock(id="wipe_host", version=1, purpose="Wipe", category="Destruction", min_stage=4)
+CATALOG = [ISOLATE, DISABLE, WIPE]
+STEPS = [{"baustein": "isolate_endpoint", "ziel": ["srv-1"], "parameter": {"dauer_h": 4}},
+         {"baustein": "disable_account", "ziel": ["u-7", "srv-1"]}]
+SEQ = {"schritte": STEPS, "begruendung": "lateral movement", "gegenargumente": "admin session",
+       "beleg_ids": ["rt-x/1"]}
+
+
+def catalog_registry(policy=None, stage=2, **extra):
+    reg = registry(policy=policy or StubPolicyClient(blocks=CATALOG), stage=stage, **extra)
+    reg.load_catalog()
+    return reg
+
+
+def test_load_catalog_filters_by_stage_and_hides_the_rest():
+    reg = catalog_registry(stage=2)
+    assert list(reg.catalog) == ["isolate_endpoint", "disable_account"] and [b.id for b in reg.catalog_hidden] == ["wipe_host"]
+    assert reg._policy.actions_asked == ["triage"]
+    assert any("2 block(s) available at stufe 2, 1 hidden" in m for m in reg._progress)
+    assert list(catalog_registry(stage=None).catalog) == ["disable_account"]        # unknown stufe counts as 0
+    assert list(catalog_registry(stage=4).catalog) == ["isolate_endpoint", "disable_account", "wipe_host"]
+
+
+def test_catalog_is_empty_without_a_gate_or_outside_airgap():
+    assert registry(policy=StubPolicyClient()).load_catalog() is False
+    reg = registry(airgap=False, policy=StubPolicyClient(blocks=CATALOG))
+    reg.load_catalog()
+    assert reg.catalog and "catalog_invoke" in reg.get_tool_descriptions()   # the gate decides visibility, not airgap
+    plain = registry(airgap=False)
+    plain.load_catalog()
+    assert plain.catalog == {} and "catalog_invoke" not in plain.get_tool_descriptions()
+
+
+def test_catalog_load_survives_a_raising_gate():
+    class Raising(StubPolicyClient):
+        def actions(self, agent_id):
+            raise RuntimeError("boom")
+    reg = registry(policy=Raising())
+    assert reg.load_catalog() is False and any("catalogue unavailable" in m for m in reg._progress)
+
+
+def test_prompt_lists_blocks_with_their_facts_and_hidden_ones():
+    text = catalog_registry(stage=2).get_tool_descriptions()
+    assert "- catalog_invoke(schritte: JSON list of steps" in text and "beleg_ids:" in text
+    assert "Catalogue building blocks (stufe 2):" in text
+    assert ("  - isolate_endpoint v2: Isolate an endpoint. kategorie Isolation, zieltypen device, "
+            "mindest_gate APPROVE_2PERSON, umkehrbar nein, ruecknahme unisolate_endpoint. Parameters: dauer_h (hours)") in text
+    assert "  - disable_account v1: Disable an account. kategorie Identity, zieltypen user, mindest_gate APPROVE_1CLICK, umkehrbar ja. Parameters: none" in text
+    assert "Not available at this stufe: wipe_host (stufe>=4)" in text
+    assert "catalog_invoke" not in registry().get_tool_descriptions()          # no catalogue, no tool
+
+
+def test_catalog_invoke_is_implicitly_allowed_only_with_blocks(rules):
+    reg = registry(policy=StubPolicyClient())
+    assert reg.execute("catalog_invoke", SEQ).startswith("ERROR: Tool 'catalog_invoke' is not in the allowed tools list")
+    assert catalog_registry()._is_allowed("catalog_invoke") is True
+
+
+@pytest.mark.parametrize("schritte, problem", [
+    (None, "needs 'schritte'"), ([], "needs 'schritte'"), ("isolate_endpoint", "needs 'schritte'"),
+    (["isolate_endpoint"], "step 0 is not an object"),
+    ([{"baustein": "nmap_scan", "ziel": ["x"]}], "baustein 'nmap_scan' is not in the catalogue"),
+    ([{"baustein": "wipe_host", "ziel": ["x"]}], "baustein 'wipe_host' needs stufe>=4"),
+    ([{"baustein": "disable_account"}], "ziel must be a non-empty list of strings"),
+    ([{"baustein": "disable_account", "ziel": "u-7"}], "ziel must be a non-empty list of strings"),
+    ([{"baustein": "disable_account", "ziel": ["u-7"], "parameter": "x"}], "parameter must be an object"),
+])
+def test_bad_steps_are_refused_before_any_policy_request(rules, schritte, problem):
+    reg = catalog_registry()
+    result = reg.execute("catalog_invoke", {**SEQ, "schritte": schritte})
+    assert result.startswith("ERROR:") and problem in result and "no policy request" in result
+    assert reg._policy.requests == [] and reg._artifacts == [] and rules.calls == []
+
+
+def test_sequence_is_one_decide_request_with_schritte(rules):
+    """AC-09: two steps, one request, art 'folge', ziel = union of the step targets."""
+    reg = catalog_registry()
+    reg.execute("catalog_invoke", SEQ)
+    req, = reg._policy.requests
+    assert req.kind == "folge" and req.category == "" and req.params == {} and req.targets == ("srv-1", "u-7")
+    assert req.judgement["begruendung"] == "lateral movement" and req.evidence_ids == ("rt-x/1",)
+    wire = req.to_wire()["aktion"]
+    assert wire["art"] == "folge" and wire["schritte"] == [
+        {"baustein": "isolate_endpoint", "ziel": ["srv-1"], "parameter": {"dauer_h": 4}},
+        {"baustein": "disable_account", "ziel": ["u-7", "srv-1"], "parameter": {}}]
+
+
+def test_allow_records_the_sequence_for_the_playbook_and_touches_nothing(rules):
+    """E13: ALLOW is a proposal with gate ALLOW; the runtime never runs a building block."""
+    rules.notes = []
+    rules.add_note = lambda **kw: rules.notes.append(kw)
+    reg = catalog_registry()
+    result = reg.execute("catalog_invoke", SEQ)
+    assert result == ("ALLOWED: 2 step(s) recorded for the follow-up playbook (isolate_endpoint, disable_account); "
+                      "not executed by this run (entscheidung_id=pm-stub-1)")
+    assert rules.calls == [] and reg._policy.consumed == []
+    [artifact] = reg._artifacts
+    cef = artifact["cef"]
+    assert artifact["label"] == "agent_action_proposal" and artifact["name"] == "folge: isolate_endpoint, disable_account -> srv-1, u-7"
+    assert artifact["source_data_identifier"] == "pm-stub-1:rt-x/2" and artifact["run_automation"] is False
+    assert (cef["gate"], cef["freigabe_id"], cef["entscheidung_id"], cef["aktion"]) == ("ALLOW", "", "pm-stub-1", "catalog_invoke")
+    assert json.loads(cef["schritte"]) == [
+        {"baustein": "isolate_endpoint", "ziel": ["srv-1"], "parameter": {"dauer_h": 4}},
+        {"baustein": "disable_account", "ziel": ["u-7", "srv-1"], "parameter": {}}]
+    assert cef["ziel"] == ["srv-1", "u-7"] and cef["beleg_ids"] == ["rt-x/1"]
+    [note] = rules.notes
+    assert note["title"] == "Freigegeben (ALLOW): folge: isolate_endpoint, disable_account -> srv-1, u-7"
+    assert "- Gate: ALLOW" in note["content"] and "kein consume noetig" in note["content"] and "freigabe_id" not in note["content"]
+    assert reg._gated is None and reg._active_decision == ""
+
+
+def test_allow_with_unrecordable_proposal_is_an_error(rules):
+    reg = catalog_registry(artifact_ok=False)
+    result = reg.execute("catalog_invoke", SEQ)
+    assert result.startswith("ERROR: proposal not recorded (database read-only); nothing will be executed")
+
+
+def test_approval_gate_holds_the_sequence_with_freigabe_id(rules):
+    rules.notes = []
+    rules.add_note = lambda **kw: rules.notes.append(kw)
+    reg = catalog_registry(policy=StubPolicyClient(APPROVE, blocks=CATALOG))
+    result = reg.execute("catalog_invoke", SEQ)
+    assert result.startswith("HELD: 'catalog_invoke' requires APPROVE_2PERSON (2 approval(s))") and "freigabe_id=f-2" in result
+    [artifact] = reg._artifacts
+    assert artifact["cef"]["freigabe_id"] == "f-2" and json.loads(artifact["cef"]["schritte"])[0]["baustein"] == "isolate_endpoint"
+    assert rules.notes[0]["title"].startswith("Freigabe ausstehend: folge: isolate_endpoint") and "consume(freigabe_id)" in rules.notes[0]["content"]
+    assert rules.calls == []
+
+
+def test_deny_from_the_catalogue_rules_names_the_step(rules):
+    deny = PolicyDecision.from_wire({"gate": "DENY", "entscheidung_id": "pm-9", "code": "BLOCK_NOT_ALLOWED", "begruendung": [
+        {"regel": "katalog", "gate": "DENY", "grund": "disable_account not released for agent_id=triage", "schritt": 1}]})
+    reg = catalog_registry(policy=StubPolicyClient(deny, blocks=CATALOG))
+    result = reg.execute("catalog_invoke", SEQ)
+    assert result == ("POLICY DENIED code=BLOCK_NOT_ALLOWED (disable_account not released for agent_id=triage (schritt 1)); "
+                      "'catalog_invoke' was not executed.")
+    assert reg._artifacts == [] and rules.calls == []
+
+
+def test_catalog_handler_outside_the_gate_is_refused(rules):
+    reg = catalog_registry()
+    assert reg._tool_catalog_invoke(SEQ).startswith("ERROR: 'catalog_invoke' runs only through the policy gate")
+    assert reg._artifacts == []
