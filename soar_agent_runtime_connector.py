@@ -23,6 +23,7 @@ from soar_agent_runtime_utils import (
 )
 from soar_agent_runtime_audit import ArtifactAuditSink, NullAuditSink, definition_version
 from soar_agent_runtime_broker import BrokerClient, BrokerConfig, BrokerConfigError
+from soar_agent_runtime_policy import POLICY_MODES, build_policy_client
 
 try:
     from ai_soc_telemetry import TelemetryClient
@@ -61,6 +62,11 @@ class SoarAgentRuntimeConnector(BaseConnector):
         self._broker_client_key = ""
         self._broker_ca = ""
         self._broker_transport = None  # tests inject a fake; None = requests over mTLS
+        # RT-W01/W03 (Umsetzungskonzept 3.1a, E11): Policy Manager, embedded mode
+        self._policy_mode = ""
+        self._policy_path = ""
+        self._policy_state_dir = ""
+        self._policy_client = None     # tests inject a PolicyGate; None = build from the asset
 
     def initialize(self):
         self._config = self.get_config()
@@ -81,10 +87,15 @@ class SoarAgentRuntimeConnector(BaseConnector):
         self._broker_client_cert = (self._config.get("broker_client_cert") or "").strip()
         self._broker_client_key = (self._config.get("broker_client_key") or "").strip()
         self._broker_ca = (self._config.get("broker_ca") or "").strip()
+        self._policy_mode = (self._config.get("policy_mode") or "").strip().lower()
+        self._policy_path = (self._config.get("policy_path") or "").strip()
+        self._policy_state_dir = (self._config.get("policy_state_dir") or "").strip().rstrip("/")
         if self._airgap_mode:
             self.save_progress("[airgap] enabled - only provider 'local' is allowed.")
             if not self._broker_url:
                 self.save_progress("[airgap] broker_url not set - read tools unavailable.")
+            if self._policy_mode not in POLICY_MODES:
+                self.save_progress("[airgap] policy_mode not set - every effecting action is denied (RT-W03).")
         self._telemetry = self._build_telemetry()
         return phantom.APP_SUCCESS
 
@@ -295,9 +306,11 @@ class SoarAgentRuntimeConnector(BaseConnector):
             except Exception as e:
                 results[provider_name] = f"ERROR: {str(e)}"
 
-        # RT-A04 (part 2): Tool Broker health. Mandatory in airgap_mode,
-        # informational otherwise. Policy Manager health follows in 3.7.
+        # RT-A04 (part 2): Tool Broker and Policy Manager health. Both are
+        # mandatory in airgap_mode; outside it the broker is informational and
+        # the policy gate is not used at all (E4).
         broker_ok = self._test_broker(results)
+        policy_ok = self._test_policy(results)
 
         if not any_success:
             return action_result.set_status(
@@ -305,8 +318,28 @@ class SoarAgentRuntimeConnector(BaseConnector):
         if self._airgap_mode and not broker_ok:
             return action_result.set_status(
                 phantom.APP_ERROR, f"Broker check failed ({mode}). Results: {json.dumps(results)}")
+        if self._airgap_mode and not policy_ok:
+            return action_result.set_status(
+                phantom.APP_ERROR, f"Policy check failed ({mode}). Results: {json.dumps(results)}")
         return action_result.set_status(
             phantom.APP_SUCCESS, f"Connectivity OK ({mode}). Results: {json.dumps(results)}")
+
+    def _build_policy_client(self):
+        """PolicyGate for this asset (RT-W03, E11). Tests inject self._policy_client.
+        Outside airgap_mode the gate is not used (E4), so None is returned and
+        ToolRegistry keeps its fail-closed default for the airgap path."""
+        if self._policy_client is not None:
+            return self._policy_client
+        if not self._airgap_mode:
+            return None
+        state = self._policy_state_dir
+        return build_policy_client(
+            self._policy_mode,
+            policy_path=self._policy_path,
+            approvals_path=f"{state}/approvals.json" if state else "",
+            halt_path=f"{state}/halt.json" if state else "",
+            audit_path=f"{state}/audit.jsonl" if state else "",
+        )
 
     def _test_broker(self, results: dict) -> bool:
         """Fill results["broker"]; True only when a configured broker answers /health."""
@@ -322,6 +355,28 @@ class SoarAgentRuntimeConnector(BaseConnector):
             return False
         ok, message = client.health()
         results["broker"] = f"OK: {message}" if ok else f"ERROR: {message}"
+        return ok
+
+    def _test_policy(self, results: dict) -> bool:
+        """Fill results["policy"]; True only when the Policy Manager gate reports healthy.
+
+        A halted Policy Manager is reachable and therefore healthy; health()
+        says "HALTED (<reason>)" so the operator sees it. Outside airgap_mode
+        the gate is never consulted (E4), so nothing is built or checked.
+        """
+        if not self._policy_mode:
+            results["policy"] = ("NOT CONFIGURED (required in airgap_mode)" if self._airgap_mode
+                                 else "SKIPPED (no policy_mode)")
+            return False
+        if not self._airgap_mode:
+            results["policy"] = f"SKIPPED (policy_mode '{self._policy_mode}' is only used in airgap_mode)"
+            return False
+        self.save_progress("Testing policy manager...")
+        try:
+            ok, message = self._build_policy_client().health()
+        except Exception as e:  # fail closed, like every other gate call (RT-W03)
+            ok, message = False, f"policy health check raised {type(e).__name__}: {e}"
+        results["policy"] = f"OK: {message}" if ok else f"ERROR: {message}"
         return ok
 
     # -----------------------------------------------------------------------
@@ -349,6 +404,11 @@ class SoarAgentRuntimeConnector(BaseConnector):
             return action_result.set_status(phantom.APP_ERROR, "container_id must be a valid positive integer.")
 
         max_steps_override = self._safe_int(param.get("max_steps", 0), name="max_steps") or 0
+        # RT-W08: stufe (0-4) from the triggering playbook, domaene of the run; empty = unknown
+        stage_raw = param.get("stufe", "")
+        stage = self._safe_int(stage_raw, name="stufe") if stage_raw not in (None, "") else None
+        stage = stage if isinstance(stage, int) and 0 <= stage <= 4 else None
+        domain = str(param.get("domaene") or "").strip()
 
         # Load agent definition
         self.save_progress(f"Loading agent: {agent_id}")
@@ -385,6 +445,11 @@ class SoarAgentRuntimeConnector(BaseConnector):
             self.save_progress(f"[broker] misconfigured, running without broker: {e}")
             broker = None
 
+        policy = self._build_policy_client()
+        if self._airgap_mode:
+            self.save_progress(f"[policy] mode={getattr(policy, 'mode', '') or 'none'} "
+                               f"({'ready' if policy and policy.health()[0] else 'not available - effecting actions denied'})")
+
         # One lauf_id for broker context, audit and result (RT-P01)
         run_id = new_run_id()
 
@@ -404,6 +469,9 @@ class SoarAgentRuntimeConnector(BaseConnector):
             broker=broker,
             run_id=run_id,
             airgap=self._airgap_mode,
+            policy=policy,
+            stage=stage,
+            domain=domain,
         )
         tools.load_broker_tools()  # RT-L03: templates once per run
         if tools.halted:

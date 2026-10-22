@@ -6,7 +6,7 @@
     "package_name": "phantom_soar_agent_runtime",
     "type": "generic",
     "license": "Copyright 2026 Andreas Buis",
-    "app_version": "1.6.0",
+    "app_version": "1.7.0",
     "product_vendor": "OpenClaw SOC",
     "product_name": "SOAR Agent Runtime",
     "product_version_regex": ".*",
@@ -372,6 +372,30 @@
             "data_type": "string",
             "required": false,
             "order": 27
+        },
+        "policy_mode": {
+            "description": "Policy Manager mode for effecting actions (RT-W03): 'embedded' (policy_client in-process) or 'service' (Phase 4). Empty = every effecting action is denied in airgap_mode",
+            "data_type": "string",
+            "required": false,
+            "value_list": [
+                "",
+                "embedded",
+                "service"
+            ],
+            "default": "",
+            "order": 28
+        },
+        "policy_path": {
+            "description": "Path on the SOAR host to the policy file (JSON/TOML from Git) used by policy_mode 'embedded' (E11)",
+            "data_type": "string",
+            "required": false,
+            "order": 29
+        },
+        "policy_state_dir": {
+            "description": "Directory on the SOAR host for the embedded Policy Manager state: approvals.json, halt.json, audit.jsonl (E11). Must be writable by the app user",
+            "data_type": "string",
+            "required": false,
+            "order": 30
         }
     },
     "actions": [
@@ -422,6 +446,18 @@
                     "data_type": "string",
                     "required": false,
                     "order": 4
+                },
+                "stufe": {
+                    "description": "Escalation stage 0-4 of the triggering playbook, sent with every policy request (RT-W08); empty = unknown",
+                    "data_type": "numeric",
+                    "required": false,
+                    "order": 5
+                },
+                "domaene": {
+                    "description": "Domain of this run (e.g. soc, it, ot), sent with every policy request (RT-W08)",
+                    "data_type": "string",
+                    "required": false,
+                    "order": 6
                 }
             },
             "output": [
