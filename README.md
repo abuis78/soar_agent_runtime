@@ -503,3 +503,4 @@ phenv python3 soar_agent_runtime_connector.py /tmp/test_run_agent.json
 | 1.0.1 | 2026-03-22 | Fix: added `main_module` to app JSON |
 | 1.2.0 | 2026-03-22 | Skills system (Option B): `SkillStore`, `create skill`, `list skills` actions; 7 SOC use case prompts in README |
 | 1.3.0 | 2026-03-22 | Python 3.13 update: `match` statements, `X\|Y` type hints, walrus operator, list unpacking patterns; min_phantom_version 6.3.0 |
+| 1.7.1 | 2026-10-22 | Policy Manager `embedded`: bundled `policy_manager` 0.1.0 wheel (`wheels/py3/`), so `policy_mode = embedded` decides effecting actions in `airgap_mode` (RT-W01, RT-W03) |

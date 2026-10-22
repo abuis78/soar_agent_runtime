@@ -6,7 +6,7 @@
     "package_name": "phantom_soar_agent_runtime",
     "type": "generic",
     "license": "Copyright 2026 Andreas Buis",
-    "app_version": "1.7.0",
+    "app_version": "1.7.1",
     "product_vendor": "OpenClaw SOC",
     "product_name": "SOAR Agent Runtime",
     "product_version_regex": ".*",
@@ -184,6 +184,10 @@
             {
                 "module": "ai-soc-telemetry",
                 "input_file": "wheels/py3/ai_soc_telemetry-0.1.0-py3-none-any.whl"
+            },
+            {
+                "module": "policy-manager",
+                "input_file": "wheels/py3/policy_manager-0.1.0-py3-none-any.whl"
             }
         ]
     },
