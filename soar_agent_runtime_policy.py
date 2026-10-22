@@ -17,6 +17,7 @@ halt state counts as halted.
 from __future__ import annotations
 
 import inspect
+import json
 from dataclasses import dataclass, field
 from typing import Any, Optional, Protocol
 
@@ -271,10 +272,11 @@ class PolicyClientAdapter:
     package is a DENY / halted / failed result, never a traceback in the loop.
     """
 
-    def __init__(self, client: Any, request_type: Any, mode: str) -> None:
+    def __init__(self, client: Any, request_type: Any, mode: str, policy_path: str = "") -> None:
         self._client = client
         self._request_type = request_type
         self.mode = mode
+        self.policy_path = policy_path   # embedded: checked by health(), the package itself only logs
 
     def _request(self, request: PolicyRequest) -> Any:
         return self._request_type.from_wire(request.to_wire())
@@ -305,11 +307,30 @@ class PolicyClientAdapter:
             return HaltState(halted=True, reason=f"policy client failed: {type(exc).__name__}")
 
     def health(self) -> tuple[bool, str]:
+        problem = self._policy_file_problem()
+        if problem:
+            return False, f"policy {self.mode}: {problem}"
         halt = self.halt_status()
         if halt.reason.startswith("policy client failed") or halt.reason == "unknown halt state":
             return False, f"policy {self.mode}: {halt.reason}"
         state = f"HALTED ({halt.reason})" if halt.halted else "not halted"
         return True, f"policy {self.mode} healthy, {state}"
+
+    def _policy_file_problem(self) -> str:
+        """A policy file that is missing or not a JSON object makes the package deny every
+        action via its default gate; say so in health() instead of per action."""
+        if not self.policy_path:
+            return ""
+        try:
+            with open(self.policy_path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except OSError as exc:
+            return f"policy file not readable ({type(exc).__name__}): {self.policy_path}"
+        except ValueError:
+            return f"policy file is not valid JSON: {self.policy_path}"
+        if not isinstance(data, dict):
+            return f"policy file is not a JSON object: {self.policy_path}"
+        return ""
 
 
 class StubPolicyClient:
@@ -393,7 +414,7 @@ def build_policy_client(mode: str, *, policy_path: str = "", approvals_path: str
         client = EmbeddedPolicyClient(**kwargs)
     except Exception as exc:
         return NoPolicyClient(f"policy client could not start ({type(exc).__name__})", CODE_UNAVAILABLE)
-    return PolicyClientAdapter(client, DecisionRequest, POLICY_MODE_EMBEDDED)
+    return PolicyClientAdapter(client, DecisionRequest, POLICY_MODE_EMBEDDED, policy_path=kwargs["policy_path"])
 
 
 def _accepts(cls: Any, name: str) -> bool:

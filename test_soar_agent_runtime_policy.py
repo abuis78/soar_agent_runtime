@@ -213,6 +213,28 @@ def test_adapter_never_raises():
     assert not ok and "RuntimeError" in detail
 
 
+@pytest.mark.parametrize("content,problem", [
+    (None, "policy file not readable (FileNotFoundError)"),
+    ("{not json", "policy file is not valid JSON"),
+    ("[1, 2]", "policy file is not a JSON object"),
+])
+def test_adapter_health_reports_an_unusable_policy_file(tmp_path, content, problem):
+    path = tmp_path / "policy.json"
+    if content is not None:
+        path.write_text(content)
+    gate = PolicyClientAdapter(_FakePolicyClient(), _FakeRequestType, "embedded", policy_path=str(path))
+    ok, detail = gate.health()
+    assert ok is False and detail == f"policy embedded: {problem}: {path}"
+    assert gate.decide(REQ).allowed          # health is advisory; decisions still come from the package
+
+
+def test_adapter_health_accepts_a_json_object_policy_file(tmp_path):
+    path = tmp_path / "policy.json"
+    path.write_text('{"default_gate": "DENY", "categories": {}}')
+    gate = PolicyClientAdapter(_FakePolicyClient(), _FakeRequestType, "embedded", policy_path=str(path))
+    assert gate.health() == (True, "policy embedded healthy, not halted")
+
+
 def test_adapter_treats_malformed_package_answer_as_deny():
     gate = PolicyClientAdapter(_FakePolicyClient(decision={"gate": "ALLOW"}), _FakeRequestType, "embedded")
     assert gate.decide(REQ).code == CODE_INVALID_RESPONSE
@@ -240,6 +262,7 @@ def test_factory_builds_adapter_from_p1_package_without_audit_kwargs(monkeypatch
     gate = build_policy_client("embedded", policy_path="/etc/pm/policy.json", approvals_path="/var/pm/approvals.json",
                                halt_path="/var/pm/halt.json", audit_path="/var/pm/audit.jsonl")
     assert isinstance(gate, PolicyClientAdapter) and gate.mode == "embedded"
+    assert gate.policy_path == "/etc/pm/policy.json"
     assert built == {"policy_path": "/etc/pm/policy.json", "approvals_path": "/var/pm/approvals.json",
                      "halt_path": "/var/pm/halt.json"}
     assert gate.decide(REQ).allowed
