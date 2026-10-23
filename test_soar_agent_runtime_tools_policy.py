@@ -28,7 +28,7 @@ from soar_agent_runtime_utils import ReActLoop, ToolRegistry
 OK = InvokeResult(ok=True, aufruf_id="tb-1", vorlage_id="asset_kontext", vorlage_version=1,
                   katalog_version="k", zeilen=1, daten=[{"asset": "srv-1"}])
 GOOD = {"severity": "high", "begruendung": "beacon confirmed", "gegenargumente": "could be a scanner",
-        "beleg_ids": ["rt-x/1"]}
+        "unsicherheiten": "keine erkannt", "konfidenz": 0.8, "beleg_ids": ["rt-x/1"]}
 
 
 class FakeBroker:
@@ -86,17 +86,22 @@ def test_valid_evidence_is_earlier_steps_plus_broker_results():
 # --- RT-W05: mandatory fields -----------------------------------------------------
 
 @pytest.mark.parametrize("params, missing", [
-    ({"severity": "high"}, "'begruendung', 'gegenargumente', 'beleg_ids'"),
-    ({"severity": "high", "begruendung": " ", "gegenargumente": "x", "beleg_ids": ["rt-x/1"]}, "'begruendung'"),
-    ({"severity": "high", "begruendung": "b", "gegenargumente": "g", "beleg_ids": []}, "'beleg_ids'"),
-    ({"severity": "high", "begruendung": "b", "gegenargumente": "g", "beleg_ids": "rt-x/1"}, "'beleg_ids'"),
+    ({"severity": "high"}, "'begruendung', 'gegenargumente', 'unsicherheiten', 'konfidenz', 'beleg_ids'"),
+    ({**GOOD, "begruendung": " "}, "'begruendung'"),
+    ({**GOOD, "gegenargumente": []}, "'gegenargumente'"),            # D23: empty list is not a judgement
+    ({**GOOD, "gegenargumente": [" ", 3]}, "'gegenargumente'"),
+    ({**GOOD, "unsicherheiten": ""}, "'unsicherheiten'"),
+    ({**GOOD, "unsicherheiten": {"a": 1}}, "'unsicherheiten'"),
+    ({**GOOD, "konfidenz": "high"}, "'konfidenz'"),
+    ({**GOOD, "beleg_ids": []}, "'beleg_ids'"),
+    ({**GOOD, "beleg_ids": "rt-x/1"}, "'beleg_ids'"),
 ])
 def test_effecting_tool_without_mandatory_fields_is_refused_before_execution(rules, params, missing):
     reg = registry()
     result = reg.execute("update_severity", params)
-    assert result.startswith("ERROR: Tool 'update_severity' has an effect and needs " + missing)
-    assert "Nothing was executed" in result
-    assert rules.calls == []
+    assert result.startswith("ERROR: Tool 'update_severity' has an effect and needs " + missing + ":")
+    assert "'keine erkannt' if none" in result and "Nothing was executed" in result
+    assert rules.calls == [] and reg._policy.requests == []
 
 
 # --- AC-08: fabricated evidence ---------------------------------------------------
@@ -167,12 +172,13 @@ def test_allow_executes_and_sends_the_request_without_meta_params(rules):
     assert req.kind == "update_severity" and req.params == {"severity": "high"}
     assert req.targets == ("container:4711",) and req.initiator == "triage" and req.agent_id == "triage"
     assert req.run_id == "rt-x" and req.step_id == "rt-x/2" and req.evidence_ids == ("rt-x/1",)
-    assert req.judgement == {"begruendung": "beacon confirmed", "gegenargumente": "could be a scanner",
-                             "unsicherheiten": ""}
+    assert req.judgement == {"empfehlung": "beacon confirmed", "gegenargumente": ["could be a scanner"],
+                             "unsicherheiten": ["keine erkannt"], "konfidenz": 0.8}
     assert req.category == "Triage"
-    assert req.stage is None and req.domain == "" and req.confidence is None
+    assert req.stage is None and req.domain == "" and req.confidence == 0.8
     wire = req.to_wire()["kontext"]
-    assert "stufe" not in wire and "agent_konfidenz" not in wire and wire["domaene"] == ""
+    assert "stufe" not in wire and wire["agent_konfidenz"] == 0.8 and wire["domaene"] == ""
+    assert wire["urteil"] == req.judgement and "begruendung" not in wire["urteil"]   # PM docs/API.md §3 (W14)
     assert "[policy] decide update_severity (step 2)" in reg._progress
 
 
@@ -265,13 +271,14 @@ def test_outside_airgap_the_gate_is_not_consulted(rules):
 
 def test_request_carries_stage_domain_and_full_judgement(rules):
     reg = registry(stage=2, domain="soc")
-    params = {**GOOD, "unsicherheiten": "only one sensor", "konfidenz": 0.85}
+    params = {**GOOD, "gegenargumente": ["could be a scanner", " or a backup job ", ""],
+              "unsicherheiten": ["only one sensor"], "konfidenz": 0.85}
     assert reg.execute("update_severity", params).startswith("Container severity updated to: high")
     req = reg._policy.requests[0]
     assert req.stage == 2 and req.domain == "soc" and req.confidence == 0.85
     assert req.params == {"severity": "high"}                   # meta fields never reach the action
-    assert req.judgement == {"begruendung": "beacon confirmed", "gegenargumente": "could be a scanner",
-                             "unsicherheiten": "only one sensor", "konfidenz": 0.85}
+    assert req.judgement == {"empfehlung": "beacon confirmed", "gegenargumente": ["could be a scanner", "or a backup job"],
+                             "unsicherheiten": ["only one sensor"], "konfidenz": 0.85}   # lists are passed through, cleaned
     wire = req.to_wire()
     assert wire["kontext"]["stufe"] == 2 and wire["kontext"]["agent_konfidenz"] == 0.85
     assert wire["kontext"]["domaene"] == "soc" and wire["kontext"]["principal_type"] == "agent"
@@ -280,11 +287,16 @@ def test_request_carries_stage_domain_and_full_judgement(rules):
 
 
 @pytest.mark.parametrize("konfidenz", ["high", 1.5, -0.1, True, None, "0.9x"])
-def test_unusable_confidence_is_dropped_not_rejected(rules, konfidenz):
+def test_unusable_confidence_is_refused_before_any_policy_request(rules, konfidenz):
+    """W14: the Policy Manager denies a judgement without konfidenz (INCOMPLETE_JUDGEMENT); refuse it locally."""
     reg = registry()
-    assert reg.execute("update_severity", {**GOOD, "konfidenz": konfidenz}).startswith("Container severity")
-    req = reg._policy.requests[0]
-    assert req.confidence is None and "konfidenz" not in req.judgement
+    result = reg.execute("update_severity", {**GOOD, "konfidenz": konfidenz})
+    assert result.startswith("ERROR: Tool 'update_severity' has an effect and needs 'konfidenz':")
+    assert reg._policy.requests == [] and rules.calls == []
+
+
+def test_numeric_string_confidence_is_accepted(rules):
+    assert registry().execute("update_severity", {**GOOD, "konfidenz": "0.9"}).startswith("Container severity")
 
 
 @pytest.mark.parametrize("stage", [True, "2", 3.5, None])
@@ -293,9 +305,11 @@ def test_stage_is_an_int_or_unknown(stage):
     assert registry(stage=0).stage == 0 and registry(stage=4).stage == 4
 
 
-def test_prompt_marks_unsicherheiten_and_konfidenz_optional():
+def test_prompt_marks_every_judgement_field_mandatory():
     line = next(ln for ln in registry().get_tool_descriptions().splitlines() if ln.startswith("- update_severity("))
-    assert "unsicherheiten: optional" in line and "konfidenz: optional" in line
+    assert "optional" not in line
+    assert "unsicherheiten: What you are unsure about (text or list of strings; write 'keine erkannt' if none)" in line
+    assert "konfidenz: Your confidence 0..1 (number)" in line and "gegenargumente: What speaks against it (text or list of strings)" in line
 
 
 # --- RT-W11: no path around the gate ------------------------------------------------------
@@ -378,7 +392,7 @@ def make_loop(responses, policy):
 
 
 ACT = ('ACTION: update_severity\nPARAMS: {"severity": "high", "begruendung": "b", "gegenargumente": "g", '
-       '"beleg_ids": ["rt-x/1"]}')
+       '"unsicherheiten": "keine erkannt", "konfidenz": 0.7, "beleg_ids": ["rt-x/1"]}')
 
 
 def test_loop_audit_event_carries_entscheidung_id(rules):
@@ -426,7 +440,7 @@ CATALOG = [ISOLATE, DISABLE, WIPE]
 STEPS = [{"baustein": "isolate_endpoint", "ziel": ["srv-1"], "parameter": {"dauer_h": 4}},
          {"baustein": "disable_account", "ziel": ["u-7", "srv-1"]}]
 SEQ = {"schritte": STEPS, "begruendung": "lateral movement", "gegenargumente": "admin session",
-       "beleg_ids": ["rt-x/1"]}
+       "unsicherheiten": "keine erkannt", "konfidenz": 0.75, "beleg_ids": ["rt-x/1"]}
 
 
 def catalog_registry(policy=None, stage=2, **extra):
@@ -501,7 +515,7 @@ def test_sequence_is_one_decide_request_with_schritte(rules):
     reg.execute("catalog_invoke", SEQ)
     req, = reg._policy.requests
     assert req.kind == "folge" and req.category == "" and req.params == {} and req.targets == ("srv-1", "u-7")
-    assert req.judgement["begruendung"] == "lateral movement" and req.evidence_ids == ("rt-x/1",)
+    assert req.judgement["empfehlung"] == "lateral movement" and req.evidence_ids == ("rt-x/1",)
     wire = req.to_wire()["aktion"]
     assert wire["art"] == "folge" and wire["schritte"] == [
         {"baustein": "isolate_endpoint", "ziel": ["srv-1"], "parameter": {"dauer_h": 4}},

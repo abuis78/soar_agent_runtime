@@ -135,12 +135,12 @@ Your FINAL_ANSWER MUST be a single JSON object (no text outside the JSON) with t
 - "belege": list of beleg_id strings. A beleg_id is a schritt_id shown in an OBSERVATION of this run. Never invent one; use [] if you have no evidence.
 - "begruendung": string, your reasoning for the recommendation
 - "gegenargumente": list of strings, arguments against your conclusion
-- "unsicherheiten": list of strings, what you could not verify
+- "unsicherheiten": list of strings, what you could not verify; write ["keine erkannt"] if none
 - "konfidenz": number between 0 and 1
 - "datenlage": one of "vollstaendig" | "teilweise" | "unbekannt" | "blinder_fleck"
 Skill output fields, if any, go into the same object.
 Example:
-FINAL_ANSWER: {"belege": ["<schritt_id>"], "begruendung": "...", "gegenargumente": ["..."], "unsicherheiten": [], "konfidenz": 0.7, "datenlage": "teilweise"}
+FINAL_ANSWER: {"belege": ["<schritt_id>"], "begruendung": "...", "gegenargumente": ["..."], "unsicherheiten": ["keine erkannt"], "konfidenz": 0.7, "datenlage": "teilweise"}
 """
 
 
@@ -483,15 +483,17 @@ class ToolRegistry:
     GAP_LABEL = "agent_action_gap"
     LEGACY_SPL_TOOL = "splunk_search"
     DEPRECATED_NOTE = " (deprecated: prefer broker_invoke templates)"
-    # RT-W05: every effecting tool needs a justification, counter-arguments and
-    # evidence that originated in this run (checked locally, OQ-8) before any
-    # policy request is made. Shown in the prompt only in airgap_mode (E4).
+    # RT-W05: every effecting tool needs a complete judgement and evidence that
+    # originated in this run, checked locally (OQ-8) before any policy request
+    # is made. The Policy Manager denies an incomplete judgement anyway
+    # (INCOMPLETE_JUDGEMENT, D23/W14), so all five fields are mandatory.
+    # Shown in the prompt only in airgap_mode (E4).
     EFFECT_PARAMS = {
         "begruendung": "Why this action is needed (text)",
-        "gegenargumente": "What speaks against it (text)",
+        "gegenargumente": "What speaks against it (text or list of strings)",
         "beleg_ids": "JSON list of evidence ids from this run (aufruf_id of a broker result or schritt_id of an earlier step)",
-        "unsicherheiten": "optional: what you are unsure about (text)",
-        "konfidenz": "optional: your confidence 0..1 (number)",
+        "unsicherheiten": "What you are unsure about (text or list of strings; write 'keine erkannt' if none)",
+        "konfidenz": "Your confidence 0..1 (number)",
     }
     # Broker codes that mean "data gap, no other access path" (RT-L06).
     BROKER_GAP_CODES = frozenset({"UNREACHABLE", "TIMEOUT", "BAD_RESPONSE", "SOURCE_ERROR",
@@ -676,15 +678,20 @@ class ToolRegistry:
         """RT-W05 / AC-08: validate the mandatory fields of an effecting call.
         Returns an ERROR observation, or None when the call may go on to the gate."""
         params = params if isinstance(params, dict) else {}
-        missing = [k for k in ("begruendung", "gegenargumente")
-                   if not isinstance(params.get(k), str) or not params[k].strip()]
+        missing = []
+        if not isinstance(params.get("begruendung"), str) or not params["begruendung"].strip():
+            missing.append("begruendung")
+        missing += [k for k in ("gegenargumente", "unsicherheiten") if not self._text_list(params.get(k))]
+        if self._confidence(params.get("konfidenz")) is None:
+            missing.append("konfidenz")
         beleg_ids = params.get("beleg_ids")
         if not isinstance(beleg_ids, list) or not beleg_ids:
             missing.append("beleg_ids")
         if missing:
             return (f"ERROR: Tool '{tool_name}' has an effect and needs {', '.join(repr(m) for m in missing)}: "
-                    "begruendung (text), gegenargumente (text), beleg_ids (non-empty JSON list of this run's "
-                    "aufruf_id or earlier schritt_id values). Nothing was executed.")
+                    "begruendung (text), gegenargumente and unsicherheiten (text or list of strings, "
+                    "'keine erkannt' if none), konfidenz (number 0..1), beleg_ids (non-empty JSON list of this "
+                    "run's aufruf_id or earlier schritt_id values). Nothing was executed.")
         valid = self.valid_evidence()
         bad = [str(b) for b in beleg_ids if not isinstance(b, str) or b not in valid]
         if bad:
@@ -807,8 +814,19 @@ class ToolRegistry:
     META_PARAMS = ("begruendung", "gegenargumente", "beleg_ids", "unsicherheiten", "konfidenz")
 
     @staticmethod
+    def _text_list(value) -> list[str]:
+        """gegenargumente / unsicherheiten as the Policy Manager wants them (D23):
+        a list with at least one non-empty entry. Text becomes a one-entry list,
+        anything unusable becomes [] (which _check_effect_params refuses)."""
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list):
+            return []
+        return [v.strip() for v in value if isinstance(v, str) and v.strip()]
+
+    @staticmethod
     def _confidence(value) -> float | None:
-        """konfidenz 0..1 or None; an unusable value is dropped, never rejected."""
+        """konfidenz 0..1 or None when unusable (refused by _check_effect_params)."""
         if isinstance(value, bool) or value is None:
             return None
         try:
@@ -819,13 +837,14 @@ class ToolRegistry:
 
     def _build_policy_request(self, tool_name: str, params: dict) -> PolicyRequest:
         """Request content per RT-W08: initiator, ids, stufe, domaene, evidence and
-        the judgement (begruendung, gegenargumente, unsicherheiten, konfidenz).
+        the judgement in the Policy Manager's form (docs/API.md §3, W14):
+        urteil = {empfehlung, gegenargumente[], unsicherheiten[], konfidenz}.
         Reversibility is not sent; the client identity is the mTLS certificate."""
         action_params = {k: v for k, v in params.items() if k not in self.META_PARAMS}
         confidence = self._confidence(params.get("konfidenz"))
-        judgement = {"begruendung": params.get("begruendung", ""),
-                     "gegenargumente": params.get("gegenargumente", ""),
-                     "unsicherheiten": str(params.get("unsicherheiten") or "")}
+        judgement = {"empfehlung": str(params.get("begruendung") or "").strip(),
+                     "gegenargumente": self._text_list(params.get("gegenargumente")),
+                     "unsicherheiten": self._text_list(params.get("unsicherheiten"))}
         if confidence is not None:
             judgement["konfidenz"] = confidence
         kind, category, targets = tool_name, _ACTION_TELEMETRY.get(tool_name, ""), (f"container:{self.container_id}",)
@@ -908,8 +927,8 @@ class ToolRegistry:
             "lauf_id": request.run_id,
             "schritt_id": request.step_id,
             "agent_id": request.agent_id,
-            "begruendung": request.judgement.get("begruendung", ""),
-            "gegenargumente": request.judgement.get("gegenargumente", ""),
+            "begruendung": request.judgement.get("empfehlung", ""),
+            "gegenargumente": "; ".join(request.judgement.get("gegenargumente", ())),
             "beleg_ids": list(request.evidence_ids),
             "policy_version": decision.policy_version,
         }

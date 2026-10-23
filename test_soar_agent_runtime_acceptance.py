@@ -228,7 +228,8 @@ def test_ac12_every_step_is_audited_with_lauf_id_and_schritt_id(platform, llm, m
         "THOUGHT: a\nACTION: get_container_info",
         # RT-W05 (3.3): an effecting call cites evidence from this run - step 1 here.
         'THOUGHT: b\nACTION: update_severity\nPARAMS: {"severity": "high", "begruendung": "beacon confirmed", '
-        '"gegenargumente": "could be a scanner", "beleg_ids": ["rt-test/1"]}',
+        '"gegenargumente": "could be a scanner", "unsicherheiten": "keine erkannt", "konfidenz": 0.6, '
+        '"beleg_ids": ["rt-test/1"]}',
         f"FINAL_ANSWER: {VALID_VERDICT}",
     ]
     c = make_connector(airgap_mode=True)
@@ -490,7 +491,7 @@ EXPECTED_KIND = {"catalog_invoke": "folge"}      # aktion.art on the wire (RT-W0
 CATALOG = [CatalogBlock(id="isolate_endpoint", version=2, purpose="Isolate an endpoint", category="Isolation",
                         target_types=("device",), parameters={"dauer_h": "hours"}, min_gate="APPROVE_2PERSON")]
 JUDGEMENT = {"begruendung": "beacon confirmed by step 1", "gegenargumente": "could be a scanner",
-             "beleg_ids": [f"{RUN_ID}/1"]}
+             "unsicherheiten": "keine erkannt", "konfidenz": 0.6, "beleg_ids": [f"{RUN_ID}/1"]}
 
 
 def effect_script(tool, beleg_ids=None):
@@ -553,7 +554,8 @@ def test_ac05_effecting_tool_runs_exactly_once_on_allow_and_the_audit_names_the_
     req, = stub.requests
     assert (req.kind, req.run_id, req.step_id, req.evidence_ids) == (EXPECTED_KIND.get(tool, tool), RUN_ID,
                                                                        f"{RUN_ID}/2", (f"{RUN_ID}/1",))
-    assert req.judgement["begruendung"] == JUDGEMENT["begruendung"] and "beleg_ids" not in req.params
+    assert req.judgement["empfehlung"] == JUDGEMENT["begruendung"] and "beleg_ids" not in req.params
+    assert req.judgement["unsicherheiten"] == ["keine erkannt"] and req.judgement["konfidenz"] == 0.6
     done = [e for e in audit_events(c) if e["schritt_id"] == f"{RUN_ID}/2" and e["phase"] == "erledigt"]
     assert done and done[0]["entscheidung_id"] == "pm-stub-1"
 
