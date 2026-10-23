@@ -158,11 +158,12 @@ class _FakeRequestType:
 
 
 class _FakePolicyClient:
-    def __init__(self, decision=None, fail=False, halted=False, halt_reason=None):
+    def __init__(self, decision=None, fail=False, halted=False, halt_reason=None, known=None):
         self.decision = decision or {"gate": "ALLOW", "entscheidung_id": "e-7"}
         self.fail = fail
         self.halted = halted
         self.halt_reason = halt_reason
+        self.known = known                  # None = the wire has no "bekannt" (packages before 0.5.1)
         self.calls = []
 
     def _maybe_fail(self):
@@ -186,7 +187,10 @@ class _FakePolicyClient:
     def halt_status(self):
         self._maybe_fail()
         reason = self.halt_reason if self.halt_reason is not None else ("drill" if self.halted else "")
-        return _Wire({"angehalten": self.halted, "grund": reason})
+        wire = {"angehalten": self.halted, "grund": reason}
+        if self.known is not None:
+            wire["bekannt"] = self.known
+        return _Wire(wire)
 
 
 def test_adapter_bridges_through_the_wire_format():
@@ -276,6 +280,36 @@ def test_adapter_health_fails_when_the_halt_state_cannot_be_determined(reason, m
 def test_adapter_health_names_the_missing_halt_file_and_how_to_create_it():
     gate = PolicyClientAdapter(_FakePolicyClient(halted=True, halt_reason="halt file missing"), _FakeRequestType, "embedded")
     assert gate.health() == (False, 'policy embedded: halt file missing (create halt.json {"angehalten": false} in policy_state_dir)')
+
+
+@pytest.mark.parametrize("wire, expected", [
+    ({"angehalten": False, "grund": "eingerichtet", "bekannt": True}, HaltState(False, "eingerichtet", True)),
+    ({"angehalten": True, "grund": "drill", "bekannt": True}, HaltState(True, "drill", True)),
+    ({"angehalten": True, "grund": "Dienst nicht erreichbar", "bekannt": False}, HaltState(True, "Dienst nicht erreichbar", False)),
+    ({"angehalten": False, "bekannt": False}, HaltState(True, "unknown halt state", False)),     # bekannt false forces halted
+    ({"angehalten": False, "bekannt": "yes"}, HaltState(True, "unknown halt state", False)),     # anything but true
+    ({"angehalten": False, "grund": ""}, HaltState(False, "", None)),                            # pre-0.5.1 wire
+    ({"angehalten": True, "grund": "halt file missing"}, HaltState(True, "halt file missing", None)),
+    ({"grund": "x"}, HaltState(True, "x", False)),                                               # angehalten missing
+    ({"angehalten": "no"}, HaltState(True, "unknown halt state", False)),
+    ("junk", HaltState(True, "unknown halt state", False)),
+])
+def test_halt_state_takes_bekannt_from_the_wire(wire, expected):
+    """API.md §5 (Policy Manager 0.5.1): bekannt=false means undetermined and therefore halted; missing = reported as known."""
+    assert HaltState.from_wire(wire) == expected
+
+
+@pytest.mark.parametrize("reason", ["Dienst nicht erreichbar", "HTTP 503", "", "drill"])
+def test_adapter_health_fails_on_bekannt_false_whatever_the_text(reason):
+    gate = PolicyClientAdapter(_FakePolicyClient(halted=True, halt_reason=reason, known=False), _FakeRequestType, "service")
+    assert gate.health() == (False, f"policy service: {reason or 'unknown halt state'}")
+
+
+def test_adapter_health_trusts_bekannt_true_over_the_text_fallback():
+    gate = PolicyClientAdapter(_FakePolicyClient(halted=True, halt_reason="halt file missing", known=True), _FakeRequestType, "embedded")
+    assert gate.health() == (True, "policy embedded healthy, HALTED (halt file missing)")
+    gate = PolicyClientAdapter(_FakePolicyClient(halted=False, halt_reason="eingerichtet", known=True), _FakeRequestType, "embedded")
+    assert gate.health() == (True, "policy embedded healthy, not halted")
 
 
 def test_adapter_health_keeps_a_deliberate_halt_healthy():

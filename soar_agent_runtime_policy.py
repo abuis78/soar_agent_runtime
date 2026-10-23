@@ -287,16 +287,30 @@ class ConsumeState:
 
 @dataclass(frozen=True)
 class HaltState:
-    """Emergency stop (PM-F30/F31). Unknown state means halted."""
+    """Emergency stop (PM-F30/F31). Unknown state means halted.
+
+    ``known`` mirrors the wire field ``bekannt`` (API.md §5, Policy Manager
+    0.5.1): False = the state could not be determined (service unreachable,
+    halt file missing/unreadable), None = the counterpart did not report it
+    (older packages), True = a determined state.
+    """
     halted: bool
     reason: str = ""
+    known: Optional[bool] = None
 
     @classmethod
     def from_wire(cls, data: Any) -> "HaltState":
-        if not isinstance(data, dict) or data.get("angehalten") is not False:
-            reason = str(data.get("grund") or "") if isinstance(data, dict) else ""
-            return cls(halted=True, reason=reason or "unknown halt state")
-        return cls(halted=False, reason=str(data.get("grund") or ""))
+        if not isinstance(data, dict):
+            return cls(halted=True, reason="unknown halt state", known=False)
+        reason = str(data.get("grund") or "")
+        if "bekannt" in data and data.get("bekannt") is not True:
+            return cls(halted=True, reason=reason or "unknown halt state", known=False)
+        known = True if "bekannt" in data else None
+        if data.get("angehalten") is False:
+            return cls(halted=False, reason=reason, known=known)
+        if data.get("angehalten") is True:
+            return cls(halted=True, reason=reason, known=known)
+        return cls(halted=True, reason=reason or "unknown halt state", known=False)   # angehalten missing/invalid
 
 
 # -- Gate interface -------------------------------------------------------------
@@ -335,7 +349,7 @@ class NoPolicyClient:
         return ConsumeState(ok=False, code=self.code)
 
     def halt_status(self) -> HaltState:
-        return HaltState(halted=True, reason=self.reason)
+        return HaltState(halted=True, reason=self.reason, known=False)
 
     def health(self) -> tuple[bool, str]:
         return False, self.reason
@@ -385,7 +399,7 @@ class PolicyClientAdapter:
         try:
             return HaltState.from_wire(self._client.halt_status().to_wire())
         except Exception as exc:
-            return HaltState(halted=True, reason=f"policy client failed: {type(exc).__name__}")
+            return HaltState(halted=True, reason=f"policy client failed: {type(exc).__name__}", known=False)
 
     def actions(self, agent_id: str) -> list[CatalogBlock]:
         """Blocks released for the agent (RT-W09). A package without actions()
@@ -398,12 +412,12 @@ class PolicyClientAdapter:
         except Exception:
             return []
 
-    # Halt reasons that mean "the state could not be determined", not "halted on
-    # purpose": ours (halt_status above, HaltState.from_wire) and the texts of
-    # policy_client 0.5.0 (service.py halt_status, embedded.py halt_status,
-    # halt.py HaltFile.status). The package reports an undetermined state as
-    # halted (fail-safe), health() reports it as unhealthy so the operator sees
-    # the cause instead of "HALTED".
+    # The contract for "state could not be determined" is the wire field
+    # ``bekannt`` (API.md §5, Policy Manager 0.5.1). Packages without it (the
+    # bundled 0.1.0, 0.5.0) only say so in ``grund``; these texts (service.py,
+    # embedded.py, halt.py of 0.5.0) are the fallback until 4.1b bundles 0.5.1,
+    # then the list goes. An undetermined state is halted (fail-safe) and
+    # unhealthy, so the operator sees the cause instead of "HALTED".
     HALT_UNDETERMINED = ("policy client failed", "unknown halt state", "halt state unknown",
                          "halt check failed", "halt file missing", "halt file unreadable",
                          "unsafe permissions on halt file")
@@ -413,7 +427,8 @@ class PolicyClientAdapter:
         if problem:
             return False, f"policy {self.mode}: {problem}"
         halt = self.halt_status()
-        if halt.halted and halt.reason.startswith(self.HALT_UNDETERMINED):
+        undetermined = halt.known is False or (halt.known is None and halt.reason.startswith(self.HALT_UNDETERMINED))
+        if halt.halted and undetermined:
             hint = ' (create halt.json {"angehalten": false} in policy_state_dir)' if halt.reason.startswith(
                 "halt file missing") else ""
             return False, f"policy {self.mode}: {halt.reason}{hint}"
