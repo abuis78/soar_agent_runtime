@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import tomllib
 from dataclasses import dataclass, field
 from typing import Any, Optional, Protocol
 
@@ -286,16 +287,30 @@ class ConsumeState:
 
 @dataclass(frozen=True)
 class HaltState:
-    """Emergency stop (PM-F30/F31). Unknown state means halted."""
+    """Emergency stop (PM-F30/F31). Unknown state means halted.
+
+    ``known`` mirrors the wire field ``bekannt`` (API.md §5, Policy Manager
+    0.5.1): False = the state could not be determined (service unreachable,
+    halt file missing/unreadable), None = the counterpart did not report it
+    (older packages), True = a determined state.
+    """
     halted: bool
     reason: str = ""
+    known: Optional[bool] = None
 
     @classmethod
     def from_wire(cls, data: Any) -> "HaltState":
-        if not isinstance(data, dict) or data.get("angehalten") is not False:
-            reason = str(data.get("grund") or "") if isinstance(data, dict) else ""
-            return cls(halted=True, reason=reason or "unknown halt state")
-        return cls(halted=False, reason=str(data.get("grund") or ""))
+        if not isinstance(data, dict):
+            return cls(halted=True, reason="unknown halt state", known=False)
+        reason = str(data.get("grund") or "")
+        if "bekannt" in data and data.get("bekannt") is not True:
+            return cls(halted=True, reason=reason or "unknown halt state", known=False)
+        known = True if "bekannt" in data else None
+        if data.get("angehalten") is False:
+            return cls(halted=False, reason=reason, known=known)
+        if data.get("angehalten") is True:
+            return cls(halted=True, reason=reason, known=known)
+        return cls(halted=True, reason=reason or "unknown halt state", known=False)   # angehalten missing/invalid
 
 
 # -- Gate interface -------------------------------------------------------------
@@ -334,7 +349,7 @@ class NoPolicyClient:
         return ConsumeState(ok=False, code=self.code)
 
     def halt_status(self) -> HaltState:
-        return HaltState(halted=True, reason=self.reason)
+        return HaltState(halted=True, reason=self.reason, known=False)
 
     def health(self) -> tuple[bool, str]:
         return False, self.reason
@@ -384,7 +399,7 @@ class PolicyClientAdapter:
         try:
             return HaltState.from_wire(self._client.halt_status().to_wire())
         except Exception as exc:
-            return HaltState(halted=True, reason=f"policy client failed: {type(exc).__name__}")
+            return HaltState(halted=True, reason=f"policy client failed: {type(exc).__name__}", known=False)
 
     def actions(self, agent_id: str) -> list[CatalogBlock]:
         """Blocks released for the agent (RT-W09). A package without actions()
@@ -397,30 +412,46 @@ class PolicyClientAdapter:
         except Exception:
             return []
 
+    # The contract for "state could not be determined" is the wire field
+    # ``bekannt`` (API.md §5, Policy Manager 0.5.1). Packages without it (the
+    # bundled 0.1.0, 0.5.0) only say so in ``grund``; these texts (service.py,
+    # embedded.py, halt.py of 0.5.0) are the fallback until 4.1b bundles 0.5.1,
+    # then the list goes. An undetermined state is halted (fail-safe) and
+    # unhealthy, so the operator sees the cause instead of "HALTED".
+    HALT_UNDETERMINED = ("policy client failed", "unknown halt state", "halt state unknown",
+                         "halt check failed", "halt file missing", "halt file unreadable",
+                         "unsafe permissions on halt file")
+
     def health(self) -> tuple[bool, str]:
         problem = self._policy_file_problem()
         if problem:
             return False, f"policy {self.mode}: {problem}"
         halt = self.halt_status()
-        if halt.reason.startswith("policy client failed") or halt.reason == "unknown halt state":
-            return False, f"policy {self.mode}: {halt.reason}"
+        undetermined = halt.known is False or (halt.known is None and halt.reason.startswith(self.HALT_UNDETERMINED))
+        if halt.halted and undetermined:
+            hint = ' (create halt.json {"angehalten": false} in policy_state_dir)' if halt.reason.startswith(
+                "halt file missing") else ""
+            return False, f"policy {self.mode}: {halt.reason}{hint}"
         state = f"HALTED ({halt.reason})" if halt.halted else "not halted"
         return True, f"policy {self.mode} healthy, {state}"
 
     def _policy_file_problem(self) -> str:
-        """A policy file that is missing or not a JSON object makes the package deny every
-        action via its default gate; say so in health() instead of per action."""
+        """A policy file that is missing or not a JSON/TOML object makes the package deny
+        every action via its default gate; say so in health() instead of per action.
+        TOML (E4) is recognised by the .toml extension, anything else is read as JSON."""
         if not self.policy_path:
             return ""
+        is_toml = self.policy_path.lower().endswith(".toml")
+        fmt = "TOML" if is_toml else "JSON"
         try:
-            with open(self.policy_path, encoding="utf-8") as fh:
-                data = json.load(fh)
+            with open(self.policy_path, "rb") as fh:
+                data = tomllib.load(fh) if is_toml else json.load(fh)
         except OSError as exc:
             return f"policy file not readable ({type(exc).__name__}): {self.policy_path}"
-        except ValueError:
-            return f"policy file is not valid JSON: {self.policy_path}"
+        except (ValueError, tomllib.TOMLDecodeError):
+            return f"policy file is not valid {fmt}: {self.policy_path}"
         if not isinstance(data, dict):
-            return f"policy file is not a JSON object: {self.policy_path}"
+            return f"policy file is not a {fmt} object: {self.policy_path}"
         return ""
 
 
