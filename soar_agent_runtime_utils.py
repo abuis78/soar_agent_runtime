@@ -459,11 +459,28 @@ class ToolRegistry:
             "parameters": {
                 "schritte": "JSON list of steps [{\"baustein\": \"<block id>\", \"ziel\": [\"<target>\", ...], \"parameter\": {...}}]"
             }
+        },
+        # RT-W10: the way out when no released building block fits (E15). The
+        # gap is recorded as an artifact for an analyst and the catalogue
+        # curators; nothing is executed and no policy request is made.
+        # Available only in airgap_mode with a configured policy gate.
+        "report_gap": {
+            "description": "Record that a measure is needed for which no catalogue building block fits; an analyst acts manually, nothing is executed",
+            "wirkt": False,
+            "quelle": "builtin",
+            "parameters": {
+                "lage": "What the situation is (text)",
+                "massnahme": "Which measure is needed (text)",
+                "ziele": "JSON list of targets (hosts, users, ...), may be empty",
+                "warum_kein_baustein": "Why none of the listed building blocks fits (text)"
+            }
         }
     }
 
     BROKER_TOOL = "broker_invoke"
     CATALOG_TOOL = "catalog_invoke"
+    GAP_TOOL = "report_gap"
+    GAP_LABEL = "agent_action_gap"
     LEGACY_SPL_TOOL = "splunk_search"
     DEPRECATED_NOTE = " (deprecated: prefer broker_invoke templates)"
     # RT-W05: every effecting tool needs a justification, counter-arguments and
@@ -681,7 +698,22 @@ class ToolRegistry:
             return bool(self.broker_tools)
         if tool_name == self.CATALOG_TOOL:
             return bool(self.catalog)     # E14: released blocks are the allowlist
+        if tool_name == self.GAP_TOOL:
+            return self._gap_available()
         return tool_name in self.allowed_tools
+
+    def _gap_available(self) -> bool:
+        """RT-W10: report_gap exists only where measures go through a policy gate
+        (airgap_mode with a configured client); outside it there is no catalogue to have a gap in."""
+        return self.airgap and not isinstance(self.policy, NoPolicyClient)
+
+    def _gap_prompt_block(self) -> str:
+        if not self._gap_available():
+            return ""
+        defn = self.TOOL_DEFINITIONS[self.GAP_TOOL]
+        params = ", ".join(f"{k}: {v}" for k, v in defn["parameters"].items())
+        return (f"- {self.GAP_TOOL}({params}): {defn['description']}. "
+                "Use it when a measure is needed and no catalogue building block fits, then finish with FINAL_ANSWER")
 
     @staticmethod
     def _describe_param(name: str, spec: dict) -> str:
@@ -723,8 +755,8 @@ class ToolRegistry:
     def get_tool_descriptions(self) -> str:
         lines = []
         for name in self.allowed_tools:
-            if name in (self.BROKER_TOOL, self.CATALOG_TOOL):
-                continue  # described from the broker / action catalogue below, never statically
+            if name in (self.BROKER_TOOL, self.CATALOG_TOOL, self.GAP_TOOL):
+                continue  # described from the broker / action catalogue / gate below, never statically
             if defn := self.TOOL_DEFINITIONS.get(name):
                 parameters = dict(defn["parameters"])
                 if self.airgap and defn.get("wirkt", True):
@@ -735,6 +767,8 @@ class ToolRegistry:
         if block := self._broker_prompt_block():
             lines.append(block)
         if block := self._catalog_prompt_block():
+            lines.append(block)
+        if block := self._gap_prompt_block():
             lines.append(block)
         return "\n".join(lines)
 
@@ -1057,6 +1091,78 @@ class ToolRegistry:
             return f"ERROR: proposal not recorded ({detail}); nothing will be executed."
         return (f"ALLOWED: {len(request.steps)} step(s) recorded for the follow-up playbook "
                 f"({', '.join(s['baustein'] for s in request.steps)}); not executed by this run")
+
+    def _tool_report_gap(self, params: dict) -> str:
+        """RT-W10 / E15: record a measure that no released building block covers.
+
+        The artifact ``agent_action_gap`` is the contract for the analyst and
+        the catalogue curators; the note is reported, not fatal. No policy
+        request is made and nothing is executed.
+        """
+        params = params if isinstance(params, dict) else {}
+        text = {k: params.get(k) for k in ("lage", "massnahme", "warum_kein_baustein")}
+        missing = [k for k, v in text.items() if not isinstance(v, str) or not v.strip()]
+        targets = params.get("ziele", [])
+        if not isinstance(targets, list) or not all(isinstance(z, str) for z in targets):
+            missing.append("ziele")
+        if missing:
+            return (f"ERROR: '{self.GAP_TOOL}' needs {', '.join(repr(m) for m in missing)}: lage, massnahme and "
+                    "warum_kein_baustein as non-empty text, ziele as a JSON list of strings (may be empty). "
+                    "Nothing was recorded.")
+        measure = text["massnahme"].strip()
+        targets = [z.strip() for z in targets if z.strip()]
+        visible, hidden = sorted(self.catalog), sorted(b.id for b in self.catalog_hidden)
+        name = f"{self.GAP_TOOL}: {measure}" + (f" -> {', '.join(targets)}" if targets else "")
+        cef = {
+            "lauf_id": self.run_id,
+            "schritt_id": self.current_step_id,
+            "agent_id": self.agent_id,
+            "stufe": self.stage,
+            "domaene": self.domain,
+            "lage": text["lage"].strip(),
+            "massnahme": measure,
+            "ziele": targets,
+            "grund": text["warum_kein_baustein"].strip(),
+            "katalog_sichtbar": visible,
+            "katalog_verborgen": hidden,
+        }
+        artifact = {
+            "container_id": self.container_id,
+            "label": self.GAP_LABEL,
+            "name": name,
+            "type": self.GAP_LABEL,
+            "source_data_identifier": f"{self.run_id}:{self.current_step_id}",
+            "cef": cef,
+            "run_automation": False,
+        }
+        try:
+            status, message, _artifact_id = self.connector.save_artifact(artifact)
+        except Exception as e:
+            status, message = False, _scrub_exc(e)
+        if not status:
+            return (f"ERROR: gap not recorded ({_scrub(str(message or 'save_artifact returned APP_ERROR'))}); "
+                    "state the needed measure in FINAL_ANSWER instead.")
+        try:
+            import phantom.rules as ph_rules
+            ph_rules.add_note(
+                container=self.container_id, note_type="general",
+                title=f"Manuelle Handlungsempfehlung: {measure}",
+                content=(f"Agent `{self.agent_id}` sieht Handlungsbedarf, den kein freigegebener Baustein abdeckt "
+                         f"(Lauf `{self.run_id}`, Schritt `{self.current_step_id}`).\n\n"
+                         f"- Lage: {cef['lage']}\n"
+                         f"- Massnahme: {measure}\n"
+                         f"- Ziele: {', '.join(targets) or 'keine genannt'}\n"
+                         f"- Warum kein Baustein: {cef['grund']}\n"
+                         f"- Sichtbare Bausteine (stufe {self.stage if self.stage is not None else 'unbekannt'}): "
+                         f"{', '.join(visible) or 'keine'}\n"
+                         f"- Verborgene Bausteine: {', '.join(hidden) or 'keine'}\n\n"
+                         "Nichts wurde ausgefuehrt; ein Analyst entscheidet. Die Kuratoren des Aktionskatalogs "
+                         f"sehen die Luecke im Artefakt `{self.GAP_LABEL}`."),
+            )
+        except Exception as e:
+            self.connector.save_progress(f"[policy] gap note failed: {_scrub_exc(e)}")
+        return (f"GAP recorded (artifact {self.GAP_LABEL}, {len(visible)} visible block(s) did not fit); "
+                "an analyst acts manually. Continue with FINAL_ANSWER.")
 
     MAX_ARTIFACTS_SHOWN = 5
 

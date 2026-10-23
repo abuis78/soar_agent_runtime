@@ -19,6 +19,7 @@ from soar_agent_runtime_policy import (
     CODE_NO_POLICY_MODE,
     GATE_APPROVE_2PERSON,
     CatalogBlock,
+    NoPolicyClient,
     PolicyDecision,
     StubPolicyClient,
 )
@@ -563,3 +564,101 @@ def test_catalog_handler_outside_the_gate_is_refused(rules):
     reg = catalog_registry()
     assert reg._tool_catalog_invoke(SEQ).startswith("ERROR: 'catalog_invoke' runs only through the policy gate")
     assert reg._artifacts == []
+
+
+# --- RT-W10 / E15: report_gap ---------------------------------------------------------
+
+GAP = {"lage": "C2 beaconing from srv-1 to a fresh domain", "massnahme": "Block the C2 domain at the proxy",
+       "ziele": ["evil.example", " srv-1 "], "warum_kein_baustein": "no block covers proxy rules; isolation is too broad"}
+
+
+def test_report_gap_exists_only_in_airgap_with_a_configured_gate():
+    reg = catalog_registry(stage=2)
+    assert reg._is_allowed("report_gap") is True and ToolRegistry.has_effect("report_gap") is False
+    assert ("- report_gap(lage: What the situation is (text), massnahme: Which measure is needed (text), "
+            "ziele: JSON list of targets (hosts, users, ...), may be empty, warum_kein_baustein: Why none of the "
+            "listed building blocks fits (text)): Record that a measure is needed for which no catalogue building "
+            "block fits; an analyst acts manually, nothing is executed. Use it when a measure is needed and no "
+            "catalogue building block fits, then finish with FINAL_ANSWER") in reg.get_tool_descriptions()
+    assert registry(policy=StubPolicyClient())._is_allowed("report_gap") is True          # gate, but empty catalogue
+    for reg in (registry(airgap=False, policy=StubPolicyClient(blocks=CATALOG)),         # outside airgap (AC-15)
+                registry(policy=NoPolicyClient("policy_mode not configured")),           # airgap without a gate
+                registry(airgap=False, allowed=("add_note", "report_gap"))):             # allowlist does not help
+        assert reg._is_allowed("report_gap") is False and "report_gap" not in reg.get_tool_descriptions()
+        assert reg.execute("report_gap", GAP) == "ERROR: Tool 'report_gap' is not in the allowed tools list."
+        assert reg._artifacts == []
+
+
+@pytest.mark.parametrize("params, missing", [
+    ({}, "'lage', 'massnahme', 'warum_kein_baustein'"),
+    ({**GAP, "lage": "  "}, "'lage'"),
+    ({**GAP, "massnahme": 7}, "'massnahme'"),
+    ({**GAP, "warum_kein_baustein": None}, "'warum_kein_baustein'"),
+    ({**GAP, "ziele": "evil.example"}, "'ziele'"),
+    ({**GAP, "ziele": [1]}, "'ziele'"),
+])
+def test_report_gap_refuses_incomplete_input_without_recording(rules, params, missing):
+    reg = catalog_registry()
+    result = reg.execute("report_gap", params)
+    assert result.startswith(f"ERROR: 'report_gap' needs {missing}:") and result.endswith("Nothing was recorded.")
+    assert reg._artifacts == [] and reg._policy.requests == []
+
+
+def test_report_gap_records_artifact_and_note_without_touching_the_gate(rules):
+    rules.notes = []
+    rules.add_note = lambda **kw: rules.notes.append(kw)
+    reg = catalog_registry(stage=2, domain="endpoint")
+    result = reg.execute("report_gap", GAP)
+    assert result == ("GAP recorded (artifact agent_action_gap, 2 visible block(s) did not fit); "
+                      "an analyst acts manually. Continue with FINAL_ANSWER.")
+    assert reg._policy.requests == [] and rules.calls == []           # no decide(), nothing executed
+    [artifact] = reg._artifacts
+    assert (artifact["label"], artifact["type"], artifact["run_automation"]) == ("agent_action_gap", "agent_action_gap", False)
+    assert artifact["name"] == "report_gap: Block the C2 domain at the proxy -> evil.example, srv-1"
+    assert artifact["source_data_identifier"] == "rt-x:rt-x/2" and artifact["container_id"] == 4711
+    assert artifact["cef"] == {
+        "lauf_id": "rt-x", "schritt_id": "rt-x/2", "agent_id": "triage", "stufe": 2, "domaene": "endpoint",
+        "lage": "C2 beaconing from srv-1 to a fresh domain", "massnahme": "Block the C2 domain at the proxy",
+        "ziele": ["evil.example", "srv-1"], "grund": "no block covers proxy rules; isolation is too broad",
+        "katalog_sichtbar": ["disable_account", "isolate_endpoint"], "katalog_verborgen": ["wipe_host"]}
+    [note] = rules.notes
+    assert note["container"] == 4711 and note["title"] == "Manuelle Handlungsempfehlung: Block the C2 domain at the proxy"
+    for line in ("Agent `triage` sieht Handlungsbedarf", "(Lauf `rt-x`, Schritt `rt-x/2`)",
+                 "- Lage: C2 beaconing from srv-1 to a fresh domain", "- Ziele: evil.example, srv-1",
+                 "- Warum kein Baustein: no block covers proxy rules; isolation is too broad",
+                 "- Sichtbare Bausteine (stufe 2): disable_account, isolate_endpoint", "- Verborgene Bausteine: wipe_host",
+                 "Nichts wurde ausgefuehrt; ein Analyst entscheidet.", "Artefakt `agent_action_gap`"):
+        assert line in note["content"], line
+
+
+def test_report_gap_without_targets_or_catalogue_is_still_recorded(rules):
+    rules.notes = []
+    rules.add_note = lambda **kw: rules.notes.append(kw)
+    reg = registry(policy=StubPolicyClient(), stage=None)       # gate configured, catalogue empty, stufe unknown
+    result = reg.execute("report_gap", {**GAP, "ziele": []})
+    assert result.startswith("GAP recorded (artifact agent_action_gap, 0 visible block(s) did not fit)")
+    [artifact] = reg._artifacts
+    assert artifact["name"] == "report_gap: Block the C2 domain at the proxy"
+    assert artifact["cef"]["ziele"] == [] and artifact["cef"]["stufe"] is None and artifact["cef"]["katalog_sichtbar"] == []
+    assert "- Ziele: keine genannt" in rules.notes[0]["content"] and "(stufe unbekannt): keine" in rules.notes[0]["content"]
+
+
+def test_report_gap_failed_artifact_is_an_error(rules):
+    reg = catalog_registry(artifact_ok=False)
+    result = reg.execute("report_gap", GAP)
+    assert result == ("ERROR: gap not recorded (database read-only); state the needed measure in FINAL_ANSWER instead.")
+
+    def boom(artifact):
+        raise RuntimeError("socket closed")
+    reg = catalog_registry()
+    reg.connector.save_artifact = boom
+    assert reg.execute("report_gap", GAP).startswith("ERROR: gap not recorded (RuntimeError: socket closed)")
+
+
+def test_report_gap_note_failure_is_reported_not_fatal(rules):
+    def failing_note(**kw):
+        raise RuntimeError("notes disabled")
+    rules.add_note = failing_note
+    reg = catalog_registry()
+    assert reg.execute("report_gap", GAP).startswith("GAP recorded")
+    assert len(reg._artifacts) == 1 and any("gap note failed: RuntimeError: notes disabled" in m for m in reg._progress)
