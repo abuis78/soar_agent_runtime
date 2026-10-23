@@ -59,6 +59,21 @@ None.
 | `agent_list_name` | Custom List for agents | `agent_definitions` |
 | `skill_list_name` | Custom List for skills | `agent_skills` |
 
+Policy Manager (effecting actions in `airgap_mode`, RT-W01/RT-W03; the air-gap and Tool Broker fields are documented with sub-change 5.5):
+
+| Field | Description | Default |
+|---|---|---|
+| `policy_mode` | `embedded` (the bundled `policy_client` runs in-process) or `service` (Policy Manager service over mTLS). Empty = every effecting action is denied in `airgap_mode` | — |
+| `policy_path` | Path on the SOAR host to the policy file (JSON/TOML from Git); `embedded` only | — |
+| `policy_state_dir` | Writable directory for the embedded state: `approvals.json`, `halt.json`, `audit.jsonl`; `embedded` only | — |
+| `policy_service_url` | Base URL of the Policy Manager service, `https://` only; `service` only | — |
+| `policy_timeout_s` | Timeout per service call; on timeout the action is denied, there is no fallback to `embedded` (RT-W04) | `5` |
+| `policy_client_cert` | Path to the client certificate (PEM); its CN is the runtime's identity at the Policy Manager | — |
+| `policy_client_key` | Path to the private key (PEM); the key never leaves the host | — |
+| `policy_ca` | Path to the CA bundle (PEM) that signed the service certificate | — |
+
+The bundled wheel `wheels/py3/policy_manager-0.1.0-py3-none-any.whl` is Policy Manager P1: `embedded` works, `service` and the action catalogue need a wheel from P3/P4 or later and report `UNAVAILABLE` until then (the wheel refresh is sub-changes 4.1b/4.2b).
+
 ---
 
 ## 5. Test Connectivity
@@ -85,6 +100,8 @@ Runs a named agent via the ReAct loop.
 | `container_id` | numeric | Yes | SOAR Container ID |
 | `max_steps` | numeric | No | Override max steps (0 = use default) |
 | `extra_context` | string | No | Additional JSON context |
+| `stufe` | numeric | No | Escalation stage 0-4 of the triggering playbook, sent with every policy request and used to filter the action catalogue (RT-W08, E12); empty = unknown = 0 |
+| `domaene` | string | No | Domain of this run (e.g. `soc`, `it`, `ot`), sent with every policy request (RT-W08) |
 
 Output paths:
 | Path | Description |
@@ -95,6 +112,32 @@ Output paths:
 | `action_result.data.*.provider` | LLM provider |
 | `action_result.data.*.model` | Model name |
 | `action_result.data.*.step_log` | Full JSON step trace |
+
+### Action catalogue and gap report (`airgap_mode`)
+
+In `airgap_mode` every effecting tool call (`update_severity`, `catalog_invoke`) must carry a complete judgement
+before the Policy Manager is asked: `begruendung` (text), `gegenargumente` and `unsicherheiten` (text or list of
+strings, `"keine erkannt"` when there is nothing to say), `konfidenz` (0..1) and `beleg_ids` (ids that originated in
+this run). Incomplete calls are refused locally and never reach the Policy Manager (RT-W05, AC-08).
+
+**`catalog_invoke(schritte=[{baustein, ziel, parameter}, ...])`** proposes one or more building blocks from the
+Policy Manager's action catalogue (`GET /v1/aktionen`, RT-W09). The tool appears as soon as the catalogue lists
+blocks for the agent; the blocks are the allowlist, nothing is configured per agent (E14). Blocks whose
+`mindeststufe` is above the run's `stufe` are shown as unavailable and refused locally (E12). A sequence of several
+steps is decided as **one** request (`aktion.art = "folge"`, AC-09). Whatever the decision, the runtime never
+executes a building block itself:
+
+| Decision | What the run records | Who executes |
+|---|---|---|
+| `ALLOW` | artifact `agent_action_proposal` with `gate = ALLOW`, no `freigabe_id`, plus note "Freigegeben (ALLOW): ..." | the follow-up playbook, without `consume` (E13) |
+| `APPROVE_*` | artifact `agent_action_proposal` with `freigabe_id`, plus note "Freigabe ausstehend: ..." | the follow-up playbook after `consume(freigabe_id)` (RT-W07) |
+| `DENY` | nothing; the observation names the code and the step (`BLOCK_NOT_ALLOWED`, `INVALID_SEQUENCE`, ...) | nobody |
+
+**`report_gap(lage, massnahme, ziele, warum_kein_baustein)`** is the way out when a measure is needed and no
+released block fits (RT-W10). It exists only in `airgap_mode` with a configured `policy_mode`, has no effect and
+makes no policy request: it writes the artifact `agent_action_gap` (CEF `lauf_id`, `schritt_id`, `agent_id`,
+`stufe`, `domaene`, `lage`, `massnahme`, `ziele`, `grund`, `katalog_sichtbar`, `katalog_verborgen`) and the note
+"Manuelle Handlungsempfehlung: ..." for an analyst; the catalogue curators read the artifacts (E15).
 
 ---
 
@@ -504,3 +547,4 @@ phenv python3 soar_agent_runtime_connector.py /tmp/test_run_agent.json
 | 1.2.0 | 2026-03-22 | Skills system (Option B): `SkillStore`, `create skill`, `list skills` actions; 7 SOC use case prompts in README |
 | 1.3.0 | 2026-03-22 | Python 3.13 update: `match` statements, `X\|Y` type hints, walrus operator, list unpacking patterns; min_phantom_version 6.3.0 |
 | 1.7.1 | 2026-10-22 | Policy Manager `embedded`: bundled `policy_manager` 0.1.0 wheel (`wheels/py3/`), so `policy_mode = embedded` decides effecting actions in `airgap_mode` (RT-W01, RT-W03) |
+| 1.8.0 | 2026-10-23 | Phase 4: `policy_mode = service` over mTLS via the package's `ServicePolicyClient`, no fallback (RT-W01, RT-W04; asset fields `policy_service_url`, `policy_timeout_s`, `policy_client_cert`, `policy_client_key`, `policy_ca`); action catalogue with `catalog_invoke` (one decision per sequence, stage filter, proposal artifact also for `ALLOW`; RT-W09, AC-09, E12-E14); `report_gap` with artifact `agent_action_gap` (RT-W10, E15); judgement sent as `urteil = {empfehlung, gegenargumente[], unsicherheiten[], konfidenz}` and `unsicherheiten`/`konfidenz` mandatory for effecting calls (Policy Manager API.md §3, W14). Service mode and catalogue need a Policy Manager P3/P4 wheel (4.1b/4.2b) |
