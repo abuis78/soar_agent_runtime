@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import tomllib
 from dataclasses import dataclass, field
 from typing import Any, Optional, Protocol
 
@@ -397,30 +398,45 @@ class PolicyClientAdapter:
         except Exception:
             return []
 
+    # Halt reasons that mean "the state could not be determined", not "halted on
+    # purpose": ours (halt_status above, HaltState.from_wire) and the texts of
+    # policy_client 0.5.0 (service.py halt_status, embedded.py halt_status,
+    # halt.py HaltFile.status). The package reports an undetermined state as
+    # halted (fail-safe), health() reports it as unhealthy so the operator sees
+    # the cause instead of "HALTED".
+    HALT_UNDETERMINED = ("policy client failed", "unknown halt state", "halt state unknown",
+                         "halt check failed", "halt file missing", "halt file unreadable",
+                         "unsafe permissions on halt file")
+
     def health(self) -> tuple[bool, str]:
         problem = self._policy_file_problem()
         if problem:
             return False, f"policy {self.mode}: {problem}"
         halt = self.halt_status()
-        if halt.reason.startswith("policy client failed") or halt.reason == "unknown halt state":
-            return False, f"policy {self.mode}: {halt.reason}"
+        if halt.halted and halt.reason.startswith(self.HALT_UNDETERMINED):
+            hint = ' (create halt.json {"angehalten": false} in policy_state_dir)' if halt.reason.startswith(
+                "halt file missing") else ""
+            return False, f"policy {self.mode}: {halt.reason}{hint}"
         state = f"HALTED ({halt.reason})" if halt.halted else "not halted"
         return True, f"policy {self.mode} healthy, {state}"
 
     def _policy_file_problem(self) -> str:
-        """A policy file that is missing or not a JSON object makes the package deny every
-        action via its default gate; say so in health() instead of per action."""
+        """A policy file that is missing or not a JSON/TOML object makes the package deny
+        every action via its default gate; say so in health() instead of per action.
+        TOML (E4) is recognised by the .toml extension, anything else is read as JSON."""
         if not self.policy_path:
             return ""
+        is_toml = self.policy_path.lower().endswith(".toml")
+        fmt = "TOML" if is_toml else "JSON"
         try:
-            with open(self.policy_path, encoding="utf-8") as fh:
-                data = json.load(fh)
+            with open(self.policy_path, "rb") as fh:
+                data = tomllib.load(fh) if is_toml else json.load(fh)
         except OSError as exc:
             return f"policy file not readable ({type(exc).__name__}): {self.policy_path}"
-        except ValueError:
-            return f"policy file is not valid JSON: {self.policy_path}"
+        except (ValueError, tomllib.TOMLDecodeError):
+            return f"policy file is not valid {fmt}: {self.policy_path}"
         if not isinstance(data, dict):
-            return f"policy file is not a JSON object: {self.policy_path}"
+            return f"policy file is not a {fmt} object: {self.policy_path}"
         return ""
 
 

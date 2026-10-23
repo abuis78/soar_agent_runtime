@@ -158,10 +158,11 @@ class _FakeRequestType:
 
 
 class _FakePolicyClient:
-    def __init__(self, decision=None, fail=False, halted=False):
+    def __init__(self, decision=None, fail=False, halted=False, halt_reason=None):
         self.decision = decision or {"gate": "ALLOW", "entscheidung_id": "e-7"}
         self.fail = fail
         self.halted = halted
+        self.halt_reason = halt_reason
         self.calls = []
 
     def _maybe_fail(self):
@@ -184,7 +185,8 @@ class _FakePolicyClient:
 
     def halt_status(self):
         self._maybe_fail()
-        return _Wire({"angehalten": self.halted, "grund": "drill" if self.halted else ""})
+        reason = self.halt_reason if self.halt_reason is not None else ("drill" if self.halted else "")
+        return _Wire({"angehalten": self.halted, "grund": reason})
 
 
 def test_adapter_bridges_through_the_wire_format():
@@ -237,6 +239,48 @@ def test_adapter_health_accepts_a_json_object_policy_file(tmp_path):
     path.write_text('{"default_gate": "DENY", "categories": {}}')
     gate = PolicyClientAdapter(_FakePolicyClient(), _FakeRequestType, "embedded", policy_path=str(path))
     assert gate.health() == (True, "policy embedded healthy, not halted")
+
+
+def test_adapter_health_accepts_a_toml_policy_file(tmp_path):
+    """E4: the policy may come from Git as TOML; the engine reads it, so must health()."""
+    path = tmp_path / "policy.TOML"
+    path.write_text('version = 1\ndefault_gate = "APPROVE_2PERSON"\n\n[categories]\n"Isolation" = "APPROVE_2PERSON"\n')
+    gate = PolicyClientAdapter(_FakePolicyClient(), _FakeRequestType, "embedded", policy_path=str(path))
+    assert gate.health() == (True, "policy embedded healthy, not halted")
+
+
+@pytest.mark.parametrize("content,problem", [
+    ('default_gate = \n', "policy file is not valid TOML"),
+    ('{"default_gate": "DENY"}', "policy file is not valid TOML"),       # JSON in a .toml file
+])
+def test_adapter_health_reports_an_unusable_toml_policy_file(tmp_path, content, problem):
+    path = tmp_path / "policy.toml"
+    path.write_text(content)
+    gate = PolicyClientAdapter(_FakePolicyClient(), _FakeRequestType, "embedded", policy_path=str(path))
+    assert gate.health() == (False, f"policy embedded: {problem}: {path}")
+
+
+@pytest.mark.parametrize("reason, mode", [
+    ("halt state unknown (TLS setup failed (SSLError))", "service"),   # policy_client 0.5.0 service.py
+    ("halt state unknown (HTTP 503)", "service"),
+    ("halt check failed (OSError)", "embedded"),                      # embedded.py
+    ("halt file unreadable", "embedded"),                             # halt.py
+    ("unsafe permissions on halt file", "embedded"),
+    ("unknown halt state", "embedded"),                               # our HaltState.from_wire
+])
+def test_adapter_health_fails_when_the_halt_state_cannot_be_determined(reason, mode):
+    gate = PolicyClientAdapter(_FakePolicyClient(halted=True, halt_reason=reason), _FakeRequestType, mode)
+    assert gate.health() == (False, f"policy {mode}: {reason}")
+
+
+def test_adapter_health_names_the_missing_halt_file_and_how_to_create_it():
+    gate = PolicyClientAdapter(_FakePolicyClient(halted=True, halt_reason="halt file missing"), _FakeRequestType, "embedded")
+    assert gate.health() == (False, 'policy embedded: halt file missing (create halt.json {"angehalten": false} in policy_state_dir)')
+
+
+def test_adapter_health_keeps_a_deliberate_halt_healthy():
+    gate = PolicyClientAdapter(_FakePolicyClient(halted=True, halt_reason="Uebung, Freigabe durch SOC-Leitung"), _FakeRequestType, "service")
+    assert gate.health() == (True, "policy service healthy, HALTED (Uebung, Freigabe durch SOC-Leitung)")
 
 
 def test_adapter_treats_malformed_package_answer_as_deny():
