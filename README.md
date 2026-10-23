@@ -72,7 +72,20 @@ Policy Manager (effecting actions in `airgap_mode`, RT-W01/RT-W03; the air-gap a
 | `policy_client_key` | Path to the private key (PEM); the key never leaves the host | — |
 | `policy_ca` | Path to the CA bundle (PEM) that signed the service certificate | — |
 
-The bundled wheel `wheels/py3/policy_manager-0.5.1-py3-none-any.whl` is Policy Manager 0.5.1, built from the PolicyManager tag `rp/p5-3` (commit `fbea672`, ahead of the PolicyManager pull requests): `embedded`, `service` and the action catalogue work with it. Two things the operator must provide: `halt.json` with `{"angehalten": false}` in `policy_state_dir` (a missing file counts as halted), and `update_severity = "fall_aenderung"` under `[tool_action_kinds]` in the policy, otherwise every severity change falls to `default_gate`.
+The bundled wheel `wheels/py3/policy_manager-0.5.1-py3-none-any.whl` is Policy Manager 0.5.1, built from the PolicyManager tag `rp/p5-3` (commit `fbea672`, ahead of the PolicyManager pull requests by decision of 2026-10-23): `embedded`, `service` and the action catalogue work with it. Refresh it with `scripts/build_wheel.sh --copy-to wheels/py3` from the PolicyManager repo, then `python3 tools/update_wheels.py`.
+
+
+### Operator checklist: Policy Manager
+
+Every item below was learned against the real engine (0.5.1); missing any of them means denied actions, not errors.
+
+1. **Halt file.** `policy_state_dir` must contain `halt.json` with `{"angehalten": false, "grund": ""}`, owned by the app user, mode `0600`. A missing, unreadable or world-writable file counts as halted; `test connectivity` then reports `halt file missing (create halt.json ...)`.
+2. **Valid policy.** The engine validates the whole file on every decision; one error (for example a building block without `loud`, or an `undo` that names an unknown block) means `POLICY_INVALID` and every action is denied. Validate changes with the PolicyManager repo's `policy-check` before copying the file to the host.
+3. **Tool name mapped.** The runtime sends `aktion.art = "update_severity"`. The policy needs `update_severity = "fall_aenderung"` under `[tool_action_kinds]` (PolicyManager example policy since 0.5.1); otherwise every severity change falls to `default_gate`.
+4. **Stage and domain from the playbook.** Pass `stufe` (0-4) and `domaene` (for example `cyber`) to `run agent`. Without `stufe` the engine uses `default_gate`, without `domaene` at least `APPROVE_1CLICK` (RT-W08).
+5. **Released building blocks.** A block is offered to an agent only when its `agents` list names the `agent_id`; `mindeststufe` above the run's `stufe` hides it. The runtime never executes a block; the follow-up playbook does (artifact `agent_action_proposal`).
+6. **Service mode.** `policy_service_url` is `https://`, certificate, key and CA are files readable by the app user, the certificate's CN has the role `decide` at the service, `policy_timeout_s` fits the network. `test connectivity` must say `policy service healthy, not halted`; anything else denies every effecting action (no fallback, RT-W04).
+7. **Sequence register.** `sequences.json` in `policy_state_dir` is written by the Policy Manager's register workflow; without it every multi-step sequence counts as new (at least `APPROVE_1CLICK`).
 
 ---
 
@@ -549,3 +562,4 @@ phenv python3 soar_agent_runtime_connector.py /tmp/test_run_agent.json
 | 1.7.1 | 2026-10-22 | Policy Manager `embedded`: bundled `policy_manager` 0.1.0 wheel (`wheels/py3/`), so `policy_mode = embedded` decides effecting actions in `airgap_mode` (RT-W01, RT-W03) |
 | 1.8.0 | 2026-10-23 | Phase 4: `policy_mode = service` over mTLS via the package's `ServicePolicyClient`, no fallback (RT-W01, RT-W04; asset fields `policy_service_url`, `policy_timeout_s`, `policy_client_cert`, `policy_client_key`, `policy_ca`); action catalogue with `catalog_invoke` (one decision per sequence, stage filter, proposal artifact also for `ALLOW`; RT-W09, AC-09, E12-E14); `report_gap` with artifact `agent_action_gap` (RT-W10, E15); judgement sent as `urteil = {empfehlung, gegenargumente[], unsicherheiten[], konfidenz}` and `unsicherheiten`/`konfidenz` mandatory for effecting calls (Policy Manager API.md §3, W14). Service mode and catalogue need a Policy Manager P3/P4 wheel (4.1b/4.2b) |
 | 1.8.1 | 2026-10-23 | Fix: Policy Manager `health()` reads TOML policies (before: every `.toml` policy was reported as "not valid JSON" and `test connectivity` failed); an undeterminable halt state (service unreachable, halt file missing/unreadable) is reported as unhealthy with its cause and a hint to create `halt.json`, a deliberate halt stays healthy + HALTED. Found in the 4.1b spike against `policy_manager` 0.5.0 |
+| 1.9.0 | 2026-10-23 | Bundled `policy_manager` 0.5.1 (built from PolicyManager tag `rp/p5-3`, commit `fbea672`; E16: tag instead of PolicyManager `main`): `policy_mode = service`, action catalogue, halt field `bekannt` and the sequence register work with the shipped package; `sequences_path` passed to the embedded client; `health()` decides "undetermined" from `bekannt` only; wheel integration tests follow the 0.5.x engine (tool-name mapping, `stufe`/`domaene`, judgement W14, catalogue, sequences, audit); README operator checklist for the Policy Manager (4.1b) |
