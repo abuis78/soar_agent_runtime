@@ -415,7 +415,7 @@ def test_app_json_declares_broker_fields_in_order():
     with open("soar_agent_runtime.json") as f:
         app = json.load(f)
     cfg = app["configuration"]
-    assert app["app_version"] == "1.8.1"
+    assert app["app_version"] == "1.9.0"
     assert [cfg[k]["order"] for k in ("broker_url", "broker_timeout_s", "broker_client_cert", "broker_client_key", "broker_ca")] == [23, 24, 25, 26, 27]
     assert cfg["broker_client_key"]["data_type"] == "string"  # a path, never the key material
     assert len({f["order"] for f in cfg.values()}) == len(cfg)  # orders unique
@@ -808,6 +808,7 @@ def test_airgap_embedded_derives_state_files_from_state_dir(monkeypatch):
                     "approvals_path": "/opt/phantom/local/data/policy/approvals.json",
                     "halt_path": "/opt/phantom/local/data/policy/halt.json",
                     "audit_path": "/opt/phantom/local/data/policy/audit.jsonl",
+                    "sequences_path": "/opt/phantom/local/data/policy/sequences.json",
                     "service_url": "", "service_timeout_s": 5.0, "client_cert": "", "client_key": "", "ca": ""}
 
 
