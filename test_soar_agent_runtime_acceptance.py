@@ -9,6 +9,8 @@ AC-10 FINAL_ANSWER without mandatory fields is rejected after one correction rou
 AC-11 invalid PARAMS JSON never calls a tool
 AC-12 every step is audited with lauf_id/schritt_id; no effect when audit is not writable
 AC-15 without airgap_mode the app behaves as before
+Phase 3 adds AC-05..AC-08 (policy gate), Phase 4 adds AC-09 (catalogue sequence),
+RT-W10 (gap report), RT-W04 (service mode without fallback) and E12 (stage filter).
 """
 
 from __future__ import annotations
@@ -102,8 +104,8 @@ def define_agent(platform, agent_id="triage", **cfg):
                                     "max_steps": 6} | cfg
 
 
-def run(c, agent_id="triage", container_id=11):
-    status = c._handle_run_agent({"agent_id": agent_id, "task": "triage this case", "container_id": container_id})
+def run(c, agent_id="triage", container_id=11, **param):
+    status = c._handle_run_agent({"agent_id": agent_id, "task": "triage this case", "container_id": container_id, **param})
     return status, c.action_results[-1]
 
 
@@ -653,3 +655,292 @@ def test_ac08_invented_beleg_id_is_refused_before_the_policy_manager_is_asked(pl
     obs = step_log(result)[1]["observation"]
     assert obs.startswith("ERROR: beleg_id ") and "did not originate in this run" in obs
     assert "no policy request was made (RT-W05)" in obs and f"Valid evidence: {RUN_ID}/1." in obs
+
+
+# ============================================================================
+# Phase 4 (service mode, action catalogue, gap report): AC-09, RT-W10, RT-W04, E12
+# ============================================================================
+
+SERVICE_ASSET = {"policy_mode": "service", "policy_service_url": "https://pm.internal:8443",
+                 "policy_client_cert": "/etc/pm/rt.crt", "policy_client_key": "/etc/pm/rt.key",
+                 "policy_ca": "/etc/pm/ca.pem"}
+# /v1/aktionen entries as the Policy Manager sends them (API.md), parsed by the adapter.
+AKTIONEN = [
+    {"id": "isolate_endpoint", "version": 2, "zweck": "Isolate an endpoint", "kategorie": "Isolation",
+     "zieltypen": ["device"], "parameter": {"dauer_h": "hours"}, "mindeststufe": 1, "umkehrbar": False,
+     "ruecknahme": "unisolate_endpoint", "mindest_gate": "APPROVE_2PERSON"},
+    {"id": "disable_account", "version": 1, "zweck": "Disable an account", "kategorie": "Identity",
+     "zieltypen": ["user"], "parameter": {}, "mindeststufe": 0, "umkehrbar": True, "mindest_gate": "APPROVE_1CLICK"},
+    {"id": "wipe_host", "version": 1, "zweck": "Wipe a host", "kategorie": "Destruction", "zieltypen": ["device"],
+     "parameter": {}, "mindeststufe": 4, "umkehrbar": False, "mindest_gate": "APPROVE_2PERSON"},
+]
+PHASE4_CATALOG = [CatalogBlock.from_wire(a) for a in AKTIONEN]
+SEQUENCE = [{"baustein": "isolate_endpoint", "ziel": ["srv-1"], "parameter": {"dauer_h": 4}},
+            {"baustein": "disable_account", "ziel": ["u-7"]}]
+WIRE_SEQUENCE = [{"baustein": "isolate_endpoint", "ziel": ["srv-1"], "parameter": {"dauer_h": 4}},
+                 {"baustein": "disable_account", "ziel": ["u-7"], "parameter": {}}]
+GAP = {"lage": "C2 beaconing to a fresh domain", "massnahme": "Block the C2 domain at the proxy",
+       "ziele": ["evil.example"], "warum_kein_baustein": "no block covers proxy rules; isolation is too broad"}
+
+
+def script(action, params):
+    return ["THOUGHT: look at the case\nACTION: get_container_info",
+            f"THOUGHT: act\nACTION: {action}\nPARAMS: {json.dumps(params)}",
+            f"FINAL_ANSWER: {VALID_VERDICT}"]
+
+
+def gaps(c):
+    return [a for a in c.artifacts if a["label"] == "agent_action_gap"]
+
+
+def agent_notes(platform):
+    """Notes written by tools during the run (the loop's own final-answer note is left out)."""
+    return [n for n in platform["notes"] if not n["title"].startswith("[Agent:")]
+
+
+def catalogue_agent(platform):
+    # E14: the released blocks are the allowlist; catalog_invoke and report_gap are never listed.
+    define_agent(platform, provider="local", allowed_tools=["get_container_info"])
+
+
+# --- AC-09: a sequence is ONE decision ---------------------------------------
+
+def test_ac09_sequence_is_one_decision_and_allow_records_it_for_the_playbook(platform, llm, monkeypatch):
+    catalogue_agent(platform)
+    llm["responses"] = script("catalog_invoke", {"schritte": SEQUENCE} | JUDGEMENT)
+    stub = StubPolicyClient(blocks=PHASE4_CATALOG)
+    c = policy_connector(monkeypatch, stub)
+    status, result = run(c, stufe=2)
+    assert status is True, result.message
+    prompt = llm["system_prompts"][0]
+    assert "Catalogue building blocks (stufe 2):" in prompt and "- isolate_endpoint v2:" in prompt
+    assert "Not available at this stufe: wipe_host (stufe>=4)" in prompt and "- report_gap(lage:" in prompt
+    req, = stub.requests                                               # asked exactly once for both steps
+    assert req.kind == "folge" and req.targets == ("srv-1", "u-7") and req.evidence_ids == (f"{RUN_ID}/1",)
+    aktion = req.to_wire()["aktion"]
+    assert (aktion["art"], aktion["ziel"], aktion["parameter"], aktion["schritte"]) == ("folge", ["srv-1", "u-7"], {}, WIRE_SEQUENCE)
+    assert req.to_wire()["kontext"]["stufe"] == 2 and req.judgement["empfehlung"] == JUDGEMENT["begruendung"]
+    assert platform["severity"] == [] and stub.consumed == []          # E13: nothing executed, nothing consumed
+    proposal, = proposals(c)
+    cef = proposal["cef"]
+    assert (cef["gate"], cef["freigabe_id"], cef["entscheidung_id"], cef["aktion"]) == ("ALLOW", "", "pm-stub-1", "catalog_invoke")
+    assert json.loads(cef["schritte"]) == WIRE_SEQUENCE and cef["ziel"] == ["srv-1", "u-7"]
+    assert cef["lauf_id"] == RUN_ID and cef["schritt_id"] == f"{RUN_ID}/2" and cef["beleg_ids"] == [f"{RUN_ID}/1"]
+    assert proposal["source_data_identifier"] == f"pm-stub-1:{RUN_ID}/2" and proposal["run_automation"] is False
+    assert [n["title"] for n in agent_notes(platform)] == ["Freigegeben (ALLOW): folge: isolate_endpoint, disable_account -> srv-1, u-7"]
+    assert "kein consume noetig" in agent_notes(platform)[0]["content"]
+    obs = step_log(result)[1]["observation"]
+    assert obs == ("ALLOWED: 2 step(s) recorded for the follow-up playbook (isolate_endpoint, disable_account); "
+                   "not executed by this run (entscheidung_id=pm-stub-1)")
+    done = [e for e in audit_events(c) if e["schritt_id"] == f"{RUN_ID}/2" and e["phase"] == "erledigt"]
+    assert done and done[0]["entscheidung_id"] == "pm-stub-1"
+    assert llm["calls"] == 3 and result.summary["steps_taken"] == 3    # the run went on to its verdict
+
+
+def test_ac09_denied_sequence_leaves_no_trace_and_the_run_continues(platform, llm, monkeypatch):
+    catalogue_agent(platform)
+    llm["responses"] = script("catalog_invoke", {"schritte": SEQUENCE} | JUDGEMENT)
+    deny = PolicyDecision(gate=GATE_DENY, decision_id="pm-9", code="BLOCK_NOT_ALLOWED", reasons=(
+        {"regel": "katalog", "grund": "disable_account not released for agent_id=triage", "schritt": 1},))
+    stub = StubPolicyClient(deny, blocks=PHASE4_CATALOG)
+    c = policy_connector(monkeypatch, stub)
+    status, result = run(c, stufe=2)
+    assert status is True, result.message
+    assert len(stub.requests) == 1 and proposals(c) == [] and agent_notes(platform) == [] and platform["severity"] == []
+    assert step_log(result)[1]["observation"] == (
+        "POLICY DENIED code=BLOCK_NOT_ALLOWED (disable_account not released for agent_id=triage (schritt 1)); "
+        "'catalog_invoke' was not executed.")
+    assert result.summary["steps_taken"] == 3
+
+
+def test_ac09_approval_gate_holds_the_sequence_with_freigabe_id(platform, llm, monkeypatch):
+    catalogue_agent(platform)
+    llm["responses"] = script("catalog_invoke", {"schritte": SEQUENCE} | JUDGEMENT)
+    stub = StubPolicyClient(PolicyDecision(gate=GATE_APPROVE_2PERSON, decision_id="pm-7", approval_id="fg-7",
+                                           approvals_needed=2), blocks=PHASE4_CATALOG)
+    c = policy_connector(monkeypatch, stub)
+    status, result = run(c, stufe=2)
+    assert status is True, result.message
+    proposal, = proposals(c)
+    assert proposal["cef"]["freigabe_id"] == "fg-7" and json.loads(proposal["cef"]["schritte"]) == WIRE_SEQUENCE
+    assert proposal["source_data_identifier"] == f"fg-7:{RUN_ID}/2" and stub.consumed == []
+    assert [n["title"] for n in agent_notes(platform)] == ["Freigabe ausstehend: folge: isolate_endpoint, disable_account -> srv-1, u-7"]
+    assert step_log(result)[1]["observation"].startswith("HELD: 'catalog_invoke' requires APPROVE_2PERSON (2 approval(s))")
+
+
+# --- E12: stage filter, no target-type filter --------------------------------
+
+def test_e12_block_above_the_runs_stufe_is_refused_before_the_policy_manager(platform, llm, monkeypatch):
+    catalogue_agent(platform)
+    llm["responses"] = script("catalog_invoke", {"schritte": [{"baustein": "wipe_host", "ziel": ["srv-1"]}]} | JUDGEMENT)
+    stub = StubPolicyClient(blocks=PHASE4_CATALOG)
+    c = policy_connector(monkeypatch, stub)
+    status, result = run(c, stufe=2)
+    assert status is True, result.message
+    assert stub.requests == [] and proposals(c) == []
+    obs = step_log(result)[1]["observation"]
+    assert obs.startswith("ERROR: step 0: baustein 'wipe_host' needs stufe>=4") and "no policy request" in obs
+    assert "Available blocks: disable_account, isolate_endpoint" in obs
+
+
+def test_e12_unknown_stufe_counts_as_zero(platform, llm, monkeypatch):
+    catalogue_agent(platform)
+    llm["responses"] = script("catalog_invoke", {"schritte": [SEQUENCE[0]]} | JUDGEMENT)
+    stub = StubPolicyClient(blocks=PHASE4_CATALOG)
+    c = policy_connector(monkeypatch, stub)
+    status, result = run(c)                                            # no stufe from the playbook
+    assert status is True, result.message
+    prompt = llm["system_prompts"][0]
+    assert "Catalogue building blocks (stufe unknown=0):" in prompt and "- disable_account v1:" in prompt
+    assert "Not available at this stufe: isolate_endpoint (stufe>=1), wipe_host (stufe>=4)" in prompt
+    assert "- isolate_endpoint v2:" not in prompt
+    assert stub.requests == [] and step_log(result)[1]["observation"].startswith(
+        "ERROR: step 0: baustein 'isolate_endpoint' needs stufe>=1")
+
+
+# --- RT-W10: gap report ------------------------------------------------------
+
+def test_rtw10_report_gap_records_artifact_and_note_without_a_policy_request(platform, llm, monkeypatch):
+    catalogue_agent(platform)
+    llm["responses"] = script("report_gap", GAP)
+    stub = StubPolicyClient(blocks=PHASE4_CATALOG)
+    c = policy_connector(monkeypatch, stub)
+    status, result = run(c, stufe=2, domaene="endpoint")
+    assert status is True, result.message
+    assert stub.requests == [] and proposals(c) == [] and platform["severity"] == []
+    gap, = gaps(c)
+    assert gap["container_id"] == 11 and gap["run_automation"] is False
+    assert gap["name"] == "report_gap: Block the C2 domain at the proxy -> evil.example"
+    assert gap["source_data_identifier"] == f"{RUN_ID}:{RUN_ID}/2"
+    assert gap["cef"] == {
+        "lauf_id": RUN_ID, "schritt_id": f"{RUN_ID}/2", "agent_id": "triage", "stufe": 2, "domaene": "endpoint",
+        "lage": GAP["lage"], "massnahme": GAP["massnahme"], "ziele": ["evil.example"], "grund": GAP["warum_kein_baustein"],
+        "katalog_sichtbar": ["disable_account", "isolate_endpoint"], "katalog_verborgen": ["wipe_host"]}
+    note, = agent_notes(platform)
+    assert note["title"] == "Manuelle Handlungsempfehlung: Block the C2 domain at the proxy"
+    assert "Nichts wurde ausgefuehrt; ein Analyst entscheidet." in note["content"]
+    assert step_log(result)[1]["observation"] == ("GAP recorded (artifact agent_action_gap, 2 visible block(s) did not fit); "
+                                                  "an analyst acts manually. Continue with FINAL_ANSWER.")
+    assert result.summary["steps_taken"] == 3
+
+
+def test_rtw10_report_gap_exists_only_with_a_policy_gate(platform, llm, monkeypatch):
+    define_agent(platform, provider="local", allowed_tools=["get_container_info", "report_gap"])
+    llm["responses"] = script("report_gap", GAP)
+    c = policy_connector(monkeypatch)                                  # airgap, but no policy_mode (RT-W03)
+    status, result = run(c)
+    assert status is True, result.message
+    assert "report_gap" not in llm["system_prompts"][0] and gaps(c) == [] and agent_notes(platform) == []
+    assert step_log(result)[1]["observation"] == "ERROR: Tool 'report_gap' is not in the allowed tools list."
+
+
+def test_ac15_report_gap_does_not_exist_outside_airgap(platform, llm):
+    define_agent(platform, provider="local", allowed_tools=["get_container_info", "report_gap"])
+    llm["responses"] = script("report_gap", GAP)
+    c = make_connector()
+    status, result = run(c)
+    assert status is True, result.message
+    assert "report_gap" not in llm["system_prompts"][0] and gaps(c) == [] and agent_notes(platform) == []
+    assert step_log(result)[1]["observation"] == "ERROR: Tool 'report_gap' is not in the allowed tools list."
+
+
+# --- RT-W04: service mode, no fallback -----------------------------------------
+
+def _install_service_package(monkeypatch, decide=None, aktionen=()):
+    """A policy_manager wheel with policy_client.service (P3+) whose client answers from a script,
+    and an embedded client that must never be built (no fallback, RT-W04)."""
+    class Wire:
+        def __init__(self, data):
+            self.data = data
+
+        def to_wire(self):
+            return self.data
+
+    class FakeServiceClient:
+        instances: list = []
+
+        def __init__(self, url, cert, key, ca, timeout_s=5.0):
+            self.args = (url, cert, key, ca, timeout_s)
+            self.requests, self.actions_asked = [], []
+            FakeServiceClient.instances.append(self)
+
+        def halt_status(self):
+            return Wire({"angehalten": False, "grund": ""})
+
+        def decide(self, request):
+            self.requests.append(request)
+            if isinstance(decide, BaseException):
+                raise decide
+            return Wire(decide)
+
+        def actions(self, agent_id):
+            self.actions_asked.append(agent_id)
+            return list(aktionen)
+
+    class NoEmbedded:
+        def __init__(self, *a, **kw):
+            raise AssertionError("service mode must never fall back to the embedded client")
+
+    base = types.ModuleType("policy_client.base")
+    base.DecisionRequest = types.SimpleNamespace(from_wire=lambda data: data)
+    svc = types.ModuleType("policy_client.service")
+    svc.ServicePolicyClient = FakeServiceClient
+    emb = types.ModuleType("policy_client.embedded")
+    emb.EmbeddedPolicyClient = NoEmbedded
+    for name, mod in (("policy_client", types.ModuleType("policy_client")), ("policy_client.base", base),
+                      ("policy_client.service", svc), ("policy_client.embedded", emb)):
+        monkeypatch.setitem(sys.modules, name, mod)
+    return FakeServiceClient
+
+
+def test_rtw04_unreachable_policy_service_denies_without_falling_back(platform, llm, monkeypatch):
+    svc = _install_service_package(monkeypatch, decide=TimeoutError("timed out after 2.0s"))
+    define_agent(platform, provider="local")
+    llm["responses"] = effect_script("update_severity")
+    c = policy_connector(monkeypatch, **SERVICE_ASSET, policy_timeout_s=2)   # asset config decides, no injected stub
+    status, result = run(c)
+    assert status is True, result.message
+    assert platform["severity"] == [] and proposals(c) == []
+    client, = svc.instances
+    assert client.args == ("https://pm.internal:8443", "/etc/pm/rt.crt", "/etc/pm/rt.key", "/etc/pm/ca.pem", 2.0)
+    assert len(client.requests) == 1 and client.requests[0]["kontext"]["principal_type"] == "agent"
+    obs = step_log(result)[1]["observation"]
+    assert obs.startswith("POLICY DENIED code=UNAVAILABLE (") and "TimeoutError" in obs
+    assert "'update_severity' was not executed" in obs
+    assert any(m.startswith("[policy] mode=service (ready)") for m in c.progress)
+
+
+def test_rtw04_service_without_certificates_denies_every_effecting_action(platform, llm, monkeypatch):
+    svc = _install_service_package(monkeypatch, decide={"gate": "ALLOW", "entscheidung_id": "pm-s1"})
+    define_agent(platform, provider="local")
+    llm["responses"] = effect_script("update_severity")
+    c = policy_connector(monkeypatch, policy_mode="service", policy_service_url="https://pm.internal:8443")
+    status, result = run(c)
+    assert status is True, result.message
+    assert platform["severity"] == [] and svc.instances == []          # the client was never built
+    obs = step_log(result)[1]["observation"]
+    assert obs.startswith("POLICY DENIED code=NO_POLICY_MODE (policy_mode 'service' needs policy_client_cert, "
+                          "policy_client_key, policy_ca")
+    assert any(m.startswith("[policy] mode=none (not available - effecting actions denied)") for m in c.progress)
+
+
+def test_rtw04_service_decisions_and_catalogue_come_from_the_package_client(platform, llm, monkeypatch):
+    svc = _install_service_package(monkeypatch, decide={"gate": "ALLOW", "entscheidung_id": "pm-s1", "policy_version": "v5"},
+                                   aktionen=AKTIONEN)
+    catalogue_agent(platform)
+    llm["responses"] = script("catalog_invoke", {"schritte": [SEQUENCE[1]]} | JUDGEMENT)
+    c = policy_connector(monkeypatch, **SERVICE_ASSET)
+    status, result = run(c, stufe=1)
+    assert status is True, result.message
+    prompt = llm["system_prompts"][0]
+    assert "Catalogue building blocks (stufe 1):" in prompt and "- isolate_endpoint v2:" in prompt
+    assert "- disable_account v1:" in prompt and "Not available at this stufe: wipe_host (stufe>=4)" in prompt
+    client, = svc.instances
+    assert client.actions_asked == ["triage"] and len(client.requests) == 1
+    aktion = client.requests[0]["aktion"]
+    assert (aktion["art"], aktion["ziel"], aktion["schritte"]) == (
+        "folge", ["u-7"], [{"baustein": "disable_account", "ziel": ["u-7"], "parameter": {}}])
+    proposal, = proposals(c)
+    assert proposal["cef"]["gate"] == "ALLOW" and proposal["cef"]["entscheidung_id"] == "pm-s1"
+    assert proposal["cef"]["policy_version"] == "v5" and platform["severity"] == []
+    assert step_log(result)[1]["observation"].endswith("(entscheidung_id=pm-s1)")

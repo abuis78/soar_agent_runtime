@@ -687,8 +687,8 @@ def test_airgap_service_passes_the_fields_to_the_factory(monkeypatch):
     assert seen["policy_path"] == "" and seen["approvals_path"] == ""   # embedded paths stay empty
 
 
-def _install_fake_service_package(monkeypatch, halted=False):
-    """policy_client with a service module whose client answers from memory (P3-style wheel)."""
+def _install_fake_service_package(monkeypatch, halted=False, aktionen=()):
+    """policy_client with a service module whose client answers from memory (P3/P4-style wheel)."""
     class Wire:
         def __init__(self, data):
             self.data = data
@@ -702,6 +702,12 @@ def _install_fake_service_package(monkeypatch, halted=False):
 
         def halt_status(self):
             return Wire({"angehalten": halted, "grund": "drill" if halted else ""})
+
+        def decide(self, request):
+            return Wire({"gate": "ALLOW", "entscheidung_id": "pm-svc"})
+
+        def actions(self, agent_id):
+            return list(aktionen)
 
     base = types.ModuleType("policy_client.base")
     base.DecisionRequest = types.SimpleNamespace(from_wire=lambda data: data)
@@ -749,6 +755,26 @@ def test_connectivity_airgap_service_with_p1_wheel_reports_unavailable(monkeypat
     c._broker_transport = _health_transport()
     assert c._handle_test_connectivity({}) is False
     assert '"policy": "ERROR: policy_client.service not in the bundled policy_manager wheel' in c.action_results[-1].message
+
+
+AKTIONEN = [{"id": "disable_account", "version": 1, "zweck": "Disable", "kategorie": "Identity", "mindeststufe": 0},
+            {"id": "wipe_host", "version": 1, "zweck": "Wipe", "kategorie": "Destruction", "mindeststufe": 4}]
+
+
+@pytest.mark.parametrize("param, expected", [
+    ({"stufe": 1}, "[policy] catalogue: 1 block(s) available at stufe 1, 1 hidden (higher stufe)."),
+    ({}, "[policy] catalogue: 1 block(s) available at stufe 0, 1 hidden (higher stufe)."),
+    ({"stufe": 4}, "[policy] catalogue: 2 block(s) available at stufe 4, 0 hidden (higher stufe)."),
+])
+def test_run_agent_service_mode_loads_the_catalogue_through_the_package_client(monkeypatch, param, expected):
+    """RT-W09 / E12 over run_agent: GET /v1/aktionen via the package client, filtered by the run's stufe."""
+    _install_fake_service_package(monkeypatch, aktionen=AKTIONEN)
+    _capture_loop(monkeypatch)
+    c = make_connector(airgap_mode=True, **BROKER_ASSET, **SERVICE_ASSET)   # no injected stub
+    c._broker_transport = _transport(body=TOOLS_BODY)
+    assert c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 7, **param}) is True
+    assert any(m.startswith("[policy] mode=service (ready)") for m in c.progress)
+    assert expected in c.progress
 
 
 def test_airgap_without_policy_mode_warns():
