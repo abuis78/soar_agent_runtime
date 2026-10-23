@@ -87,7 +87,8 @@ def gate_for(state):
     return build_policy_client("embedded", policy_path=state["policy_path"],
                                approvals_path=str(state["dir"] / "approvals.json"),
                                halt_path=str(state["dir"] / "halt.json"),
-                               audit_path=str(state["dir"] / "audit.jsonl"))
+                               audit_path=str(state["dir"] / "audit.jsonl"),
+                               sequences_path=str(state["dir"] / "sequences.json"))
 
 
 def test_factory_builds_the_real_embedded_gate(state):
@@ -198,7 +199,12 @@ def test_sequence_is_decided_as_one_request_with_the_catalogue_gate(state):
                   steps=(sequence_step("isolate_endpoint", ["ws-0815"], {"dauer_h": 2}),))
     d = gate.decide(seq)
     assert d.needs_approval and d.gate == GATE_APPROVE_2PERSON and d.approval_id
-    assert "isolate_endpoint v2 (schritt 0)" in d.reason_text()
+    assert "isolate_endpoint v2 (schritt 0)" in d.reason_text() and "single step" in d.reason_text()
+    two = request(kind=ACTION_SEQUENCE, params={}, targets=("ws-0815",),
+                  steps=(sequence_step("isolate_endpoint", ["ws-0815"], {"dauer_h": 2}),
+                         sequence_step("unisolate_endpoint", ["ws-0815"])))
+    d = gate.decide(two)
+    assert d.needs_approval and "sequence not in register" in d.reason_text()   # register (sequences_path) consulted, P4
     unknown = request(kind=ACTION_SEQUENCE, params={}, targets=("x",), steps=(sequence_step("nmap_scan", ["x"]),))
     d = gate.decide(unknown)
     assert d.denied and d.code == "BLOCK_NOT_ALLOWED"

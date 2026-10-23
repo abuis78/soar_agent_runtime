@@ -808,6 +808,7 @@ def test_airgap_embedded_derives_state_files_from_state_dir(monkeypatch):
                     "approvals_path": "/opt/phantom/local/data/policy/approvals.json",
                     "halt_path": "/opt/phantom/local/data/policy/halt.json",
                     "audit_path": "/opt/phantom/local/data/policy/audit.jsonl",
+                    "sequences_path": "/opt/phantom/local/data/policy/sequences.json",
                     "service_url": "", "service_timeout_s": 5.0, "client_cert": "", "client_key": "", "ca": ""}
 
 

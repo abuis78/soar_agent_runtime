@@ -412,23 +412,17 @@ class PolicyClientAdapter:
         except Exception:
             return []
 
-    # The contract for "state could not be determined" is the wire field
-    # ``bekannt`` (API.md §5, Policy Manager 0.5.1). Packages without it (the
-    # bundled 0.1.0, 0.5.0) only say so in ``grund``; these texts (service.py,
-    # embedded.py, halt.py of 0.5.0) are the fallback until 4.1b bundles 0.5.1,
-    # then the list goes. An undetermined state is halted (fail-safe) and
-    # unhealthy, so the operator sees the cause instead of "HALTED".
-    HALT_UNDETERMINED = ("policy client failed", "unknown halt state", "halt state unknown",
-                         "halt check failed", "halt file missing", "halt file unreadable",
-                         "unsafe permissions on halt file")
-
     def health(self) -> tuple[bool, str]:
+        """Healthy = policy file usable and the halt state determined. The contract for
+        "could not be determined" is the wire field ``bekannt`` (API.md §5, Policy
+        Manager 0.5.1, bundled since 4.1b); the package reports that state as halted
+        (fail-safe), health() reports it as unhealthy with the cause. A counterpart
+        without the field counts as determined."""
         problem = self._policy_file_problem()
         if problem:
             return False, f"policy {self.mode}: {problem}"
         halt = self.halt_status()
-        undetermined = halt.known is False or (halt.known is None and halt.reason.startswith(self.HALT_UNDETERMINED))
-        if halt.halted and undetermined:
+        if halt.halted and halt.known is False:
             hint = ' (create halt.json {"angehalten": false} in policy_state_dir)' if halt.reason.startswith(
                 "halt file missing") else ""
             return False, f"policy {self.mode}: {halt.reason}{hint}"
@@ -508,7 +502,7 @@ SERVICE_TIMEOUT_DEFAULT_S = 5.0
 
 
 def build_policy_client(mode: str, *, policy_path: str = "", approvals_path: str = "",
-                        halt_path: str = "", audit_path: str = "",
+                        halt_path: str = "", audit_path: str = "", sequences_path: str = "",
                         audit_client: str = AUDIT_CLIENT, service_url: str = "",
                         service_timeout_s: float | None = None, client_cert: str = "",
                         client_key: str = "", ca: str = "") -> PolicyGate:
@@ -540,11 +534,13 @@ def build_policy_client(mode: str, *, policy_path: str = "", approvals_path: str
                               "every effecting action is denied", CODE_UNAVAILABLE)
     kwargs: dict[str, Any] = {"policy_path": policy_path.strip(), "approvals_path": approvals_path.strip(),
                               "halt_path": halt_path.strip()}
-    # The audit file arrives with Policy Manager P3; pass it only to a client that takes it,
-    # so the same app works with the P1 wheel (no audit kwargs) and later ones.
+    # The audit file arrived with Policy Manager P3, the sequence register with P4;
+    # pass each only to a client that takes it, so the app works with any wheel.
     if _accepts(EmbeddedPolicyClient, "audit_path"):
         kwargs["audit_path"] = (audit_path or "").strip() or None
         kwargs["audit_client"] = audit_client
+    if _accepts(EmbeddedPolicyClient, "sequences_path"):
+        kwargs["sequences_path"] = (sequences_path or "").strip() or None   # None: every sequence counts as new
     try:
         client = EmbeddedPolicyClient(**kwargs)
     except Exception as exc:

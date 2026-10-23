@@ -350,6 +350,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
             approvals_path=f"{state}/approvals.json" if state else "",
             halt_path=f"{state}/halt.json" if state else "",
             audit_path=f"{state}/audit.jsonl" if state else "",
+            sequences_path=f"{state}/sequences.json" if state else "",
             service_url=self._policy_service_url,
             service_timeout_s=self._policy_timeout_s,
             client_cert=self._policy_client_cert,

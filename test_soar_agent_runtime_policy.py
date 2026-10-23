@@ -265,20 +265,26 @@ def test_adapter_health_reports_an_unusable_toml_policy_file(tmp_path, content, 
 
 
 @pytest.mark.parametrize("reason, mode", [
-    ("halt state unknown (TLS setup failed (SSLError))", "service"),   # policy_client 0.5.0 service.py
+    ("halt state unknown (TLS setup failed (SSLError))", "service"),   # policy_client service.py texts
     ("halt state unknown (HTTP 503)", "service"),
     ("halt check failed (OSError)", "embedded"),                      # embedded.py
     ("halt file unreadable", "embedded"),                             # halt.py
     ("unsafe permissions on halt file", "embedded"),
-    ("unknown halt state", "embedded"),                               # our HaltState.from_wire
 ])
-def test_adapter_health_fails_when_the_halt_state_cannot_be_determined(reason, mode):
-    gate = PolicyClientAdapter(_FakePolicyClient(halted=True, halt_reason=reason), _FakeRequestType, mode)
+def test_adapter_health_fails_on_bekannt_false_with_the_package_texts(reason, mode):
+    gate = PolicyClientAdapter(_FakePolicyClient(halted=True, halt_reason=reason, known=False), _FakeRequestType, mode)
     assert gate.health() == (False, f"policy {mode}: {reason}")
 
 
+@pytest.mark.parametrize("reason", ["halt state unknown (HTTP 503)", "halt file missing", "drill"])
+def test_adapter_health_without_the_bekannt_field_trusts_the_counterpart(reason):
+    """A counterpart older than 0.5.1 sends no bekannt: its halt is taken as a determined halt (no text heuristics)."""
+    gate = PolicyClientAdapter(_FakePolicyClient(halted=True, halt_reason=reason), _FakeRequestType, "embedded")
+    assert gate.health() == (True, f"policy embedded healthy, HALTED ({reason})")
+
+
 def test_adapter_health_names_the_missing_halt_file_and_how_to_create_it():
-    gate = PolicyClientAdapter(_FakePolicyClient(halted=True, halt_reason="halt file missing"), _FakeRequestType, "embedded")
+    gate = PolicyClientAdapter(_FakePolicyClient(halted=True, halt_reason="halt file missing", known=False), _FakeRequestType, "embedded")
     assert gate.health() == (False, 'policy embedded: halt file missing (create halt.json {"angehalten": false} in policy_state_dir)')
 
 
@@ -305,7 +311,7 @@ def test_adapter_health_fails_on_bekannt_false_whatever_the_text(reason):
     assert gate.health() == (False, f"policy service: {reason or 'unknown halt state'}")
 
 
-def test_adapter_health_trusts_bekannt_true_over_the_text_fallback():
+def test_adapter_health_trusts_bekannt_true_whatever_the_text():
     gate = PolicyClientAdapter(_FakePolicyClient(halted=True, halt_reason="halt file missing", known=True), _FakeRequestType, "embedded")
     assert gate.health() == (True, "policy embedded healthy, HALTED (halt file missing)")
     gate = PolicyClientAdapter(_FakePolicyClient(halted=False, halt_reason="eingerichtet", known=True), _FakeRequestType, "embedded")
@@ -368,13 +374,32 @@ def test_factory_passes_audit_kwargs_to_a_package_that_takes_them(monkeypatch):
 
     _install_fake_package(monkeypatch, FakeEmbeddedP3)
     gate = build_policy_client("embedded", policy_path="/etc/pm/policy.json", approvals_path="/var/pm/approvals.json",
-                               halt_path="/var/pm/halt.json", audit_path="/var/pm/audit.jsonl")
+                               halt_path="/var/pm/halt.json", audit_path="/var/pm/audit.jsonl",
+                               sequences_path="/var/pm/sequences.json")           # P3 takes no sequences_path: dropped
     assert isinstance(gate, PolicyClientAdapter)
     assert built == {"policy_path": "/etc/pm/policy.json", "approvals_path": "/var/pm/approvals.json",
                      "halt_path": "/var/pm/halt.json", "audit_path": "/var/pm/audit.jsonl",
                      "audit_client": "soar_agent_runtime"}
     assert build_policy_client("embedded", policy_path="/p", approvals_path="/a", halt_path="/h").decide(REQ).allowed
     assert built["audit_path"] is None   # empty audit_path is passed as None
+
+
+def test_factory_passes_sequences_path_to_a_package_that_takes_it(monkeypatch):
+    """Policy Manager P4+: the sequence register; without it every sequence counts as new (PM-F10/F11)."""
+    built = {}
+
+    class FakeEmbeddedP4(_FakePolicyClient):
+        def __init__(self, policy_path, approvals_path, halt_path, ttl=600.0, audit_path=None, audit_client="",
+                     sequences_path=None):
+            super().__init__()
+            built.update(audit_path=audit_path, sequences_path=sequences_path)
+
+    _install_fake_package(monkeypatch, FakeEmbeddedP4)
+    build_policy_client("embedded", policy_path="/p", approvals_path="/a", halt_path="/h",
+                        audit_path="/var/pm/audit.jsonl", sequences_path=" /var/pm/sequences.json ")
+    assert built == {"audit_path": "/var/pm/audit.jsonl", "sequences_path": "/var/pm/sequences.json"}
+    build_policy_client("embedded", policy_path="/p", approvals_path="/a", halt_path="/h")
+    assert built == {"audit_path": None, "sequences_path": None}
 
 
 def test_factory_without_embedded_client_in_package_is_unavailable(monkeypatch):
