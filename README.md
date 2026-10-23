@@ -72,7 +72,7 @@ Policy Manager (effecting actions in `airgap_mode`, RT-W01/RT-W03; the air-gap a
 | `policy_client_key` | Path to the private key (PEM); the key never leaves the host | — |
 | `policy_ca` | Path to the CA bundle (PEM) that signed the service certificate | — |
 
-The bundled wheel `wheels/py3/policy_manager-0.1.0-py3-none-any.whl` is Policy Manager P1: `embedded` works, `service` and the action catalogue need a wheel from P3/P4 or later and report `UNAVAILABLE` until then (the wheel refresh is sub-changes 4.1b/4.2b).
+The bundled wheel `wheels/py3/policy_manager-0.5.1-py3-none-any.whl` is Policy Manager 0.5.1, built from the PolicyManager tag `rp/p5-3` (commit `fbea672`, ahead of the PolicyManager pull requests): `embedded`, `service` and the action catalogue work with it. Two things the operator must provide: `halt.json` with `{"angehalten": false}` in `policy_state_dir` (a missing file counts as halted), and `update_severity = "fall_aenderung"` under `[tool_action_kinds]` in the policy, otherwise every severity change falls to `default_gate`.
 
 ---
 

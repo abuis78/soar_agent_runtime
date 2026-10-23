@@ -187,7 +187,7 @@
             },
             {
                 "module": "policy-manager",
-                "input_file": "wheels/py3/policy_manager-0.1.0-py3-none-any.whl"
+                "input_file": "wheels/py3/policy_manager-0.5.1-py3-none-any.whl"
             }
         ]
     },
