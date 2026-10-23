@@ -66,6 +66,12 @@ class SoarAgentRuntimeConnector(BaseConnector):
         self._policy_mode = ""
         self._policy_path = ""
         self._policy_state_dir = ""
+        # RT-W01/W04 (4.1): service mode over mTLS, file paths like the broker
+        self._policy_service_url = ""
+        self._policy_timeout_s = 5.0
+        self._policy_client_cert = ""
+        self._policy_client_key = ""
+        self._policy_ca = ""
         self._policy_client = None     # tests inject a PolicyGate; None = build from the asset
 
     def initialize(self):
@@ -90,6 +96,11 @@ class SoarAgentRuntimeConnector(BaseConnector):
         self._policy_mode = (self._config.get("policy_mode") or "").strip().lower()
         self._policy_path = (self._config.get("policy_path") or "").strip()
         self._policy_state_dir = (self._config.get("policy_state_dir") or "").strip().rstrip("/")
+        self._policy_service_url = (self._config.get("policy_service_url") or "").strip()
+        self._policy_timeout_s = self._cfg_number("policy_timeout_s", 5.0, float)
+        self._policy_client_cert = (self._config.get("policy_client_cert") or "").strip()
+        self._policy_client_key = (self._config.get("policy_client_key") or "").strip()
+        self._policy_ca = (self._config.get("policy_ca") or "").strip()
         if self._airgap_mode:
             self.save_progress("[airgap] enabled - only provider 'local' is allowed.")
             if not self._broker_url:
@@ -339,6 +350,11 @@ class SoarAgentRuntimeConnector(BaseConnector):
             approvals_path=f"{state}/approvals.json" if state else "",
             halt_path=f"{state}/halt.json" if state else "",
             audit_path=f"{state}/audit.jsonl" if state else "",
+            service_url=self._policy_service_url,
+            service_timeout_s=self._policy_timeout_s,
+            client_cert=self._policy_client_cert,
+            client_key=self._policy_client_key,
+            ca=self._policy_ca,
         )
 
     def _test_broker(self, results: dict) -> bool:
@@ -474,6 +490,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
             domain=domain,
         )
         tools.load_broker_tools()  # RT-L03: templates once per run
+        tools.load_catalog()       # RT-W09: building blocks once per run (empty outside airgap)
         if tools.halted:
             # RT-B01 / RT-L05: halt state known before the first step -> do not start.
             return action_result.set_status(

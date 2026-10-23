@@ -55,7 +55,7 @@ def registry(broker=None, allowed=("add_note",), **kw):
 
 def test_every_tool_declares_quelle_and_broker_invoke_is_a_read_tool():
     for name, defn in ToolRegistry.TOOL_DEFINITIONS.items():
-        assert defn["quelle"] in ("builtin", "broker"), name
+        assert defn["quelle"] in ("builtin", "broker", "katalog"), name
     b = ToolRegistry.TOOL_DEFINITIONS["broker_invoke"]
     assert b["quelle"] == "broker" and b["wirkt"] is False
     assert ToolRegistry.has_effect("broker_invoke") is False

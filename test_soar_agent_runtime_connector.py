@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sys
+import types
 
 import pytest
 
@@ -414,7 +415,7 @@ def test_app_json_declares_broker_fields_in_order():
     with open("soar_agent_runtime.json") as f:
         app = json.load(f)
     cfg = app["configuration"]
-    assert app["app_version"] == "1.7.1"
+    assert app["app_version"] == "1.8.0"
     assert [cfg[k]["order"] for k in ("broker_url", "broker_timeout_s", "broker_client_cert", "broker_client_key", "broker_ca")] == [23, 24, 25, 26, 27]
     assert cfg["broker_client_key"]["data_type"] == "string"  # a path, never the key material
     assert len({f["order"] for f in cfg.values()}) == len(cfg)  # orders unique
@@ -647,6 +648,135 @@ def test_policy_fields_are_read_and_normalised():
     assert make_connector()._policy_mode == ""
 
 
+# --- Policy Manager service fields (RT-W01, RT-W04; sub-change 4.1-2) ----------
+
+SERVICE_ASSET = {"policy_mode": "service", "policy_service_url": "https://pm.internal:8443",
+                 "policy_client_cert": "/etc/pm/rt.crt", "policy_client_key": "/etc/pm/rt.key",
+                 "policy_ca": "/etc/pm/ca.pem"}
+SERVICE_FIELDS = ("policy_service_url", "policy_timeout_s", "policy_client_cert", "policy_client_key", "policy_ca")
+
+
+def test_app_json_declares_service_fields():
+    with open("soar_agent_runtime.json") as f:
+        cfg = json.load(f)["configuration"]
+    assert [cfg[k]["order"] for k in SERVICE_FIELDS] == [31, 32, 33, 34, 35]
+    assert all(cfg[k]["required"] is False and "service" in cfg[k]["description"] for k in SERVICE_FIELDS)
+    assert cfg["policy_timeout_s"]["data_type"] == "numeric" and cfg["policy_timeout_s"]["default"] == 5
+    assert len({f["order"] for f in cfg.values()}) == len(cfg)
+
+
+def test_service_fields_are_read_and_normalised():
+    c = make_connector(**{**SERVICE_ASSET, "policy_service_url": " https://pm.internal:8443 ",
+                          "policy_timeout_s": "2.5", "policy_ca": " /etc/pm/ca.pem "})
+    assert (c._policy_service_url, c._policy_timeout_s, c._policy_ca) == ("https://pm.internal:8443", 2.5, "/etc/pm/ca.pem")
+    d = make_connector()
+    assert (d._policy_service_url, d._policy_timeout_s, d._policy_client_cert, d._policy_client_key, d._policy_ca) == \
+        ("", 5.0, "", "", "")
+    assert make_connector(policy_timeout_s="abc")._policy_timeout_s == 5.0   # invalid = default + warning
+
+
+def test_airgap_service_passes_the_fields_to_the_factory(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(connector_module, "build_policy_client",
+                        lambda mode, **kw: seen.update(mode=mode, **kw) or StubPolicyClient())
+    make_connector(airgap_mode=True, policy_timeout_s=3, **SERVICE_ASSET)._build_policy_client()
+    assert seen["mode"] == "service"
+    assert {k: seen[k] for k in ("service_url", "service_timeout_s", "client_cert", "client_key", "ca")} == {
+        "service_url": "https://pm.internal:8443", "service_timeout_s": 3.0, "client_cert": "/etc/pm/rt.crt",
+        "client_key": "/etc/pm/rt.key", "ca": "/etc/pm/ca.pem"}
+    assert seen["policy_path"] == "" and seen["approvals_path"] == ""   # embedded paths stay empty
+
+
+def _install_fake_service_package(monkeypatch, halted=False, aktionen=()):
+    """policy_client with a service module whose client answers from memory (P3/P4-style wheel)."""
+    class Wire:
+        def __init__(self, data):
+            self.data = data
+
+        def to_wire(self):
+            return self.data
+
+    class FakeServiceClient:
+        def __init__(self, url, cert, key, ca, timeout_s=5.0):
+            self.args = (url, cert, key, ca, timeout_s)
+
+        def halt_status(self):
+            return Wire({"angehalten": halted, "grund": "drill" if halted else ""})
+
+        def decide(self, request):
+            return Wire({"gate": "ALLOW", "entscheidung_id": "pm-svc"})
+
+        def actions(self, agent_id):
+            return list(aktionen)
+
+    base = types.ModuleType("policy_client.base")
+    base.DecisionRequest = types.SimpleNamespace(from_wire=lambda data: data)
+    svc = types.ModuleType("policy_client.service")
+    svc.ServicePolicyClient = FakeServiceClient
+    for name, mod in (("policy_client", types.ModuleType("policy_client")), ("policy_client.base", base),
+                      ("policy_client.service", svc)):
+        monkeypatch.setitem(sys.modules, name, mod)
+
+
+def test_connectivity_airgap_service_reports_ok_through_the_package_client(monkeypatch):
+    _record_connection_tests(monkeypatch)
+    _install_fake_service_package(monkeypatch)
+    c = make_connector(airgap_mode=True, **BROKER_ASSET, **SERVICE_ASSET)   # no injected stub
+    c._broker_transport = _health_transport()
+    assert c._handle_test_connectivity({}) is True
+    assert '"policy": "OK: policy service healthy, not halted"' in c.action_results[-1].message
+
+
+def test_connectivity_airgap_service_halted_is_healthy_but_flagged(monkeypatch):
+    _record_connection_tests(monkeypatch)
+    _install_fake_service_package(monkeypatch, halted=True)
+    c = make_connector(airgap_mode=True, **BROKER_ASSET, **SERVICE_ASSET)
+    c._broker_transport = _health_transport()
+    assert c._handle_test_connectivity({}) is True
+    assert '"policy": "OK: policy service healthy, HALTED (drill)"' in c.action_results[-1].message
+
+
+def test_connectivity_airgap_service_without_certificate_fields_fails_and_names_them(monkeypatch):
+    _record_connection_tests(monkeypatch)
+    _install_fake_service_package(monkeypatch)
+    c = make_connector(airgap_mode=True, **BROKER_ASSET, policy_mode="service",
+                       policy_service_url="https://pm.internal:8443")
+    c._broker_transport = _health_transport()
+    assert c._handle_test_connectivity({}) is False
+    msg = c.action_results[-1].message
+    assert msg.startswith("Policy check failed (airgap).")
+    assert '"policy": "ERROR: policy_mode \'service\' needs policy_client_cert, policy_client_key, policy_ca' in msg
+
+
+def test_connectivity_airgap_service_with_p1_wheel_reports_unavailable(monkeypatch):
+    _record_connection_tests(monkeypatch)
+    monkeypatch.setitem(sys.modules, "policy_client.service", None)   # bundled P1 wheel: no service module
+    c = make_connector(airgap_mode=True, **BROKER_ASSET, **SERVICE_ASSET)
+    c._broker_transport = _health_transport()
+    assert c._handle_test_connectivity({}) is False
+    assert '"policy": "ERROR: policy_client.service not in the bundled policy_manager wheel' in c.action_results[-1].message
+
+
+AKTIONEN = [{"id": "disable_account", "version": 1, "zweck": "Disable", "kategorie": "Identity", "mindeststufe": 0},
+            {"id": "wipe_host", "version": 1, "zweck": "Wipe", "kategorie": "Destruction", "mindeststufe": 4}]
+
+
+@pytest.mark.parametrize("param, expected", [
+    ({"stufe": 1}, "[policy] catalogue: 1 block(s) available at stufe 1, 1 hidden (higher stufe)."),
+    ({}, "[policy] catalogue: 1 block(s) available at stufe 0, 1 hidden (higher stufe)."),
+    ({"stufe": 4}, "[policy] catalogue: 2 block(s) available at stufe 4, 0 hidden (higher stufe)."),
+])
+def test_run_agent_service_mode_loads_the_catalogue_through_the_package_client(monkeypatch, param, expected):
+    """RT-W09 / E12 over run_agent: GET /v1/aktionen via the package client, filtered by the run's stufe."""
+    _install_fake_service_package(monkeypatch, aktionen=AKTIONEN)
+    _capture_loop(monkeypatch)
+    c = make_connector(airgap_mode=True, **BROKER_ASSET, **SERVICE_ASSET)   # no injected stub
+    c._broker_transport = _transport(body=TOOLS_BODY)
+    assert c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 7, **param}) is True
+    assert any(m.startswith("[policy] mode=service (ready)") for m in c.progress)
+    assert expected in c.progress
+
+
 def test_airgap_without_policy_mode_warns():
     c = make_connector(airgap_mode=True, **BROKER_ASSET)
     assert any("policy_mode not set" in m and "denied" in m for m in c.progress)
@@ -677,7 +807,8 @@ def test_airgap_embedded_derives_state_files_from_state_dir(monkeypatch):
     assert seen == {"mode": "embedded", "policy_path": "/opt/phantom/etc/policy.json",
                     "approvals_path": "/opt/phantom/local/data/policy/approvals.json",
                     "halt_path": "/opt/phantom/local/data/policy/halt.json",
-                    "audit_path": "/opt/phantom/local/data/policy/audit.jsonl"}
+                    "audit_path": "/opt/phantom/local/data/policy/audit.jsonl",
+                    "service_url": "", "service_timeout_s": 5.0, "client_cert": "", "client_key": "", "ca": ""}
 
 
 def _capture_registry(monkeypatch):
