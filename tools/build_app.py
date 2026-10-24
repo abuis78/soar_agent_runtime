@@ -98,19 +98,40 @@ def warn_if_dirty() -> None:
               file=sys.stderr)
 
 
+def directories(files: list[str]) -> list[str]:
+    """Directory entries the tar needs, parents first: SOAR's installer looks for
+    the app directory as a real member, not just as a path prefix of the files."""
+    dirs = {TOP_DIR}
+    for rel in files:
+        parent = pathlib.PurePosixPath(rel).parent
+        while parent != pathlib.PurePosixPath("."):
+            dirs.add(f"{TOP_DIR}/{parent}")
+            parent = parent.parent
+    return sorted(dirs)
+
+
 def build(out_dir: pathlib.Path, dry_run: bool) -> pathlib.Path:
     files = package_files()
+    dirs = directories(files)
     target = out_dir / f"{TOP_DIR}_v{app_version()}.tar"
     print(f"package: {target}")
+    for name in dirs:
+        print(f"  {name}/")
     for rel in files:
         print(f"  {TOP_DIR}/{rel}")
-    print(f"{len(files)} files, {sum(1 for f in files if f.endswith('.whl'))} wheels")
+    print(f"{len(dirs)} directories, {len(files)} files, {sum(1 for f in files if f.endswith('.whl'))} wheels")
     if dry_run:
         print("dry run, nothing written")
         return target
     warn_if_dirty()
     out_dir.mkdir(parents=True, exist_ok=True)
     with tarfile.open(target, "w") as tar:
+        for name in dirs:
+            info = tarfile.TarInfo(name)
+            info.type = tarfile.DIRTYPE
+            info.mode = 0o755
+            info.mtime = int((ROOT / APP_JSON.name).stat().st_mtime)
+            tar.addfile(info)
         for rel in files:
             tar.add(ROOT / rel, arcname=f"{TOP_DIR}/{rel}", recursive=False)
     size_mb = target.stat().st_size / (1024 * 1024)
