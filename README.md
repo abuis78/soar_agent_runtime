@@ -36,7 +36,8 @@ None.
 
 ## 3. App Installation
 
-1. **Apps → Install App** → upload `soar_agent_runtime_v1.2.0.tar`
+0. Build the package from a checkout of `main`: `python3 tools/build_app.py` writes `soar_agent_runtime_v<app_version>.tar` next to app.json (`--dry-run` lists the files, `--out DIR` picks the directory). The tar carries all bundled wheels, so the SOAR host needs no internet access (SOAR ≥ 7.0.0 with Python 3.13 on Linux x86_64).
+1. **Apps → Install App** → upload the tar from step 0
 2. **Apps → SOAR Agent Runtime → Configure New Asset**
 3. Fill in API keys for the providers you want to use
 4. **Test Connectivity**
