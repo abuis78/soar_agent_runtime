@@ -534,6 +534,8 @@ cd /opt/phantom/apps/soar_agent_runtime_*/
 phenv python3 soar_agent_runtime_connector.py /tmp/test_run_agent.json
 ```
 
+Unit and integration tests run with `uv` and the bundled wheels (see the command in `test_soar_agent_runtime_policy_wheel.py`). The mTLS integration tests in `test_soar_agent_runtime_policy_service.py` start the Policy Manager service from the bundled wheel in-process with a throwaway PKI made by the `openssl` CLI; without `openssl` they are skipped.
+
 ---
 
 ## 11. Troubleshooting
