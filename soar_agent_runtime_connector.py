@@ -273,11 +273,16 @@ class SoarAgentRuntimeConnector(BaseConnector):
                 provider="local",
                 api_key=self._config.get("local_llm_api_key", "ollama"),
                 api_url=self._config.get("local_llm_url", "http://localhost:11434/v1"),
-                model=model or "llama3",
+                model=model or self._local_llm_model(),
                 **self._llm_kwargs(),
             )
         else:
             raise ValueError(f"Unknown provider: {provider}. Use: anthropic | openai | gemini | local")
+
+    def _local_llm_model(self) -> str:
+        """Model for provider 'local' when the agent definition names none; also the
+        model `test connectivity` asks the local server for (asset field local_llm_model)."""
+        return (self._config.get("local_llm_model") or "llama3").strip() or "llama3"
 
     # -----------------------------------------------------------------------
     # Action: test connectivity
@@ -292,7 +297,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
             ("anthropic", "claude-haiku-4-5-20251001"),
             ("openai",    "gpt-4o-mini"),
             ("gemini",    "gemini-2.0-flash"),
-            ("local",     "llama3")
+            ("local",     self._local_llm_model())
         ]
         any_success = False
         for provider_name, default_model in providers:

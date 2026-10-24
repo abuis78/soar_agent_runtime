@@ -416,7 +416,7 @@ def test_app_json_declares_broker_fields_in_order():
         app = json.load(f)
     cfg = app["configuration"]
     assert app["app_version"] == "1.9.0"
-    assert [cfg[k]["order"] for k in ("broker_url", "broker_timeout_s", "broker_client_cert", "broker_client_key", "broker_ca")] == [23, 24, 25, 26, 27]
+    assert [cfg[k]["order"] for k in ("broker_url", "broker_timeout_s", "broker_client_cert", "broker_client_key", "broker_ca")] == [24, 25, 26, 27, 28]
     assert cfg["broker_client_key"]["data_type"] == "string"  # a path, never the key material
     assert len({f["order"] for f in cfg.values()}) == len(cfg)  # orders unique
 
@@ -632,7 +632,7 @@ def test_app_json_declares_policy_fields_and_run_agent_params():
     with open("soar_agent_runtime.json") as f:
         app = json.load(f)
     cfg = app["configuration"]
-    assert [cfg[k]["order"] for k in ("policy_mode", "policy_path", "policy_state_dir")] == [28, 29, 30]
+    assert [cfg[k]["order"] for k in ("policy_mode", "policy_path", "policy_state_dir")] == [29, 30, 31]
     assert cfg["policy_mode"]["value_list"] == ["", "embedded", "service"] and cfg["policy_mode"]["default"] == ""
     assert all(cfg[k]["required"] is False for k in ("policy_mode", "policy_path", "policy_state_dir"))
     assert len({f["order"] for f in cfg.values()}) == len(cfg)
@@ -659,7 +659,7 @@ SERVICE_FIELDS = ("policy_service_url", "policy_timeout_s", "policy_client_cert"
 def test_app_json_declares_service_fields():
     with open("soar_agent_runtime.json") as f:
         cfg = json.load(f)["configuration"]
-    assert [cfg[k]["order"] for k in SERVICE_FIELDS] == [31, 32, 33, 34, 35]
+    assert [cfg[k]["order"] for k in SERVICE_FIELDS] == [32, 33, 34, 35, 36]
     assert all(cfg[k]["required"] is False and "service" in cfg[k]["description"] for k in SERVICE_FIELDS)
     assert cfg["policy_timeout_s"]["data_type"] == "numeric" and cfg["policy_timeout_s"]["default"] == 5
     assert len({f["order"] for f in cfg.values()}) == len(cfg)
