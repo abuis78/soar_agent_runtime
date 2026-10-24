@@ -55,6 +55,7 @@ None.
 | `gemini_api_key` | Google Gemini API Key | — |
 | `local_llm_url` | Local LLM URL | `http://localhost:11434/v1` |
 | `local_llm_api_key` | Local LLM key | `ollama` |
+| `local_llm_model` | Local model when the agent definition names none; also used by `test connectivity` (Ollama tag, e.g. `qwen2.5:7b`) | `llama3` |
 | `default_provider` | Fallback provider | `anthropic` |
 | `default_max_steps` | Max ReAct steps | `25` |
 | `agent_list_name` | Custom List for agents | `agent_definitions` |
@@ -99,6 +100,8 @@ openai (gpt-4o-mini): SKIPPED (no credentials configured)
 gemini: SKIPPED
 local: SKIPPED
 ```
+
+`test connectivity` always tries the `local` provider with `local_llm_model` (default `llama3`); set the field to a model the server actually serves (`ollama list`), otherwise the local check fails although the server is up. Cloud providers are tested only when a key is configured.
 
 ---
 
@@ -566,3 +569,4 @@ Unit and integration tests run with `uv` and the bundled wheels (see the command
 | 1.8.0 | 2026-10-23 | Phase 4: `policy_mode = service` over mTLS via the package's `ServicePolicyClient`, no fallback (RT-W01, RT-W04; asset fields `policy_service_url`, `policy_timeout_s`, `policy_client_cert`, `policy_client_key`, `policy_ca`); action catalogue with `catalog_invoke` (one decision per sequence, stage filter, proposal artifact also for `ALLOW`; RT-W09, AC-09, E12-E14); `report_gap` with artifact `agent_action_gap` (RT-W10, E15); judgement sent as `urteil = {empfehlung, gegenargumente[], unsicherheiten[], konfidenz}` and `unsicherheiten`/`konfidenz` mandatory for effecting calls (Policy Manager API.md §3, W14). Service mode and catalogue need a Policy Manager P3/P4 wheel (4.1b/4.2b) |
 | 1.8.1 | 2026-10-23 | Fix: Policy Manager `health()` reads TOML policies (before: every `.toml` policy was reported as "not valid JSON" and `test connectivity` failed); an undeterminable halt state (service unreachable, halt file missing/unreadable) is reported as unhealthy with its cause and a hint to create `halt.json`, a deliberate halt stays healthy + HALTED. Found in the 4.1b spike against `policy_manager` 0.5.0 |
 | 1.9.0 | 2026-10-23 | Bundled `policy_manager` 0.5.1 (built from PolicyManager tag `rp/p5-3`, commit `fbea672`; E16: tag instead of PolicyManager `main`): `policy_mode = service`, action catalogue, halt field `bekannt` and the sequence register work with the shipped package; `sequences_path` passed to the embedded client; `health()` decides "undetermined" from `bekannt` only; wheel integration tests follow the 0.5.x engine (tool-name mapping, `stufe`/`domaene`, judgement W14, catalogue, sequences, audit); README operator checklist for the Policy Manager (4.1b) |
+| 1.9.1 | 2026-10-24 | Asset field `local_llm_model` (default `llama3`): the model `test connectivity` asks the local server for, and the fallback model for provider `local` when the agent definition names none; `tools/build_app.py` builds the installable tar with directory entries (B17) |

@@ -6,7 +6,7 @@
     "package_name": "phantom_soar_agent_runtime",
     "type": "generic",
     "license": "Copyright 2026 Andreas Buis",
-    "app_version": "1.9.0",
+    "app_version": "1.9.1",
     "product_vendor": "OpenClaw SOC",
     "product_name": "SOAR Agent Runtime",
     "product_version_regex": ".*",
@@ -237,145 +237,152 @@
             "required": false,
             "order": 6
         },
+        "local_llm_model": {
+            "description": "Local LLM model used when the agent definition names none, and by test connectivity (Ollama: the tag from 'ollama list', e.g. qwen2.5:7b)",
+            "data_type": "string",
+            "required": false,
+            "default": "llama3",
+            "order": 7
+        },
         "default_provider": {
             "description": "Default LLM provider if not specified in agent definition (anthropic | openai | gemini | local)",
             "data_type": "string",
             "required": false,
             "default": "anthropic",
-            "order": 7
+            "order": 8
         },
         "default_max_steps": {
             "description": "Default maximum ReAct loop steps per agent run",
             "data_type": "numeric",
             "required": false,
             "default": 25,
-            "order": 8
+            "order": 9
         },
         "agent_list_name": {
             "description": "SOAR Custom List name containing agent definitions",
             "data_type": "string",
             "required": false,
             "default": "agent_definitions",
-            "order": 9
+            "order": 10
         },
         "telemetry_enabled": {
             "description": "Send agent_action telemetry events to Splunk HEC (AI-SOC Telemetry). Off by default; agent behaviour is unaffected either way.",
             "data_type": "boolean",
             "required": false,
             "default": false,
-            "order": 10
+            "order": 11
         },
         "hec_url": {
             "description": "Splunk HEC event endpoint, e.g. https://splunk.example.com:8088/services/collector/event",
             "data_type": "string",
             "required": false,
-            "order": 11
+            "order": 12
         },
         "hec_token": {
             "description": "Splunk HEC token, scoped to the ai_soc_audit index",
             "data_type": "password",
             "required": false,
-            "order": 12
+            "order": 13
         },
         "telemetry_index": {
             "description": "Splunk index for telemetry events",
             "data_type": "string",
             "required": false,
             "default": "ai_soc_audit",
-            "order": 13
+            "order": 14
         },
         "telemetry_verify_tls": {
             "description": "Verify the HEC TLS certificate. Disable only for a self-signed test instance.",
             "data_type": "boolean",
             "required": false,
             "default": true,
-            "order": 14
+            "order": 15
         },
         "skill_list_name": {
             "description": "SOAR Custom List name containing skill definitions",
             "data_type": "string",
             "required": false,
             "default": "agent_skills",
-            "order": 15
+            "order": 16
         },
         "airgap_mode": {
             "description": "Air-gap mode (RT-A01). When enabled only the 'local' provider is allowed, cloud providers are rejected at run start, free-form SPL is disabled and read/act tools go through Tool Broker and Policy Manager. Off = current behaviour.",
             "data_type": "boolean",
             "required": false,
             "default": false,
-            "order": 16
+            "order": 17
         },
         "llm_timeout_s": {
             "description": "Timeout in seconds for a single model call (RT-A03)",
             "data_type": "numeric",
             "required": false,
             "default": 120,
-            "order": 17
+            "order": 18
         },
         "llm_temperature": {
             "description": "Sampling temperature for model calls; 0 = as deterministic as the model allows (RT-A03)",
             "data_type": "numeric",
             "required": false,
             "default": 0,
-            "order": 18
+            "order": 19
         },
         "llm_max_tokens": {
             "description": "Maximum output tokens per model call (RT-A03)",
             "data_type": "numeric",
             "required": false,
             "default": 4096,
-            "order": 19
+            "order": 20
         },
         "llm_seed": {
             "description": "Optional sampling seed, sent only if set and only if the inference server supports it (RT-A03). Leave empty to not send a seed.",
             "data_type": "numeric",
             "required": false,
-            "order": 20
+            "order": 21
         },
         "max_observation_chars": {
             "description": "Maximum characters of a single tool observation, extra_context block or container payload passed to the model; longer input is truncated and marked (RT-B04)",
             "data_type": "numeric",
             "required": false,
             "default": 8000,
-            "order": 21
+            "order": 22
         },
         "audit_enabled": {
             "description": "Write one audit artifact (label agent_audit) per agent step to the case (RT-P02). Always on and fail-closed in airgap_mode.",
             "data_type": "boolean",
             "required": false,
             "default": false,
-            "order": 22
+            "order": 23
         },
         "broker_url": {
             "description": "Tool Broker base URL, https only (mTLS, RT-L07). Required in airgap_mode: read tools come from the broker.",
             "data_type": "string",
             "required": false,
-            "order": 23
+            "order": 24
         },
         "broker_timeout_s": {
             "description": "Timeout in seconds for every Tool Broker call (RT-L07)",
             "data_type": "numeric",
             "required": false,
             "default": 30,
-            "order": 24
+            "order": 25
         },
         "broker_client_cert": {
             "description": "Path on the SOAR host to the client certificate (PEM) presented to the Tool Broker (mTLS)",
             "data_type": "string",
             "required": false,
-            "order": 25
+            "order": 26
         },
         "broker_client_key": {
             "description": "Path on the SOAR host to the private key (PEM) for the client certificate; the key never leaves the host",
             "data_type": "string",
             "required": false,
-            "order": 26
+            "order": 27
         },
         "broker_ca": {
             "description": "Path on the SOAR host to the CA bundle (PEM) that signed the Tool Broker server certificate",
             "data_type": "string",
             "required": false,
-            "order": 27
+            "order": 28
         },
         "policy_mode": {
             "description": "Policy Manager mode for effecting actions (RT-W03): 'embedded' (policy_client in-process, policy_path + policy_state_dir) or 'service' (Policy Manager service over mTLS, policy_service_url + certificate fields). Empty = every effecting action is denied in airgap_mode",
@@ -387,50 +394,50 @@
                 "service"
             ],
             "default": "",
-            "order": 28
+            "order": 29
         },
         "policy_path": {
             "description": "Path on the SOAR host to the policy file (JSON/TOML from Git) used by policy_mode 'embedded' (E11)",
             "data_type": "string",
             "required": false,
-            "order": 29
+            "order": 30
         },
         "policy_state_dir": {
             "description": "Directory on the SOAR host for the embedded Policy Manager state: approvals.json, halt.json, audit.jsonl (E11). Must be writable by the app user",
             "data_type": "string",
             "required": false,
-            "order": 30
+            "order": 31
         },
         "policy_service_url": {
             "description": "Policy Manager service base URL, https only (mTLS, RT-W01). Only policy_mode 'service'",
             "data_type": "string",
             "required": false,
-            "order": 31
+            "order": 32
         },
         "policy_timeout_s": {
             "description": "Timeout in seconds for every Policy Manager service call; on timeout the action is denied, no fallback (RT-W04). Only policy_mode 'service'",
             "data_type": "numeric",
             "required": false,
             "default": 5,
-            "order": 32
+            "order": 33
         },
         "policy_client_cert": {
             "description": "Path on the SOAR host to the client certificate (PEM) presented to the Policy Manager service; its CN is the client identity. Only policy_mode 'service'",
             "data_type": "string",
             "required": false,
-            "order": 33
+            "order": 34
         },
         "policy_client_key": {
             "description": "Path on the SOAR host to the private key (PEM) for the Policy Manager client certificate; the key never leaves the host. Only policy_mode 'service'",
             "data_type": "string",
             "required": false,
-            "order": 34
+            "order": 35
         },
         "policy_ca": {
             "description": "Path on the SOAR host to the CA bundle (PEM) that signed the Policy Manager server certificate. Only policy_mode 'service'",
             "data_type": "string",
             "required": false,
-            "order": 35
+            "order": 36
         }
     },
     "actions": [

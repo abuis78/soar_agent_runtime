@@ -415,8 +415,8 @@ def test_app_json_declares_broker_fields_in_order():
     with open("soar_agent_runtime.json") as f:
         app = json.load(f)
     cfg = app["configuration"]
-    assert app["app_version"] == "1.9.0"
-    assert [cfg[k]["order"] for k in ("broker_url", "broker_timeout_s", "broker_client_cert", "broker_client_key", "broker_ca")] == [23, 24, 25, 26, 27]
+    assert app["app_version"] == "1.9.1"
+    assert [cfg[k]["order"] for k in ("broker_url", "broker_timeout_s", "broker_client_cert", "broker_client_key", "broker_ca")] == [24, 25, 26, 27, 28]
     assert cfg["broker_client_key"]["data_type"] == "string"  # a path, never the key material
     assert len({f["order"] for f in cfg.values()}) == len(cfg)  # orders unique
 
@@ -632,7 +632,7 @@ def test_app_json_declares_policy_fields_and_run_agent_params():
     with open("soar_agent_runtime.json") as f:
         app = json.load(f)
     cfg = app["configuration"]
-    assert [cfg[k]["order"] for k in ("policy_mode", "policy_path", "policy_state_dir")] == [28, 29, 30]
+    assert [cfg[k]["order"] for k in ("policy_mode", "policy_path", "policy_state_dir")] == [29, 30, 31]
     assert cfg["policy_mode"]["value_list"] == ["", "embedded", "service"] and cfg["policy_mode"]["default"] == ""
     assert all(cfg[k]["required"] is False for k in ("policy_mode", "policy_path", "policy_state_dir"))
     assert len({f["order"] for f in cfg.values()}) == len(cfg)
@@ -659,7 +659,7 @@ SERVICE_FIELDS = ("policy_service_url", "policy_timeout_s", "policy_client_cert"
 def test_app_json_declares_service_fields():
     with open("soar_agent_runtime.json") as f:
         cfg = json.load(f)["configuration"]
-    assert [cfg[k]["order"] for k in SERVICE_FIELDS] == [31, 32, 33, 34, 35]
+    assert [cfg[k]["order"] for k in SERVICE_FIELDS] == [32, 33, 34, 35, 36]
     assert all(cfg[k]["required"] is False and "service" in cfg[k]["description"] for k in SERVICE_FIELDS)
     assert cfg["policy_timeout_s"]["data_type"] == "numeric" and cfg["policy_timeout_s"]["default"] == 5
     assert len({f["order"] for f in cfg.values()}) == len(cfg)
@@ -946,3 +946,61 @@ def test_connectivity_normal_mode_skips_policy_and_never_builds_a_gate(monkeypat
     plain = make_connector()
     assert plain._handle_test_connectivity({}) is True
     assert '"policy": "SKIPPED (no policy_mode)"' in plain.action_results[-1].message
+
+
+# --- local_llm_model: the model for provider 'local' without one in the definition ----
+
+def _record_tested_models(monkeypatch):
+    tested = []
+
+    def fake_test(self):
+        tested.append((self.provider, self.model))
+        return True, "OK"
+
+    monkeypatch.setattr(connector_module.LLMProvider, "test_connection", fake_test)
+    return tested
+
+
+def test_connectivity_asks_local_for_the_configured_model(monkeypatch):
+    tested = _record_tested_models(monkeypatch)
+    c = make_connector(airgap_mode=True, local_llm_model="qwen2.5:7b", broker_url="https://broker.internal:8443",
+                       broker_client_cert="/etc/rt.crt", broker_client_key="/etc/rt.key", policy_mode="embedded")
+    c._broker_transport = lambda method, url, params, body, timeout_s: (200, {"status": "ok"})
+    c._policy_client = StubPolicyClient()
+    assert c._handle_test_connectivity({}) is True
+    assert tested == [("local", "qwen2.5:7b")]
+    assert '"local": "OK"' in c.action_results[-1].message
+
+
+@pytest.mark.parametrize("raw", [None, "", "   "])
+def test_connectivity_local_model_defaults_to_llama3(monkeypatch, raw):
+    tested = _record_tested_models(monkeypatch)
+    config = {"airgap_mode": True} if raw is None else {"airgap_mode": True, "local_llm_model": raw}
+    c = make_connector(**config)
+    c._handle_test_connectivity({})
+    assert tested == [("local", "llama3")]
+
+
+def test_local_provider_without_model_in_definition_uses_asset_field():
+    c = make_connector(local_llm_model="qwen2.5:7b")
+    assert c._build_llm_provider("local", "").model == "qwen2.5:7b"
+
+
+def test_model_in_definition_wins_over_local_llm_model():
+    c = make_connector(local_llm_model="qwen2.5:7b")
+    assert c._build_llm_provider("local", "mistral").model == "mistral"
+
+
+def test_local_llm_model_does_not_touch_cloud_providers():
+    c = make_connector(local_llm_model="qwen2.5:7b")
+    assert c._build_llm_provider("anthropic", "").model != "qwen2.5:7b"
+
+
+def test_app_json_declares_local_llm_model_next_to_the_local_url():
+    with open("soar_agent_runtime.json") as f:
+        cfg = json.load(f)["configuration"]
+    keys = list(cfg)
+    assert keys.index("local_llm_model") == keys.index("local_llm_api_key") + 1
+    assert cfg["local_llm_model"]["default"] == "llama3"
+    assert cfg["local_llm_model"]["data_type"] == "string" and cfg["local_llm_model"]["required"] is False
+    assert [cfg[k]["order"] for k in keys] == list(range(len(keys)))  # contiguous after the insert
