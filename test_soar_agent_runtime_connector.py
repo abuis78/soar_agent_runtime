@@ -946,3 +946,61 @@ def test_connectivity_normal_mode_skips_policy_and_never_builds_a_gate(monkeypat
     plain = make_connector()
     assert plain._handle_test_connectivity({}) is True
     assert '"policy": "SKIPPED (no policy_mode)"' in plain.action_results[-1].message
+
+
+# --- local_llm_model: the model for provider 'local' without one in the definition ----
+
+def _record_tested_models(monkeypatch):
+    tested = []
+
+    def fake_test(self):
+        tested.append((self.provider, self.model))
+        return True, "OK"
+
+    monkeypatch.setattr(connector_module.LLMProvider, "test_connection", fake_test)
+    return tested
+
+
+def test_connectivity_asks_local_for_the_configured_model(monkeypatch):
+    tested = _record_tested_models(monkeypatch)
+    c = make_connector(airgap_mode=True, local_llm_model="qwen2.5:7b", broker_url="https://broker.internal:8443",
+                       broker_client_cert="/etc/rt.crt", broker_client_key="/etc/rt.key", policy_mode="embedded")
+    c._broker_transport = lambda method, url, params, body, timeout_s: (200, {"status": "ok"})
+    c._policy_client = StubPolicyClient()
+    assert c._handle_test_connectivity({}) is True
+    assert tested == [("local", "qwen2.5:7b")]
+    assert '"local": "OK"' in c.action_results[-1].message
+
+
+@pytest.mark.parametrize("raw", [None, "", "   "])
+def test_connectivity_local_model_defaults_to_llama3(monkeypatch, raw):
+    tested = _record_tested_models(monkeypatch)
+    config = {"airgap_mode": True} if raw is None else {"airgap_mode": True, "local_llm_model": raw}
+    c = make_connector(**config)
+    c._handle_test_connectivity({})
+    assert tested == [("local", "llama3")]
+
+
+def test_local_provider_without_model_in_definition_uses_asset_field():
+    c = make_connector(local_llm_model="qwen2.5:7b")
+    assert c._build_llm_provider("local", "").model == "qwen2.5:7b"
+
+
+def test_model_in_definition_wins_over_local_llm_model():
+    c = make_connector(local_llm_model="qwen2.5:7b")
+    assert c._build_llm_provider("local", "mistral").model == "mistral"
+
+
+def test_local_llm_model_does_not_touch_cloud_providers():
+    c = make_connector(local_llm_model="qwen2.5:7b")
+    assert c._build_llm_provider("anthropic", "").model != "qwen2.5:7b"
+
+
+def test_app_json_declares_local_llm_model_next_to_the_local_url():
+    with open("soar_agent_runtime.json") as f:
+        cfg = json.load(f)["configuration"]
+    keys = list(cfg)
+    assert keys.index("local_llm_model") == keys.index("local_llm_api_key") + 1
+    assert cfg["local_llm_model"]["default"] == "llama3"
+    assert cfg["local_llm_model"]["data_type"] == "string" and cfg["local_llm_model"]["required"] is False
+    assert [cfg[k]["order"] for k in keys] == list(range(len(keys)))  # contiguous after the insert
