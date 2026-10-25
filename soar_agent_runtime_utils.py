@@ -96,6 +96,14 @@ _PRIVATE_IP_RE = re.compile(
     re.IGNORECASE
 )
 
+# E2E finding E-6 (2026-10-25, container 212): SOAR raises a container's severity to a
+# higher artifact severity without an audit entry, and artifacts default to "medium". Every
+# runtime artifact therefore carries the lowest default severity, so audit, proposal and gap
+# artifacts never change the case severity (update_severity low was undone by the next audit
+# artifact). "low" exists on every SOAR instance; a container at "informational" would still
+# be raised to "low".
+RUNTIME_ARTIFACT_SEVERITY = "low"
+
 # Issue #4 (DoS): Absolute maximum ReAct steps regardless of config.
 MAX_STEPS_HARD_LIMIT = 50
 
@@ -967,6 +975,7 @@ class ToolRegistry:
             "label": self.PROPOSAL_LABEL,
             "name": name,
             "type": self.PROPOSAL_LABEL,
+            "severity": RUNTIME_ARTIFACT_SEVERITY,
             "source_data_identifier": f"{decision.approval_id or decision.decision_id}:{request.step_id}",
             "cef": cef,
             "run_automation": False,
@@ -1168,6 +1177,7 @@ class ToolRegistry:
             "label": self.GAP_LABEL,
             "name": name,
             "type": self.GAP_LABEL,
+            "severity": RUNTIME_ARTIFACT_SEVERITY,
             "source_data_identifier": f"{self.run_id}:{self.current_step_id}",
             "cef": cef,
             "run_automation": False,
