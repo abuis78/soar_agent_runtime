@@ -177,6 +177,8 @@ Creates or updates an agent in the `agent_definitions` Custom List.
 
 Available tools: `splunk_search`, `add_note`, `update_severity`, `get_container_info`, `run_sub_agent`
 
+`splunk_search` is not available in SOAR apps (SOAR offers apps no search API); it answers with an error and runs no SPL. Read data via `broker_invoke` templates.
+
 ---
 
 ### `create skill`
@@ -589,3 +591,4 @@ Unit and integration tests run with `uv` and the bundled wheels (see the command
 | 1.10.2 | 2026-10-25 | `update_severity` sets the severity over the SOAR REST API (`POST /rest/container/<id>`) after an allowed policy decision instead of `phantom.rules.update_container`, which apps cannot call on SOAR 8.7; a rejected value is named in the observation |
 | 1.10.3 | 2026-10-25 | `run agent` summary note lists the executed actions from the step log and warns when the answer claims an effect (`update_severity`, `catalog_invoke`) that did not take effect; result data `executed_actions` and `unbelegte_behauptungen` |
 | 1.11.0 | 2026-10-25 | New action `setup app`: creates missing Custom Lists, removes older duplicate agent/skill rows, checks model and (in `airgap_mode`) broker, policy, files and `halt.json`; `dry_run`. `test connectivity` reports missing Custom Lists without writing |
+| 1.11.1 | 2026-10-25 | Strict parser: a model turn with several `ACTION`s or `ACTION` plus `FINAL_ANSWER` runs nothing and asks the model to send one action at a time (a second ACTION used to replace the first silently); the step log keeps the raw model turn (2000 characters). `splunk_search` answers that SOAR apps cannot search (`phantom.rules.run_query` does not exist) |
