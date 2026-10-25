@@ -326,43 +326,51 @@ def test_has_effect_flags():
     assert ToolRegistry.has_effect("unknown_tool") is True
 
 
-# --- RT-P05: one ACTION per turn (1.11.1) --------------------------------------------------
-# On SOAR 8.7 qwen2.5:7b planned "update the severity to high and add a note", yet only
-# add_note ran: a second ACTION used to replace the first without any error.
+# --- RT-P05 with weak models: first ACTION runs, the rest is named (1.11.2) ------------
+# Raw turn of qwen2.5:7b on SOAR 8.7 (run rt-20261025T053802Z-17af70c7). 1.11.0 dropped
+# update_severity silently; 1.11.1 rejected the turn and the model repeated it 6 times.
 
-TWO_ACTIONS = ('THOUGHT: I will update the severity to high and add a note.\n'
-               'ACTION: update_severity\nPARAMS: {"severity": "high"}\n'
-               'ACTION: add_note\nPARAMS: {"title": "Why", "content": "malware URL"}')
+TWO_ACTIONS = ('THOUGHT: Based on the current information, I will update the severity to high and add a note '
+               'explaining the rationale.\n'
+               'ACTION: update_severity\nPARAMS: {"severity": "high"}\n\n'
+               'ACTION: add_note\nPARAMS: {"title": "Rationale for High Severity", "content": "malware URL"}')
 
 
-def test_two_actions_in_one_turn_are_rejected_not_merged():
+def test_first_of_two_actions_is_parsed_with_its_own_params():
     loop, _, _ = make_loop([])
     tool, params, _thought, final, err = loop._parse_response(TWO_ACTIONS)
-    assert params == {} and final is None
-    assert err.startswith("ERROR: one ACTION per response; you sent update_severity, add_note. Nothing was executed.")
+    assert (tool, params, final, err) == ("update_severity", {"severity": "high"}, None, None)
+    assert loop._dropped_actions == ["add_note"] and loop._final_dropped is False
 
 
-def test_action_with_final_answer_is_rejected():
+def test_action_with_final_answer_runs_the_action_and_drops_the_answer():
     loop, _, _ = make_loop([])
-    _tool, _params, _t, final, err = loop._parse_response(
+    tool, params, _t, final, err = loop._parse_response(
         'THOUGHT: done\nACTION: update_severity\nPARAMS: {"severity": "high"}\nFINAL_ANSWER: severity set')
-    assert final is None
-    assert "you sent update_severity and FINAL_ANSWER" in err
+    assert (tool, params, final, err) == ("update_severity", {"severity": "high"}, None, None)
+    assert loop._final_dropped is True
 
 
-def test_rejected_turn_runs_nothing_and_the_model_retries_one_at_a_time():
+def test_the_real_turn_sets_the_severity_and_tells_the_model_what_did_not_run():
     loop, llm, tools = make_loop([
         TWO_ACTIONS,
-        'THOUGHT: one at a time\nACTION: update_severity\nPARAMS: {"severity": "high"}',
         'THOUGHT: now the note\nACTION: add_note\nPARAMS: {"title": "Why", "content": "malware URL"}',
         "THOUGHT: done\nFINAL_ANSWER: severity high, note added",
     ])
-    result = loop.run("Call update_severity with severity high. Then add a note.")
+    result = loop.run("Call update_severity with severity high. Then add a note explaining why.")
     assert tools.calls == [("update_severity", {"severity": "high"}), ("add_note", {"title": "Why", "content": "malware URL"})]
     log = json.loads(result["step_log"])
-    assert log[0]["observation"].startswith("ERROR: one ACTION per response")
-    assert "you sent update_severity, add_note" in llm.seen_messages[1][-1]["content"]
+    assert (log[0]["action"], log[0]["not_executed"]) == ("update_severity", ["add_note"])
+    told = llm.seen_messages[1][-1]["content"]
+    assert "NOTE: only the first ACTION of your response was executed. add_note was NOT executed" in told
     assert result["final_answer"] == "severity high, note added"
+
+
+def test_invalid_params_of_the_first_action_still_block_it():
+    loop, _, _ = make_loop([])
+    _tool, _params, _t, _final, err = loop._parse_response(
+        "ACTION: update_severity\nPARAMS: {not json}\nACTION: add_note\nPARAMS: {}")
+    assert err == _PARAMS_PARSE_ERROR
 
 
 def test_step_log_keeps_the_raw_model_turn_truncated():
@@ -370,8 +378,10 @@ def test_step_log_keeps_the_raw_model_turn_truncated():
     log = json.loads(loop.run("t")["step_log"])
     assert log[0]["raw_response"] == "THOUGHT: x\nACTION: get_container_info"
     assert len(log[1]["raw_response"]) == 2000
+    assert "not_executed" not in log[0]
 
 
 def test_a_single_action_still_parses_as_before():
     loop, _, _ = make_loop([])
     assert loop._parse_response('ACTION: add_note\nPARAMS: {"title": "t", "content": "c"}')[4] is None
+    assert loop._dropped_actions == []

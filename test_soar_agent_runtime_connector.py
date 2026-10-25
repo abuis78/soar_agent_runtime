@@ -415,7 +415,7 @@ def test_app_json_declares_broker_fields_in_order():
     with open("soar_agent_runtime.json") as f:
         app = json.load(f)
     cfg = app["configuration"]
-    assert app["app_version"] == "1.11.1"
+    assert app["app_version"] == "1.11.2"
     assert [cfg[k]["order"] for k in ("broker_url", "broker_timeout_s", "broker_client_cert", "broker_client_key", "broker_ca")] == [24, 25, 26, 27, 28]
     assert cfg["broker_client_key"]["data_type"] == "string"  # a path, never the key material
     assert len({f["order"] for f in cfg.values()}) == len(cfg)  # orders unique
@@ -1228,8 +1228,10 @@ HALLUCINATED_RUN = [  # run rt-20261025T050736Z-cf477c13 on SOAR 8.7, shortened
 def test_executed_actions_lists_tool_calls_with_outcome():
     actions = connector_module.executed_actions(json.dumps(HALLUCINATED_RUN))
     assert actions == [
-        {"step": 1, "tool": "get_container_info", "outcome": "data returned", "took_effect": False},
-        {"step": 2, "tool": "add_note", "outcome": "Note added: 'Reason for Severity Increase'", "took_effect": False},
+        {"step": 1, "tool": "get_container_info", "outcome": "data returned", "took_effect": False,
+         "not_executed": []},
+        {"step": 2, "tool": "add_note", "outcome": "Note added: 'Reason for Severity Increase'", "took_effect": False,
+         "not_executed": []},
     ]
 
 
@@ -1372,3 +1374,13 @@ def test_compact_rows_drops_empty_and_older_rows():
     rows = [["", ""], ["a", "1"], ["b", "2"], ["a", "3"], "junk"]
     assert utils_module.compact_rows(rows) == ([["a", "3"], ["b", "2"]], 1)
     assert utils_module.compact_rows([["", ""]]) == ([["", ""]], 0)
+
+
+
+def test_note_names_actions_that_were_sent_but_not_executed():
+    log = [{"step": 1, "action": "update_severity", "observation": "Container severity updated to: high",
+            "not_executed": ["add_note"]}]
+    block = connector_module.executed_actions_block("Severity high.", connector_module.executed_actions(log))
+    assert ("- step 1: `update_severity` - Container severity updated to: high "
+            "(in the same response, not executed: add_note)") in block
+    assert "**Warning:**" not in block

@@ -72,6 +72,7 @@ def executed_actions(step_log) -> list[dict]:
             "tool": tool,
             "outcome": first_line[:160],
             "took_effect": bool(effect_prefix and observation.startswith(effect_prefix)),
+            "not_executed": list(entry.get("not_executed") or []),
         })
     return actions
 
@@ -89,8 +90,10 @@ def unbacked_claims(final_answer: str, actions: list[dict]) -> list[str]:
 
 def executed_actions_block(final_answer: str, actions: list[dict]) -> str:
     lines = ["**Executed actions** (from the step log, not from the model):"]
-    lines += [f"- step {a['step']}: `{a['tool']}` - {a['outcome'] or 'no observation'}" for a in actions] or [
-        "- none"]
+    lines += [f"- step {a['step']}: `{a['tool']}` - {a['outcome'] or 'no observation'}"
+              + (f" (in the same response, not executed: {', '.join(a['not_executed'])})"
+                 if a.get("not_executed") else "")
+              for a in actions] or ["- none"]
     if warnings := unbacked_claims(final_answer, actions):
         lines += ["", *[f"**Warning:** {w}" for w in warnings]]
     return "\n".join(lines)
