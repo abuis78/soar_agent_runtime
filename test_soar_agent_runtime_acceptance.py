@@ -44,7 +44,6 @@ def platform(monkeypatch):
     """Stub phantom.rules: Custom List with agent definitions, notes, severity."""
     state = {"agents": {}, "notes": [], "severity": [], "queries": []}
     rules = types.ModuleType("phantom.rules")
-    rules.get_list = lambda list_name: [[aid, json.dumps(cfg)] for aid, cfg in state["agents"].items()]
     rules.add_note = lambda **kw: state["notes"].append(kw)
     rules.update_container = lambda container=None, severity=None: state["severity"].append((container, severity))
     rules.get_container = lambda cid: {"id": cid, "name": "case"}
@@ -52,6 +51,13 @@ def platform(monkeypatch):
     rules.run_query = lambda **kw: state["queries"].append(kw) or []
     monkeypatch.setitem(sys.modules, "phantom.rules", rules)
     monkeypatch.setattr(sys.modules["phantom"], "rules", rules, raising=False)
+
+    def custom_lists(method, url, body, timeout_s):
+        # Agent definitions come from the Custom List over /rest/decided_list (1.10.0).
+        assert method == "get" and url.endswith("/rest/decided_list/agent_definitions")
+        return 200, {"content": [[aid, json.dumps(cfg)] for aid, cfg in state["agents"].items()]}
+
+    monkeypatch.setattr(utils.SoarCustomList, "transport", staticmethod(custom_lists))
     return state
 
 

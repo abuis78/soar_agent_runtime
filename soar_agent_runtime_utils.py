@@ -1224,6 +1224,98 @@ class ToolRegistry:
 
 
 # ---------------------------------------------------------------------------
+# SOAR Custom Lists over the REST API
+# ---------------------------------------------------------------------------
+# phantom.rules has no list API an app can rely on: add_to_list does not exist
+# (the playbook function is add_list) and get_list returns (success, message,
+# rows) and is a playbook API. Both wrap /rest/decided_list, so the app calls
+# that endpoint itself, like the Splunk SOAR app does. Inside an app process
+# BaseConnector authenticates requests to its own SOAR URL automatically.
+
+class CustomListError(ValueError):
+    """A Custom List could not be read or written; the text goes into the action message."""
+
+
+class SoarCustomList:
+    """Read rows from and append rows to one SOAR Custom List (/rest/decided_list)."""
+
+    # Tests replace this with a fake: transport(method, url, body, timeout_s) -> (status, dict).
+    transport = None
+
+    def __init__(self, connector, name: str, timeout_s: float = 30.0) -> None:
+        self.connector = connector
+        self.name = name
+        self.timeout_s = timeout_s
+
+    def _base_url(self) -> str:
+        get_base = getattr(self.connector, "get_phantom_base_url", None)
+        base = get_base() if callable(get_base) else ""
+        if not base and self.transport is not None:
+            base = "https://soar.invalid/"  # tests only: a fake transport without a platform
+        return base or ""
+
+    def available(self) -> bool:
+        """False off-platform (no SOAR base URL and no fake transport)."""
+        return bool(self._base_url())
+
+    def _url(self) -> str:
+        from urllib.parse import quote
+        return f"{self._base_url().rstrip('/')}/rest/decided_list/{quote(self.name, safe='')}"
+
+    def _call(self, method: str, body: dict | None = None) -> dict:
+        transport = self.transport or _requests_transport
+        try:
+            status, data = transport(method, self._url(), body, self.timeout_s)
+        except Exception as e:
+            raise CustomListError(f"{type(e).__name__}: {e} (Custom List '{self.name}')") from e
+        data = data if isinstance(data, dict) else {}
+        if status == 404:
+            raise CustomListError(
+                f"Custom List '{self.name}' does not exist (HTTP 404); create it under Home -> Custom Lists.")
+        if status != 200 or data.get("failed"):
+            raise CustomListError(
+                f"Custom List '{self.name}': HTTP {status}: {data.get('message', 'no message')}")
+        return data
+
+    def rows(self) -> list:
+        content = self._call("get").get("content") or []
+        return [row for row in content if isinstance(row, (list, dict))]
+
+    def append(self, row: list[str]) -> None:
+        self._call("post", {"append_rows": [row]})
+
+
+def _requests_transport(method: str, url: str, body: dict | None, timeout_s: float):
+    import requests  # bundled wheel; imported lazily so the module loads without it
+    # The URL is SOAR's own base URL from the platform, never user input; on-prem
+    # SOAR serves it with its own certificate, as the Splunk SOAR app assumes too.
+    response = requests.request(method, url, json=body, timeout=timeout_s, verify=False)  # nosec B501
+    try:
+        data = response.json()
+    except ValueError:
+        data = {"message": response.text[:200]}
+    return response.status_code, data
+
+
+def _rows_by_id(rows: list) -> dict[str, dict]:
+    """Rows [id, json, ...] or {"agent_id": ...} to {id: config}; empty and broken rows are
+    skipped, and a later row for the same id wins (save appends, it never rewrites)."""
+    found: dict[str, dict] = {}
+    for row in rows:
+        match row:
+            case [str() as id_, str() as config_str, *_] if id_.strip():
+                try:
+                    cfg = json.loads(config_str)
+                except ValueError:
+                    continue
+                if isinstance(cfg, dict):
+                    found[id_] = cfg
+            case {"agent_id": str() as id_, **rest} if id_.strip():
+                found[id_] = rest
+    return found
+
+
+# ---------------------------------------------------------------------------
 # Agent Definition Store
 # ---------------------------------------------------------------------------
 
@@ -1233,25 +1325,22 @@ class AgentDefinitionStore:
     def __init__(self, connector, list_name: str) -> None:
         self.connector = connector
         self.list_name = list_name
+        self.last_error = ""  # text of the last failed save, for the action message
+        self._list = SoarCustomList(connector, list_name)
 
     def load(self, agent_id: str) -> dict:
-        try:
-            import phantom.rules as ph_rules
-            rows = ph_rules.get_list(list_name=self.list_name)
-            if not rows:
-                raise ValueError(f"Custom List '{self.list_name}' is empty or does not exist.")
-            for row in rows:
-                match row:
-                    case [id_, config_str, *_] if id_ == agent_id:
-                        return json.loads(config_str)
-                    case {"agent_id": id_, **rest} if id_ == agent_id:
-                        return {"agent_id": id_} | rest
-            raise ValueError(f"Agent '{agent_id}' not found in '{self.list_name}'.")
-        except ImportError:
+        """Definition of agent_id; raises ValueError (CustomListError) with a readable reason."""
+        if not self._list.available():
             return self._load_fallback(agent_id)
+        agents = _rows_by_id(self._list.rows())
+        if not agents:
+            raise ValueError(f"Custom List '{self.list_name}' is empty; create the agent with 'create agent'.")
+        if agent_id not in agents:
+            raise ValueError(f"Agent '{agent_id}' not found in '{self.list_name}'.")
+        return {"agent_id": agent_id} | agents[agent_id] | {"agent_id": agent_id}
 
     def _load_fallback(self, agent_id: str) -> dict:
-        self.connector.save_progress(f"[DEV] phantom.rules not available, fallback for: {agent_id}")
+        self.connector.save_progress(f"[DEV] SOAR REST not available, fallback for: {agent_id}")
         return {
             "agent_id":      agent_id,
             "provider":      "anthropic",
@@ -1263,32 +1352,25 @@ class AgentDefinitionStore:
         }
 
     def save(self, agent_id: str, config: dict) -> bool:
+        if not self._list.available():
+            self.last_error = "SOAR REST not available (off-platform)"
+            return False
         try:
-            import phantom.rules as ph_rules
-            ph_rules.add_to_list(
-                list_name=self.list_name,
-                values=[[agent_id, json.dumps(config | {"agent_id": agent_id})]]
-            )
+            self._list.append([agent_id, json.dumps(config | {"agent_id": agent_id})])
+            self.last_error = ""
             return True
         except Exception as e:
-            self.connector.save_progress(f"Failed to save agent: {e}")
+            # SOAR keeps only the final action message, so the caller puts this text there.
+            self.last_error = str(e) if isinstance(e, CustomListError) else (
+                f"{type(e).__name__}: {e} (Custom List '{self.list_name}')")
+            self.connector.save_progress(f"Failed to save agent: {self.last_error}")
             return False
 
     def list_all(self) -> list[dict]:
-        try:
-            import phantom.rules as ph_rules
-            rows = ph_rules.get_list(list_name=self.list_name) or []
-            agents = []
-            for row in rows:
-                if isinstance(row, list) and len(row) >= 2:
-                    try:
-                        cfg = json.loads(row[1])
-                        agents.append(cfg | {"agent_id": row[0]})
-                    except Exception:
-                        pass
-            return agents
-        except ImportError:
+        """Every agent once (latest row wins); raises CustomListError when the list cannot be read."""
+        if not self._list.available():
             return []
+        return [cfg | {"agent_id": id_} for id_, cfg in _rows_by_id(self._list.rows()).items()]
 
 
 # ---------------------------------------------------------------------------
@@ -1310,21 +1392,20 @@ class SkillStore:
     def __init__(self, connector, list_name: str | None = None) -> None:
         self.connector = connector
         self.list_name = list_name or self.DEFAULT_LIST_NAME
+        self.last_error = ""
+        self._list = SoarCustomList(connector, self.list_name)
+        self._cache: dict[str, dict] | None = None
+
+    def _skills(self) -> dict[str, dict]:
+        if self._cache is None:
+            self._cache = _rows_by_id(self._list.rows()) if self._list.available() else {}
+        return self._cache
 
     def load(self, skill_id: str) -> dict:
-        try:
-            import phantom.rules as ph_rules
-            rows = ph_rules.get_list(list_name=self.list_name) or []
-            for row in rows:
-                if isinstance(row, list) and len(row) >= 2 and row[0] == skill_id:
-                    try:
-                        return json.loads(row[1])
-                    except Exception:
-                        return {}
+        if not self._list.available():
+            self.connector.save_progress(f"[DEV] SOAR REST not available, skill '{skill_id}' skipped.")
             return {}
-        except ImportError:
-            self.connector.save_progress(f"[DEV] phantom.rules not available, skill '{skill_id}' skipped.")
-            return {}
+        return dict(self._skills().get(skill_id, {}))
 
     def load_many(self, skill_ids: list[str]) -> list[dict]:
         skills = []
@@ -1336,31 +1417,22 @@ class SkillStore:
         return skills
 
     def save(self, skill_id: str, config: dict) -> bool:
+        if not self._list.available():
+            self.last_error = "SOAR REST not available (off-platform)"
+            return False
         try:
-            import phantom.rules as ph_rules
-            ph_rules.add_to_list(
-                list_name=self.list_name,
-                values=[[skill_id, json.dumps(config)]]
-            )
+            self._list.append([skill_id, json.dumps(config)])
+            self.last_error = ""
+            self._cache = None
             return True
         except Exception as e:
-            self.connector.save_progress(f"Failed to save skill '{skill_id}': {e}")
+            self.last_error = str(e) if isinstance(e, CustomListError) else (
+                f"{type(e).__name__}: {e} (Custom List '{self.list_name}')")
+            self.connector.save_progress(f"Failed to save skill '{skill_id}': {self.last_error}")
             return False
 
     def list_all(self) -> list[dict]:
-        try:
-            import phantom.rules as ph_rules
-            rows = ph_rules.get_list(list_name=self.list_name) or []
-            skills = []
-            for row in rows:
-                if isinstance(row, list) and len(row) >= 2:
-                    try:
-                        skills.append(json.loads(row[1]) | {"skill_id": row[0]})
-                    except Exception:
-                        pass
-            return skills
-        except ImportError:
-            return []
+        return [cfg | {"skill_id": id_} for id_, cfg in self._skills().items()]
 
     @staticmethod
     def build_injection(skills: list[dict]) -> str:

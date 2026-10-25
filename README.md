@@ -161,6 +161,8 @@ makes no policy request: it writes the artifact `agent_action_gap` (CEF `lauf_id
 ### `create agent`
 Creates or updates an agent in the `agent_definitions` Custom List.
 
+**Prerequisite:** the Custom Lists `agent_definitions` and `agent_skills` (names from the asset fields `agent_list_name` and `skill_list_name`) must exist; create them once under **Home → Custom Lists**. The app reads and writes them over the SOAR REST API (`/rest/decided_list`) as the user who runs the action. Saving appends a row; for the same `agent_id` the latest row wins. If saving fails, the action message names the list and the cause.
+
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `agent_id` | string | Yes | Unique name |
@@ -170,6 +172,7 @@ Creates or updates an agent in the `agent_definitions` Custom List.
 | `allowed_tools` | string | No | Comma-separated tools |
 | `max_steps` | numeric | No | Max loop steps |
 | `skills` | string | No | Comma-separated skill IDs |
+| `agent_role` | string | No | `triage`, `enrichment`, `response` or `generic` (default); groups the Agent Precision panel in AI-SOC Telemetry |
 
 Available tools: `splunk_search`, `add_note`, `update_severity`, `get_container_info`, `run_sub_agent`
 
@@ -570,3 +573,5 @@ Unit and integration tests run with `uv` and the bundled wheels (see the command
 | 1.8.1 | 2026-10-23 | Fix: Policy Manager `health()` reads TOML policies (before: every `.toml` policy was reported as "not valid JSON" and `test connectivity` failed); an undeterminable halt state (service unreachable, halt file missing/unreadable) is reported as unhealthy with its cause and a hint to create `halt.json`, a deliberate halt stays healthy + HALTED. Found in the 4.1b spike against `policy_manager` 0.5.0 |
 | 1.9.0 | 2026-10-23 | Bundled `policy_manager` 0.5.1 (built from PolicyManager tag `rp/p5-3`, commit `fbea672`; E16: tag instead of PolicyManager `main`): `policy_mode = service`, action catalogue, halt field `bekannt` and the sequence register work with the shipped package; `sequences_path` passed to the embedded client; `health()` decides "undetermined" from `bekannt` only; wheel integration tests follow the 0.5.x engine (tool-name mapping, `stufe`/`domaene`, judgement W14, catalogue, sequences, audit); README operator checklist for the Policy Manager (4.1b) |
 | 1.9.1 | 2026-10-24 | Asset field `local_llm_model` (default `llama3`): the model `test connectivity` asks the local server for, and the fallback model for provider `local` when the agent definition names none; `tools/build_app.py` builds the installable tar with directory entries (B17) |
+| 1.9.2 | 2026-10-25 | `create agent` and `create skill` put the exception from saving to the Custom List into the action message (SOAR keeps no progress lines); README names both Custom Lists as a prerequisite and documents `agent_role` |
+| 1.10.0 | 2026-10-25 | Agent and skill definitions over the SOAR REST API (`/rest/decided_list`) instead of `phantom.rules`, which has no `add_to_list` and whose `get_list` returns a tuple: `create agent`, `create skill`, `list agents`, `list skills` and `run agent` work on SOAR 8.7; latest row per id wins, empty rows skipped; a missing list or a rejected call is named in the action message |

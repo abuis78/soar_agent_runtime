@@ -511,7 +511,10 @@ class SoarAgentRuntimeConnector(BaseConnector):
         if skill_ids:
             self.save_progress(f"Loading skills: {skill_ids}")
             skill_store = SkillStore(self, self._skill_list_name)
-            loaded_skills = skill_store.load_many(skill_ids)
+            try:
+                loaded_skills = skill_store.load_many(skill_ids)
+            except ValueError as e:  # the agent asks for skills, so an unreadable list is fatal
+                return action_result.set_status(phantom.APP_ERROR, str(e))
             skill_injection = SkillStore.build_injection(loaded_skills)
             # RT-P04 (E3): a skill's output_schema template is a required
             # top-level key set for FINAL_ANSWER.
@@ -620,7 +623,9 @@ class SoarAgentRuntimeConnector(BaseConnector):
 
         store = AgentDefinitionStore(self, self._agent_list_name)
         if not store.save(agent_id, config):
-            return action_result.set_status(phantom.APP_ERROR, f"Failed to save agent '{agent_id}'.")
+            detail = getattr(store, "last_error", "")
+            return action_result.set_status(
+                phantom.APP_ERROR, f"Failed to save agent '{agent_id}'" + (f": {detail}" if detail else "."))
 
         action_result.add_data({
             "agent_id": agent_id, "status": "created", "skills": skills, "agent_role": agent_role
@@ -635,7 +640,10 @@ class SoarAgentRuntimeConnector(BaseConnector):
     def _handle_list_agents(self, param):
         action_result = self.add_action_result(ActionResult(dict(param)))
         store = AgentDefinitionStore(self, self._agent_list_name)
-        agents = store.list_all()
+        try:
+            agents = store.list_all()
+        except ValueError as e:  # CustomListError: list missing or unreadable
+            return action_result.set_status(phantom.APP_ERROR, str(e))
         if not agents:
             return action_result.set_status(phantom.APP_SUCCESS, "No agents found.")
         for agent in agents:
@@ -681,7 +689,9 @@ class SoarAgentRuntimeConnector(BaseConnector):
 
         skill_store = SkillStore(self, self._skill_list_name)
         if not skill_store.save(skill_id, config):
-            return action_result.set_status(phantom.APP_ERROR, f"Failed to save skill '{skill_id}'.")
+            detail = getattr(skill_store, "last_error", "")
+            return action_result.set_status(
+                phantom.APP_ERROR, f"Failed to save skill '{skill_id}'" + (f": {detail}" if detail else "."))
 
         action_result.add_data({"skill_id": skill_id, "status": "created"})
         action_result.update_summary({"skill_id": skill_id})
@@ -694,7 +704,10 @@ class SoarAgentRuntimeConnector(BaseConnector):
     def _handle_list_skills(self, param):
         action_result = self.add_action_result(ActionResult(dict(param)))
         skill_store = SkillStore(self, self._skill_list_name)
-        skills = skill_store.list_all()
+        try:
+            skills = skill_store.list_all()
+        except ValueError as e:
+            return action_result.set_status(phantom.APP_ERROR, str(e))
         if not skills:
             return action_result.set_status(phantom.APP_SUCCESS, "No skills found.")
         for skill in skills:
