@@ -1163,9 +1163,9 @@ def test_container_info_reads_container_and_five_artifacts_over_rest(monkeypatch
     })
     out = json.loads(tools._tool_get_container_info({}))
     assert out["container"]["name"] == "Phishing report"
-    assert (out["artifact_count"], out["artifacts_shown"]) == (12, 5)
+    assert (out["artifact_count"], out["artifacts_shown"], out["artifacts_total"]) == (5, 5, 12)
     assert calls[0].endswith("/rest/container/185")
-    assert calls[1].endswith("/rest/container/185/artifacts?sort=id&order=asc&page_size=5")
+    assert calls[1].endswith("/rest/container/185/artifacts?sort=id&order=asc&page_size=200")
 
 
 def test_container_info_names_the_rest_error(monkeypatch):
@@ -1506,3 +1506,21 @@ def test_model_check_counts_actions(monkeypatch, answer, status):
     rows = []
     c._self_test_model(lambda tool, st, detail: rows.append((tool, st)))
     assert rows == [("model format", status)]
+
+
+
+# --- E2E finding E-7 (2026-10-25): own artifacts are not case data ---------------------------
+
+def test_container_info_hides_the_runtimes_own_artifacts(monkeypatch):
+    old = [{"id": 648 + i, "label": "agent_audit", "cef": {"gedanke": "updated to medium", "parameter": "CVE-2024-3400"}}
+           for i in range(30)]
+    case = [{"id": 1, "label": "events", "cef": {"requestURL": "http://update-check.example-demo.org/setup.exe"}}]
+    others = [{"id": 900, "label": "agent_action_proposal"}, {"id": 901, "label": "agent_action_gap"}]
+    tools, _ = _container_tools(monkeypatch, {
+        "container/212/artifacts": (200, {"count": 33, "data": old + case + others}),
+        "container/212": (200, {"id": 212, "name": "Test", "severity": "medium"}),
+    }, container_id=212)
+    out = json.loads(tools._tool_get_container_info({}))
+    assert out["artifacts"] == case
+    assert (out["artifact_count"], out["runtime_artifacts_hidden"], out["artifacts_total"]) == (1, 32, 33)
+    assert "updated to medium" not in json.dumps(out)

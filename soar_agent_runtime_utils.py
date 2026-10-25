@@ -1212,6 +1212,8 @@ class ToolRegistry:
                 "an analyst acts manually. Continue with FINAL_ANSWER.")
 
     MAX_ARTIFACTS_SHOWN = 5
+    ARTIFACT_SCAN_LIMIT = 200   # artifacts read per call to find the case's own (E-7)
+    RUNTIME_ARTIFACT_LABELS = frozenset({"agent_audit", "agent_action_proposal", "agent_action_gap"})
 
     def _tool_get_container_info(self, params: dict) -> str:
         # RT-L08: only the container of this run. A different id in PARAMS is
@@ -1229,14 +1231,21 @@ class ToolRegistry:
                 return "Failed to get container info: SOAR REST not available (off-platform)"
             container = rest.get(f"container/{int(self.container_id)}")
             page = rest.get(f"container/{int(self.container_id)}/artifacts",
-                            {"sort": "id", "order": "asc", "page_size": self.MAX_ARTIFACTS_SHOWN})
-            shown = list(page.get("data") or [])[:self.MAX_ARTIFACTS_SHOWN]
+                            {"sort": "id", "order": "asc", "page_size": self.ARTIFACT_SCAN_LIMIT})
+            # E2E finding E-7 (container 212): the first artifacts were this runtime's own audit
+            # records of earlier runs, so the model copied old thoughts and parameters ("severity
+            # medium", an old CVE) into a new run. Case data excludes the runtime's own artifacts.
+            fetched = list(page.get("data") or [])
+            case_artifacts = [a for a in fetched if a.get("label") not in self.RUNTIME_ARTIFACT_LABELS]
+            shown = case_artifacts[:self.MAX_ARTIFACTS_SHOWN]
             # Issue #2 sanitization and the size cap (RT-B04) are applied
             # centrally at the LLM boundary; the artifact cut is marked here.
             return json.dumps(
                 {"container": container,
-                 "artifact_count": int(page.get("count", len(shown))),
+                 "artifact_count": len(case_artifacts),
                  "artifacts_shown": len(shown),
+                 "runtime_artifacts_hidden": len(fetched) - len(case_artifacts),
+                 "artifacts_total": int(page.get("count", len(fetched))),   # all labels, as SOAR counts
                  "artifacts": shown},
                 indent=2, default=str
             )
@@ -1597,6 +1606,24 @@ Container ID: {container_id}
 """
 
 
+_MARKDOWN_ACTION_RE = re.compile(r"^\s*[#*>\-\s]*\**\s*action\s*\**\s*:\s*\**\s*([A-Za-z_][\w]*)",
+                                 re.IGNORECASE | re.MULTILINE)
+
+
+def _format_reminder(response_text: str) -> str:
+    """Correction after a turn without a parsable ACTION/FINAL_ANSWER (E2E finding E-7).
+    The parser stays strict (RT-P05): Markdown is not accepted, but named precisely, and the
+    exact form is shown with the tool the model seems to want."""
+    text = response_text or ""
+    tool = (m.group(1) if (m := _MARKDOWN_ACTION_RE.search(text)) else "") or "<tool_name>"
+    markdown = "```" in text or re.search(r"^\s*#{1,6}\s", text, re.MULTILINE) is not None
+    lead = ("Your response used Markdown (headings or code blocks); nothing was executed. "
+            if markdown else "No valid ACTION or FINAL_ANSWER; nothing was executed. ")
+    return (lead + "Do not use Markdown. Answer in plain lines, exactly one of:\n"
+            f"THOUGHT: <your reasoning>\nACTION: {tool}\nPARAMS: {{...JSON object on one line...}}\n"
+            "or\nTHOUGHT: <your reasoning>\nFINAL_ANSWER: <your answer>")
+
+
 def _audit_phase(observation: str | None, halted: bool) -> str:
     """Audit phase from what really happened (E2E finding E-4, 2026-10-25): a call refused
     before or by a gate was logged as "erledigt" although nothing ran."""
@@ -1927,7 +1954,7 @@ class ReActLoop:
                     return self._audit_abort(step_entry, steps_taken)
                 messages += [
                     {"role": "assistant", "content": response_text},
-                    {"role": "user",      "content": "OBSERVATION: No valid ACTION or FINAL_ANSWER. Follow the format exactly."}
+                    {"role": "user",      "content": f"OBSERVATION: {_format_reminder(response_text)}"}
                 ]
         else:
             final_answer = f"Max steps ({self.max_steps}) reached without FINAL_ANSWER."
