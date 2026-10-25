@@ -15,6 +15,8 @@ import types
 
 import pytest
 
+import soar_agent_runtime_utils as utils_module
+
 from soar_agent_runtime_utils import (
     AGENT_ROLES,
     DEFAULT_AGENT_ROLE,
@@ -54,9 +56,6 @@ def fake_phantom(monkeypatch):
     calls = {"severity": [], "notes": []}
 
     rules = types.ModuleType("phantom.rules")
-    rules.update_container = lambda container=None, severity=None: calls["severity"].append(
-        (container, severity)
-    )
     rules.add_note = lambda **kw: calls["notes"].append(kw)
     rules.run_query = lambda **kw: []
     rules.get_container = lambda cid: {"id": cid}
@@ -66,6 +65,12 @@ def fake_phantom(monkeypatch):
     pkg.rules = rules
     monkeypatch.setitem(sys.modules, "phantom", pkg)
     monkeypatch.setitem(sys.modules, "phantom.rules", rules)
+
+    def rest(method, url, body, timeout_s):  # update_severity over /rest/container (1.10.2)
+        calls["severity"].append((int(url.rsplit("/", 1)[1]), body["severity"]))
+        return 200, {"success": True}
+
+    monkeypatch.setattr(utils_module.SoarRest, "transport", staticmethod(rest))
     return calls
 
 
@@ -154,10 +159,10 @@ def test_blocked_tool_emits_blocked_outcome(fake_phantom):
 
 
 def test_platform_failure_emits_failed_outcome(fake_phantom, monkeypatch):
-    def blow_up(**kwargs):
+    def blow_up(method, url, body, timeout_s):
         raise RuntimeError("SOAR down")
 
-    monkeypatch.setattr(sys.modules["phantom.rules"], "update_container", blow_up)
+    monkeypatch.setattr(utils_module.SoarRest, "transport", staticmethod(blow_up))
     tel = FakeTelemetry()
 
     result = build_registry(tel).execute("update_severity", {"severity": "high"})

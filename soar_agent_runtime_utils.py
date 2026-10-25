@@ -1091,8 +1091,12 @@ class ToolRegistry:
         if severity not in valid:
             return f"ERROR: severity must be one of {valid}"
         try:
-            import phantom.rules as ph_rules
-            ph_rules.update_container(container=self.container_id, severity=severity)
+            # Over REST (1.10.2): phantom.rules has no update_container for apps, and the
+            # playbook function takes (container, data) and only wraps this POST.
+            rest = SoarRest(self.connector)
+            if not rest.available():
+                return "Failed to update severity: SOAR REST not available (off-platform)"
+            rest.post(f"container/{int(self.container_id)}", {"severity": severity})
             return f"Container severity updated to: {severity}"
         except Exception as e:
             return f"Failed to update severity: {_scrub_exc(e)}"
@@ -1194,15 +1198,20 @@ class ToolRegistry:
                 return (f"ERROR: get_container_info reads only the container of this run "
                         f"({self.container_id}); other cases are read via broker_invoke templates.")
         try:
-            import phantom.rules as ph_rules
-            container = ph_rules.get_container(self.container_id)
-            artifacts = list(ph_rules.get_artifacts(container_id=self.container_id) or [])
-            shown = artifacts[:self.MAX_ARTIFACTS_SHOWN]
+            # Over REST, like the Splunk SOAR app: phantom.rules.get_artifacts and
+            # get_container need a playbook context (1.10.1).
+            rest = SoarRest(self.connector)
+            if not rest.available():
+                return "Failed to get container info: SOAR REST not available (off-platform)"
+            container = rest.get(f"container/{int(self.container_id)}")
+            page = rest.get(f"container/{int(self.container_id)}/artifacts",
+                            {"sort": "id", "order": "asc", "page_size": self.MAX_ARTIFACTS_SHOWN})
+            shown = list(page.get("data") or [])[:self.MAX_ARTIFACTS_SHOWN]
             # Issue #2 sanitization and the size cap (RT-B04) are applied
             # centrally at the LLM boundary; the artifact cut is marked here.
             return json.dumps(
                 {"container": container,
-                 "artifact_count": len(artifacts),
+                 "artifact_count": int(page.get("count", len(shown))),
                  "artifacts_shown": len(shown),
                  "artifacts": shown},
                 indent=2, default=str
@@ -1236,15 +1245,20 @@ class CustomListError(ValueError):
     """A Custom List could not be read or written; the text goes into the action message."""
 
 
-class SoarCustomList:
-    """Read rows from and append rows to one SOAR Custom List (/rest/decided_list)."""
+class SoarRestError(ValueError):
+    """A call to the SOAR REST API failed; the text goes into the observation or message."""
+
+
+class SoarRest:
+    """Calls to the app's own SOAR REST API. Playbook functions in phantom.rules
+    (get_list, get_container, get_artifacts) need a playbook context an app does
+    not have, so the app reads over REST; BaseConnector adds the user session."""
 
     # Tests replace this with a fake: transport(method, url, body, timeout_s) -> (status, dict).
     transport = None
 
-    def __init__(self, connector, name: str, timeout_s: float = 30.0) -> None:
+    def __init__(self, connector, timeout_s: float = 30.0) -> None:
         self.connector = connector
-        self.name = name
         self.timeout_s = timeout_s
 
     def _base_url(self) -> str:
@@ -1257,6 +1271,35 @@ class SoarCustomList:
     def available(self) -> bool:
         """False off-platform (no SOAR base URL and no fake transport)."""
         return bool(self._base_url())
+
+    def get(self, path: str, params: dict | None = None) -> dict:
+        """GET /rest/<path>; raises SoarRestError naming the path on any failure."""
+        return self._request("get", path, params=params)
+
+    def post(self, path: str, body: dict) -> dict:
+        """POST /rest/<path> with a JSON body; raises SoarRestError naming the path on any failure."""
+        return self._request("post", path, body=body)
+
+    def _request(self, method: str, path: str, params: dict | None = None, body: dict | None = None) -> dict:
+        from urllib.parse import urlencode
+        url = f"{self._base_url().rstrip('/')}/rest/{path}" + (f"?{urlencode(params)}" if params else "")
+        label = f"{method.upper()} /rest/{path}"
+        try:
+            status, data = (self.transport or _requests_transport)(method, url, body, self.timeout_s)
+        except Exception as e:
+            raise SoarRestError(f"{type(e).__name__}: {e} ({label})") from e
+        data = data if isinstance(data, dict) else {}
+        if status != 200 or data.get("failed"):
+            raise SoarRestError(f"{label}: HTTP {status}: {data.get('message', 'no message')}")
+        return data
+
+
+class SoarCustomList(SoarRest):
+    """Read rows from and append rows to one SOAR Custom List (/rest/decided_list)."""
+
+    def __init__(self, connector, name: str, timeout_s: float = 30.0) -> None:
+        super().__init__(connector, timeout_s)
+        self.name = name
 
     def _url(self) -> str:
         from urllib.parse import quote

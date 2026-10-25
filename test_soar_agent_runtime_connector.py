@@ -415,7 +415,7 @@ def test_app_json_declares_broker_fields_in_order():
     with open("soar_agent_runtime.json") as f:
         app = json.load(f)
     cfg = app["configuration"]
-    assert app["app_version"] == "1.10.0"
+    assert app["app_version"] == "1.10.2"
     assert [cfg[k]["order"] for k in ("broker_url", "broker_timeout_s", "broker_client_cert", "broker_client_key", "broker_ca")] == [24, 25, 26, 27, 28]
     assert cfg["broker_client_key"]["data_type"] == "string"  # a path, never the key material
     assert len({f["order"] for f in cfg.values()}) == len(cfg)  # orders unique
@@ -1035,7 +1035,7 @@ class _FakeSoarLists:
 @pytest.fixture
 def soar_lists(monkeypatch):
     fake = _FakeSoarLists({"agent_definitions": [["", ""], ["", ""]], "agent_skills": [["", ""]]})
-    monkeypatch.setattr(utils_module.SoarCustomList, "transport", staticmethod(fake))
+    monkeypatch.setattr(utils_module.SoarRest, "transport", staticmethod(fake))
     return fake
 
 
@@ -1067,7 +1067,7 @@ def test_run_agent_loads_the_definition_over_rest(soar_lists):
 
 
 def test_missing_list_names_the_list_and_the_fix(monkeypatch):
-    monkeypatch.setattr(utils_module.SoarCustomList, "transport", staticmethod(_FakeSoarLists({})))
+    monkeypatch.setattr(utils_module.SoarRest, "transport", staticmethod(_FakeSoarLists({})))
     c = make_connector()
     assert c._handle_create_agent({"agent_id": "a1"}) is False
     assert c.action_results[-1].message == ("Failed to save agent 'a1': Custom List 'agent_definitions' does not "
@@ -1077,7 +1077,7 @@ def test_missing_list_names_the_list_and_the_fix(monkeypatch):
 
 
 def test_rest_rejection_reaches_the_message(monkeypatch):
-    monkeypatch.setattr(utils_module.SoarCustomList, "transport", staticmethod(_FakeSoarLists({}, status=401)))
+    monkeypatch.setattr(utils_module.SoarRest, "transport", staticmethod(_FakeSoarLists({}, status=401)))
     c = make_connector()
     c._handle_create_skill({"skill_id": "s1", "inject": "be brief"})
     assert c.action_results[-1].message == ("Failed to save skill 's1': Custom List 'agent_skills': "
@@ -1094,7 +1094,7 @@ def test_transport_exception_is_reported_not_raised(monkeypatch):
     def boom(method, url, body, timeout_s):
         raise ConnectionError("refused")
 
-    monkeypatch.setattr(utils_module.SoarCustomList, "transport", staticmethod(boom))
+    monkeypatch.setattr(utils_module.SoarRest, "transport", staticmethod(boom))
     c = make_connector()
     c._handle_create_agent({"agent_id": "a1"})
     assert c.action_results[-1].message == ("Failed to save agent 'a1': ConnectionError: refused "
@@ -1122,7 +1122,7 @@ def test_create_agent_failure_without_detail_keeps_the_old_message(monkeypatch):
 
 
 def test_failed_save_message_carries_no_asset_secret(monkeypatch):
-    monkeypatch.setattr(utils_module.SoarCustomList, "transport", staticmethod(_FakeSoarLists({}, status=401)))
+    monkeypatch.setattr(utils_module.SoarRest, "transport", staticmethod(_FakeSoarLists({}, status=401)))
     c = make_connector(anthropic_api_key="sk-secret-123", local_llm_api_key="ollama-secret")
     c._handle_create_agent({"agent_id": "a1"})
     msg = c.action_results[-1].message
@@ -1133,3 +1133,84 @@ def test_list_url_quotes_the_name():
     lst = utils_module.SoarCustomList(types.SimpleNamespace(get_phantom_base_url=lambda: "https://127.0.0.1/"),
                                       "my list/x")
     assert lst._url() == "https://127.0.0.1/rest/decided_list/my%20list%2Fx"
+
+
+# --- get_container_info over /rest/container (1.10.1) ---------------------------------
+
+def _container_tools(monkeypatch, responses, container_id=185):
+    calls = []
+
+    def fake(method, url, body, timeout_s):
+        calls.append(url)
+        path = url.split("/rest/", 1)[1]
+        for prefix, reply in responses.items():
+            if path.startswith(prefix):
+                return reply
+        return 404, {"failed": True, "message": "not found"}
+
+    monkeypatch.setattr(utils_module.SoarRest, "transport", staticmethod(fake))
+    tools = utils_module.ToolRegistry(make_connector(), container_id, ["get_container_info"])
+    return tools, calls
+
+
+def test_container_info_reads_container_and_five_artifacts_over_rest(monkeypatch):
+    arts = [{"id": i, "name": f"a{i}", "cef": {"sourceAddress": f"10.0.0.{i}"}} for i in range(5)]
+    tools, calls = _container_tools(monkeypatch, {
+        "container/185/artifacts": (200, {"count": 12, "data": arts}),
+        "container/185": (200, {"id": 185, "name": "Phishing report", "severity": "medium"}),
+    })
+    out = json.loads(tools._tool_get_container_info({}))
+    assert out["container"]["name"] == "Phishing report"
+    assert (out["artifact_count"], out["artifacts_shown"]) == (12, 5)
+    assert calls[0].endswith("/rest/container/185")
+    assert calls[1].endswith("/rest/container/185/artifacts?sort=id&order=asc&page_size=5")
+
+
+def test_container_info_names_the_rest_error(monkeypatch):
+    tools, _ = _container_tools(monkeypatch, {"container/185": (401, {"failed": True, "message": "Authentication failed"})})
+    assert tools._tool_get_container_info({}) == (
+        "Failed to get container info: SoarRestError: GET /rest/container/185: HTTP 401: Authentication failed")
+
+
+def test_container_info_still_refuses_other_cases_without_a_call(monkeypatch):
+    tools, calls = _container_tools(monkeypatch, {})
+    assert tools._tool_get_container_info({"container_id": 999}).startswith("ERROR: get_container_info reads only")
+    assert calls == []
+
+
+def test_container_info_off_platform_says_so():
+    tools = utils_module.ToolRegistry(make_connector(), 185, ["get_container_info"])
+    assert tools._tool_get_container_info({}) == (
+        "Failed to get container info: SOAR REST not available (off-platform)")
+
+
+# --- update_severity over POST /rest/container (1.10.2) --------------------------------
+
+def _severity_tools(monkeypatch, reply=(200, {"success": True})):
+    calls = []
+
+    def fake(method, url, body, timeout_s):
+        calls.append((method, url.split("/rest/", 1)[1], body))
+        return reply
+
+    monkeypatch.setattr(utils_module.SoarRest, "transport", staticmethod(fake))
+    tools = utils_module.ToolRegistry(make_connector(), 185, ["update_severity"])
+    return tools, calls
+
+
+def test_update_severity_posts_only_the_severity(monkeypatch):
+    tools, calls = _severity_tools(monkeypatch)
+    assert tools._tool_update_severity({"severity": "High"}) == "Container severity updated to: high"
+    assert calls == [("post", "container/185", {"severity": "high"})]
+
+
+def test_update_severity_names_the_rest_error(monkeypatch):
+    tools, _ = _severity_tools(monkeypatch, (400, {"failed": True, "message": "Invalid severity critical"}))
+    assert tools._tool_update_severity({"severity": "critical"}) == (
+        "Failed to update severity: SoarRestError: POST /rest/container/185: HTTP 400: Invalid severity critical")
+
+
+def test_update_severity_rejects_unknown_values_without_a_call(monkeypatch):
+    tools, calls = _severity_tools(monkeypatch)
+    assert tools._tool_update_severity({"severity": "banana"}).startswith("ERROR: severity must be one of")
+    assert calls == []
