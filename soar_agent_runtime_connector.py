@@ -24,6 +24,7 @@ from soar_agent_runtime_utils import (
     compact_rows,
 )
 from soar_agent_runtime_audit import ArtifactAuditSink, NullAuditSink, definition_version
+from soar_agent_runtime_definitions import AGENTS_DIR, SKILLS_DIR, GitDefinitionStore
 from soar_agent_runtime_broker import BrokerClient, BrokerConfig, BrokerConfigError
 from soar_agent_runtime_policy import POLICY_MODES, build_policy_client
 
@@ -146,6 +147,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
         self._default_max_steps = 25
         self._agent_list_name = "agent_definitions"
         self._skill_list_name = "agent_skills"
+        self._definitions_path = ""    # RT-B02 (5.2): set = agents and skills from Git, not the Custom Lists
         self._default_provider = "anthropic"
         self._telemetry = None
         # RT-A01/RT-A03 (Umsetzungskonzept 1.3): Air-Gap profile and model bounds
@@ -181,6 +183,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
         self._default_max_steps = int(self._config.get("default_max_steps", 25))
         self._agent_list_name = self._config.get("agent_list_name", "agent_definitions")
         self._skill_list_name = self._config.get("skill_list_name", "agent_skills")
+        self._definitions_path = (self._config.get("definitions_path") or "").strip().rstrip("/")
         self._default_provider = self._config.get("default_provider", "anthropic")
         self._airgap_mode = bool(self._config.get("airgap_mode", False))
         self._llm_timeout_s = self._cfg_number("llm_timeout_s", 120.0, float)
@@ -389,6 +392,17 @@ class SoarAgentRuntimeConnector(BaseConnector):
     # Action: test connectivity
     # -----------------------------------------------------------------------
 
+    def _agent_store(self):
+        """RT-B02: agents from definitions_path when set, else from the Custom List."""
+        if self._definitions_path:
+            return GitDefinitionStore(self, self._definitions_path, AGENTS_DIR, known_tools=known_tool_names())
+        return AgentDefinitionStore(self, self._agent_list_name)
+
+    def _skill_store(self):
+        if self._definitions_path:
+            return GitDefinitionStore(self, self._definitions_path, SKILLS_DIR)
+        return SkillStore(self, self._skill_list_name)
+
     def _handle_test_connectivity(self, param):
         action_result = self.add_action_result(ActionResult(dict(param)))
         mode = "airgap" if self._airgap_mode else "normal"
@@ -429,6 +443,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
         broker_ok = self._test_broker(results)
         policy_ok = self._test_policy(results)
         self._test_custom_lists(results)  # informational only: never fails the test (contract B)
+        self._test_definitions(results)   # informational as well (RT-B02)
 
         if not any_success:
             return action_result.set_status(
@@ -479,6 +494,22 @@ class SoarAgentRuntimeConnector(BaseConnector):
                 results["custom_lists"] = f"ERROR: {e}"
                 return
         results["custom_lists"] = (f"MISSING: {', '.join(missing)} (run 'setup app')" if missing else "OK")
+
+    def _test_definitions(self, results: dict) -> None:
+        """Count the Git definitions and name every rejected file (RT-B02)."""
+        if not self._definitions_path:
+            results["definitions"] = "SKIPPED (no definitions_path, Custom Lists are used)"
+            return
+        counts, problems = [], []
+        for store in (self._agent_store(), self._skill_store()):
+            try:
+                counts.append(f"{len(store.list_all())} {store.kind}")
+            except ValueError as e:
+                results["definitions"] = f"ERROR: {e}"
+                return
+            problems += store.problems
+        status = f"OK: {', '.join(counts)} from {self._definitions_path}"
+        results["definitions"] = status + (f"; REJECTED: {'; '.join(problems)}" if problems else "")
 
     def _test_broker(self, results: dict) -> bool:
         """Fill results["broker"]; True only when a configured broker answers /health."""
@@ -551,7 +582,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
 
         # Load agent definition
         self.save_progress(f"Loading agent: {agent_id}")
-        store = AgentDefinitionStore(self, self._agent_list_name)
+        store = self._agent_store()
         try:
             agent_def = store.load(agent_id)
         except ValueError as e:
@@ -625,9 +656,10 @@ class SoarAgentRuntimeConnector(BaseConnector):
             skill_ids = [s.strip() for s in skill_ids.split(",") if s.strip()]
         skill_injection = ""
         required_keys: list[str] = []
+        loaded_skills: list[dict] = []
         if skill_ids:
             self.save_progress(f"Loading skills: {skill_ids}")
-            skill_store = SkillStore(self, self._skill_list_name)
+            skill_store = self._skill_store()
             try:
                 loaded_skills = skill_store.load_many(skill_ids)
             except ValueError as e:  # the agent asks for skills, so an unreadable list is fatal
@@ -662,7 +694,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
             extra_context=extra_context_str,
             skill_injection=skill_injection,
             audit=audit,
-            def_version=definition_version(agent_def),
+            def_version=self._definition_version(agent_def, loaded_skills),
             strict_schema=self._airgap_mode,
             required_keys=required_keys,
             max_observation_chars=self._max_observation_chars,
@@ -709,6 +741,13 @@ class SoarAgentRuntimeConnector(BaseConnector):
     # -----------------------------------------------------------------------
     # Action: create agent
     # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _definition_version(agent_def: dict, skills: list[dict]) -> str:
+        """Git definitions carry their own version (RT-B02); Custom-List ones get a hash."""
+        if not agent_def.get("definition_version"):
+            return definition_version(agent_def)
+        return ", ".join(d["definition_version"] for d in [agent_def, *skills] if d.get("definition_version"))
 
     def _handle_create_agent(self, param):
         action_result = self.add_action_result(ActionResult(dict(param)))
@@ -768,25 +807,26 @@ class SoarAgentRuntimeConnector(BaseConnector):
 
     def _handle_list_agents(self, param):
         action_result = self.add_action_result(ActionResult(dict(param)))
-        store = AgentDefinitionStore(self, self._agent_list_name)
+        store = self._agent_store()
         try:
             agents = store.list_all()
         except ValueError as e:  # CustomListError: list missing or unreadable
             return action_result.set_status(phantom.APP_ERROR, str(e))
         if not agents:
-            return action_result.set_status(phantom.APP_SUCCESS, "No agents found.")
+            return action_result.set_status(phantom.APP_SUCCESS, f"No agents found.{self._rejected_note(store)}")
         for agent in agents:
             action_result.add_data({
                 "agent_id": agent.get("agent_id", ""),
                 "provider": agent.get("provider", ""),
                 "model": agent.get("model", ""),
-                "allowed_tools": agent.get("allowed_tools", ""),
+                "allowed_tools": self._joined(agent.get("allowed_tools", "")),
                 "max_steps": agent.get("max_steps", self._default_max_steps),
                 "skills": ", ".join(agent.get("skills", [])),
                 "agent_role": agent.get("agent_role", DEFAULT_AGENT_ROLE)
             })
         action_result.update_summary({"total_agents": len(agents)})
-        return action_result.set_status(phantom.APP_SUCCESS, f"Found {len(agents)} agent(s).")
+        return action_result.set_status(
+            phantom.APP_SUCCESS, f"Found {len(agents)} agent(s).{self._rejected_note(store)}")
 
     # -----------------------------------------------------------------------
     # Action: create skill
@@ -832,13 +872,13 @@ class SoarAgentRuntimeConnector(BaseConnector):
 
     def _handle_list_skills(self, param):
         action_result = self.add_action_result(ActionResult(dict(param)))
-        skill_store = SkillStore(self, self._skill_list_name)
+        skill_store = self._skill_store()
         try:
             skills = skill_store.list_all()
         except ValueError as e:
             return action_result.set_status(phantom.APP_ERROR, str(e))
         if not skills:
-            return action_result.set_status(phantom.APP_SUCCESS, "No skills found.")
+            return action_result.set_status(phantom.APP_SUCCESS, f"No skills found.{self._rejected_note(skill_store)}")
         for skill in skills:
             action_result.add_data({
                 "skill_id": skill.get("skill_id", ""),
@@ -847,7 +887,18 @@ class SoarAgentRuntimeConnector(BaseConnector):
                 "has_output_schema": bool(skill.get("output_schema"))
             })
         action_result.update_summary({"total_skills": len(skills)})
-        return action_result.set_status(phantom.APP_SUCCESS, f"Found {len(skills)} skill(s).")
+        return action_result.set_status(
+            phantom.APP_SUCCESS, f"Found {len(skills)} skill(s).{self._rejected_note(skill_store)}")
+
+    @staticmethod
+    def _joined(value) -> str:
+        return ", ".join(value) if isinstance(value, list) else value
+
+    @staticmethod
+    def _rejected_note(store) -> str:
+        """Git definitions that failed validation (RT-B02); Custom-List stores have none."""
+        problems = getattr(store, "problems", [])
+        return f" Rejected files: {'; '.join(problems)}" if problems else ""
 
     # -----------------------------------------------------------------------
     # Action: list tools (contract H, 1.12.0)

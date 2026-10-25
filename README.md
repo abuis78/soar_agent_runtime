@@ -65,6 +65,7 @@ None.
 | `default_max_steps` | Max ReAct steps | `25` |
 | `agent_list_name` | Custom List for agents | `agent_definitions` |
 | `skill_list_name` | Custom List for skills | `agent_skills` |
+| `definitions_path` | Directory on the SOAR host with a checkout of [soar-agent-definitions](https://github.com/abuis78/soar-agent-definitions) (`agents/<agent_id>.toml`, `skills/<skill_id>.toml`). Set = `run agent`, `list agents` and `list skills` read the TOML files instead of the Custom Lists, and the audit field `definition_version` becomes `<id>@<version>#<sha256 prefix>` for the agent and each skill (RT-B02). `create agent` / `create skill` still write the Custom Lists until 5.3 | — |
 
 Policy Manager (effecting actions in `airgap_mode`, RT-W01/RT-W03; the air-gap and Tool Broker fields are documented with sub-change 5.5):
 
@@ -106,6 +107,8 @@ openai (gpt-4o-mini): SKIPPED (no credentials configured)
 gemini: SKIPPED
 local: SKIPPED
 ```
+
+With `definitions_path` set, the result also has `definitions`: the number of agents and skills read and every rejected file with its reason (informational, never fails the test).
 
 `test connectivity` always tries the `local` provider with `local_llm_model` (default `llama3`); set the field to a model the server actually serves (`ollama list`), otherwise the local check fails although the server is up. Cloud providers are tested only when a key is configured.
 
@@ -223,7 +226,7 @@ Creates missing Custom Lists, removes older duplicate agent and skill rows (the 
 ---
 
 ### `list agents` / `list skills`
-Returns all entries from the respective Custom List. No parameters.
+Returns all entries from the respective Custom List, or from `definitions_path` when it is set; invalid files are named in the message. No parameters.
 
 ---
 
@@ -618,3 +621,4 @@ Unit and integration tests run with `uv` and the bundled wheels (see the command
 | 1.12.2 | 2026-10-25 | Runtime artifacts (`agent_audit`, `agent_action_proposal`, `agent_action_gap`) carry severity `low`: SOAR silently raises a container to a higher artifact severity, and the default `medium` undid `update_severity` to `low` (E2E finding E-6). A container at `informational` would still be raised to `low` |
 | 1.12.3 | 2026-10-25 | `get_container_info` leaves out the runtime's own artifacts (`agent_audit`, proposals, gaps), which fed old thoughts and parameters back to the model (E2E finding E-7); new fields `runtime_artifacts_hidden`, `artifacts_total`. A turn in Markdown is still not executed, but the correction names it and shows the exact plain form |
 | 1.13.0 | 2026-10-25 | Phase 5.1 (RT-B01, AC-13): in `airgap_mode` the halt state is asked before every step; halted or unknown ends the run before the model is called, with audit phase `angehalten`. Airgap without a working policy gate now stops before step 1 (before: only effecting calls were denied) |
+| 1.14.0 | 2026-10-25 | Phase 5.2 (RT-B02): new asset field `definitions_path`; agents and skills come from TOML files in a checkout of the repository soar-agent-definitions, validated per file (id = file name, required fields, types, known tools). Audit `definition_version` = `<id>@<version>#<sha256 prefix>` for the agent and its skills. `test connectivity` reports the definitions. Empty field = Custom Lists as before |
