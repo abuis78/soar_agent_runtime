@@ -1006,34 +1006,105 @@ def test_app_json_declares_local_llm_model_next_to_the_local_url():
     assert [cfg[k]["order"] for k in keys] == list(range(len(keys)))  # contiguous after the insert
 
 
-# --- create agent / create skill: the save error reaches the final message ---------
+# --- Custom Lists over /rest/decided_list (1.10.0): no phantom.rules list API in apps ---
 
-class _FailingRules(types.ModuleType):
-    def add_to_list(self, list_name, values):
-        raise RuntimeError("list write not permitted")
+import soar_agent_runtime_utils as utils_module  # noqa: E402
+
+
+class _FakeSoarLists:
+    """In-memory /rest/decided_list: {name: rows}; records every call."""
+
+    def __init__(self, lists=None, status=None):
+        self.lists = {k: [list(r) for r in v] for k, v in (lists or {}).items()}
+        self.status = status  # force an HTTP status for every call
+        self.calls = []
+
+    def __call__(self, method, url, body, timeout_s):
+        name = url.rsplit("/rest/decided_list/", 1)[1]
+        self.calls.append((method, name, body))
+        if self.status is not None:
+            return self.status, {"failed": True, "message": "Authentication failed"}
+        if name not in self.lists:
+            return 404, {"failed": True, "message": "Item not found"}
+        if method == "get":
+            return 200, {"id": 4, "name": name, "content": self.lists[name]}
+        self.lists[name].extend(body["append_rows"])
+        return 200, {"success": True}
 
 
 @pytest.fixture
-def failing_phantom_rules(monkeypatch):
-    rules = _FailingRules("phantom.rules")
-    monkeypatch.setitem(sys.modules, "phantom.rules", rules)
-    if "phantom" in sys.modules:
-        monkeypatch.setattr(sys.modules["phantom"], "rules", rules, raising=False)
-    return rules
+def soar_lists(monkeypatch):
+    fake = _FakeSoarLists({"agent_definitions": [["", ""], ["", ""]], "agent_skills": [["", ""]]})
+    monkeypatch.setattr(utils_module.SoarCustomList, "transport", staticmethod(fake))
+    return fake
 
 
-def test_create_agent_failure_names_the_exception(failing_phantom_rules):
+def test_create_agent_appends_one_row_over_rest(soar_lists):
     c = make_connector()
-    assert c._handle_create_agent({"agent_id": "a1", "provider": "local", "model": "m"}) is False
-    msg = c.action_results[-1].message
-    assert msg == ("Failed to save agent 'a1': RuntimeError: list write not permitted "
-                   "(Custom List 'agent_definitions')")
+    assert c._handle_create_agent({"agent_id": "test_local", "provider": "local", "model": "qwen2.5:7b",
+                                   "system_prompt": "Summarise.", "allowed_tools": "add_note"}) is True
+    method, name, body = soar_lists.calls[-1]
+    assert (method, name) == ("post", "agent_definitions")
+    row = body["append_rows"][0]
+    assert row[0] == "test_local" and json.loads(row[1])["model"] == "qwen2.5:7b"
+    assert c.action_results[-1].message == "Agent 'test_local' saved."
 
 
-def test_create_skill_failure_names_the_exception(failing_phantom_rules):
+def test_list_agents_skips_empty_rows_and_latest_row_wins(soar_lists):
+    c = make_connector()
+    c._handle_create_agent({"agent_id": "a1", "provider": "local", "model": "old"})
+    c._handle_create_agent({"agent_id": "a1", "provider": "local", "model": "new"})
+    c._handle_list_agents({})
+    data = c.action_results[-1].data
+    assert [(d["agent_id"], d["model"]) for d in data] == [("a1", "new")]
+
+
+def test_run_agent_loads_the_definition_over_rest(soar_lists):
+    soar_lists.lists["agent_definitions"].append(["a1", json.dumps({"provider": "local", "model": "qwen2.5:7b"})])
+    store = utils_module.AgentDefinitionStore(make_connector(), "agent_definitions")
+    loaded = store.load("a1")
+    assert loaded["agent_id"] == "a1" and loaded["model"] == "qwen2.5:7b"
+
+
+def test_missing_list_names_the_list_and_the_fix(monkeypatch):
+    monkeypatch.setattr(utils_module.SoarCustomList, "transport", staticmethod(_FakeSoarLists({})))
+    c = make_connector()
+    assert c._handle_create_agent({"agent_id": "a1"}) is False
+    assert c.action_results[-1].message == ("Failed to save agent 'a1': Custom List 'agent_definitions' does not "
+                                            "exist (HTTP 404); create it under Home -> Custom Lists.")
+    assert c._handle_list_agents({}) is False
+    assert "does not exist (HTTP 404)" in c.action_results[-1].message
+
+
+def test_rest_rejection_reaches_the_message(monkeypatch):
+    monkeypatch.setattr(utils_module.SoarCustomList, "transport", staticmethod(_FakeSoarLists({}, status=401)))
     c = make_connector()
     c._handle_create_skill({"skill_id": "s1", "inject": "be brief"})
-    assert c.action_results[-1].message.startswith("Failed to save skill 's1': RuntimeError: list write not permitted")
+    assert c.action_results[-1].message == ("Failed to save skill 's1': Custom List 'agent_skills': "
+                                            "HTTP 401: Authentication failed")
+
+
+def test_run_agent_reports_an_unknown_agent(soar_lists):
+    c = make_connector()
+    assert c._handle_run_agent({"agent_id": "ghost", "task": "t", "container_id": 1}) is False
+    assert "empty" in c.action_results[-1].message
+
+
+def test_transport_exception_is_reported_not_raised(monkeypatch):
+    def boom(method, url, body, timeout_s):
+        raise ConnectionError("refused")
+
+    monkeypatch.setattr(utils_module.SoarCustomList, "transport", staticmethod(boom))
+    c = make_connector()
+    c._handle_create_agent({"agent_id": "a1"})
+    assert c.action_results[-1].message == ("Failed to save agent 'a1': ConnectionError: refused "
+                                            "(Custom List 'agent_definitions')")
+
+
+def test_off_platform_keeps_the_dev_fallback():
+    store = utils_module.AgentDefinitionStore(make_connector(), "agent_definitions")
+    assert store.load("x")["provider"] == "anthropic"  # no SOAR base URL, no fake transport
+    assert store.save("x", {}) is False and store.last_error == "SOAR REST not available (off-platform)"
 
 
 def test_create_agent_failure_without_detail_keeps_the_old_message(monkeypatch):
@@ -1050,8 +1121,15 @@ def test_create_agent_failure_without_detail_keeps_the_old_message(monkeypatch):
     assert c.action_results[-1].message == "Failed to save agent 'a1'."
 
 
-def test_failed_save_message_carries_no_asset_secret(failing_phantom_rules):
+def test_failed_save_message_carries_no_asset_secret(monkeypatch):
+    monkeypatch.setattr(utils_module.SoarCustomList, "transport", staticmethod(_FakeSoarLists({}, status=401)))
     c = make_connector(anthropic_api_key="sk-secret-123", local_llm_api_key="ollama-secret")
     c._handle_create_agent({"agent_id": "a1"})
     msg = c.action_results[-1].message
     assert "sk-secret-123" not in msg and "ollama-secret" not in msg
+
+
+def test_list_url_quotes_the_name():
+    lst = utils_module.SoarCustomList(types.SimpleNamespace(get_phantom_base_url=lambda: "https://127.0.0.1/"),
+                                      "my list/x")
+    assert lst._url() == "https://127.0.0.1/rest/decided_list/my%20list%2Fx"
