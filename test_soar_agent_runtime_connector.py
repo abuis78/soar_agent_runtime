@@ -1214,3 +1214,51 @@ def test_update_severity_rejects_unknown_values_without_a_call(monkeypatch):
     tools, calls = _severity_tools(monkeypatch)
     assert tools._tool_update_severity({"severity": "banana"}).startswith("ERROR: severity must be one of")
     assert calls == []
+
+
+# --- contract E: the summary note shows what really ran (1.10.3) -----------------------
+
+HALLUCINATED_RUN = [  # run rt-20261025T050736Z-cf477c13 on SOAR 8.7, shortened
+    {"step": 1, "action": "get_container_info", "observation": '{\n  "container": {"id": 185}}'},
+    {"step": 2, "action": "add_note", "observation": "Note added: 'Reason for Severity Increase'"},
+    {"step": 3, "action": "FINAL_ANSWER", "observation": "The severity of the case has been updated to high."},
+]
+
+
+def test_executed_actions_lists_tool_calls_with_outcome():
+    actions = connector_module.executed_actions(json.dumps(HALLUCINATED_RUN))
+    assert actions == [
+        {"step": 1, "tool": "get_container_info", "outcome": "data returned", "took_effect": False},
+        {"step": 2, "tool": "add_note", "outcome": "Note added: 'Reason for Severity Increase'", "took_effect": False},
+    ]
+
+
+def test_claimed_severity_change_without_a_call_is_flagged():
+    actions = connector_module.executed_actions(HALLUCINATED_RUN)
+    block = connector_module.executed_actions_block("The severity of the case has been updated to high.", actions)
+    assert "- step 2: `add_note` - Note added: 'Reason for Severity Increase'" in block
+    assert ("**Warning:** The answer mentions what update_severity does, but no update_severity call "
+            "took effect in this run.") in block
+
+
+def test_a_failed_severity_call_does_not_back_the_claim():
+    log = [{"step": 1, "action": "update_severity",
+            "observation": "Failed to update severity: SoarRestError: POST /rest/container/185: HTTP 400: bad"}]
+    actions = connector_module.executed_actions(log)
+    assert actions[0]["took_effect"] is False
+    assert connector_module.unbacked_claims("Severity set to high.", actions)
+
+
+def test_no_warning_when_the_answer_does_not_talk_about_effects():
+    actions = connector_module.executed_actions(HALLUCINATED_RUN[:2])
+    assert connector_module.unbacked_claims("Summary note added.", actions) == []
+
+
+def test_catalogue_claim_needs_an_allowed_call():
+    allowed = [{"step": 1, "action": "catalog_invoke", "observation": "ALLOWED: 1 step(s) recorded for the follow-up"}]
+    assert connector_module.unbacked_claims("Proposed block isolate_host.", connector_module.executed_actions(allowed)) == []
+    assert connector_module.unbacked_claims("Proposed block isolate_host.", []) != []
+
+
+def test_block_says_none_when_nothing_ran():
+    assert "- none" in connector_module.executed_actions_block("done", [])
