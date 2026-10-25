@@ -385,3 +385,28 @@ def test_a_single_action_still_parses_as_before():
     loop, _, _ = make_loop([])
     assert loop._parse_response('ACTION: add_note\nPARAMS: {"title": "t", "content": "c"}')[4] is None
     assert loop._dropped_actions == []
+
+
+
+# --- E2E finding E-7: Markdown answers get a precise correction, the parser stays strict ------
+
+MARKDOWN_TURN = (
+    "### Action: update_severity\n\n```json\n{\n  \"container\": 212,\n  \"severity\": \"medium\"\n}\n```")
+
+
+def test_markdown_turn_is_not_executed_and_the_model_is_told_the_exact_form():
+    loop, llm, tools = make_loop([MARKDOWN_TURN, "THOUGHT: ok\nFINAL_ANSWER: done"])
+    result = loop.run("t")
+    assert tools.calls == []                                            # strict: nothing ran (RT-P05)
+    told = llm.seen_messages[1][-1]["content"]
+    assert told.startswith("OBSERVATION: Your response used Markdown (headings or code blocks); nothing was executed.")
+    assert "ACTION: update_severity\nPARAMS: {...JSON object on one line...}" in told
+    assert result["final_answer"] == "done"
+
+
+def test_plain_garbage_gets_the_generic_reminder():
+    loop, llm, _ = make_loop(["I think the severity should be high.", "THOUGHT: ok\nFINAL_ANSWER: done"])
+    loop.run("t")
+    told = llm.seen_messages[1][-1]["content"]
+    assert told.startswith("OBSERVATION: No valid ACTION or FINAL_ANSWER; nothing was executed.")
+    assert "ACTION: <tool_name>" in told
