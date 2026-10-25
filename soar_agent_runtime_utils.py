@@ -727,6 +727,24 @@ class ToolRegistry:
             return self._gap_available()
         return tool_name in self.allowed_tools
 
+    def halt_check(self) -> str:
+        """RT-B01 (5.1): ask the Policy Manager before every step. '' means go on, otherwise
+        the reason to stop. Only in airgap_mode, where the gate is used (E4); an unknown
+        halt state counts as halted (D25), so airgap without a working gate stops too."""
+        if not self.airgap:
+            return ""
+        try:
+            state = self.policy.halt_status()
+        except Exception as e:  # fail closed, like every other gate call
+            return f"halt state unknown ({type(e).__name__})"
+        if not state.halted:
+            return ""
+        self.halted, self.halt_source = True, "Policy Manager"
+        reason = (state.reason or "").strip()
+        if state.known is False:  # None = not reported by older packages, like health() (API.md §5)
+            return f"halt state unknown: {reason or 'no answer'}"
+        return f"halted: {reason or 'no reason given'}"
+
     def _gap_available(self) -> bool:
         """RT-W10: report_gap exists only where measures go through a policy gate
         (airgap_mode with a configured client); outside it there is no catalogue to have a gap in."""
@@ -1811,6 +1829,16 @@ class ReActLoop:
                 "observation": None
             }
 
+            # RT-B01 / AC-13 (5.1): emergency stop before every step, also before the first
+            # model call; halted or undeterminable ends the run here.
+            if halt_reason := self._halt_reason():
+                step_entry["action"] = "HALT"
+                step_entry["observation"] = f"run halted by Policy Manager before step {steps_taken}: {halt_reason}"
+                self.step_log.append(step_entry)
+                self._audit("angehalten", step_entry, step_entry["observation"])
+                self.connector.save_progress(f"Agent '{self.agent_id}' halted by Policy Manager: {halt_reason}")
+                return self._error_result(f"run halted by Policy Manager ({halt_reason})", steps_taken)
+
             try:
                 response_text = self.llm.chat(system_prompt, messages)
             except Exception as e:
@@ -1947,6 +1975,10 @@ class ReActLoop:
             "urteil":           self.verdict,
             "step_log":         json.dumps(self.step_log, indent=2)
         }
+
+    def _halt_reason(self) -> str:
+        check = getattr(self.tools, "halt_check", None)
+        return check() if callable(check) else ""
 
     def _error_result(self, message: str, steps: int) -> dict:
         return self._result(f"ERROR: {message}", steps)

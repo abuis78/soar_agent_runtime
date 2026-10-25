@@ -310,6 +310,7 @@ def test_run_agent_in_airgap_writes_audit_artifacts_end_to_end(monkeypatch):
     monkeypatch.setattr(connector_module.LLMProvider, "chat",
                         lambda self, system_prompt, messages: _VALID_VERDICT)
     c = make_connector(airgap_mode=True)
+    c._policy_client = StubPolicyClient()   # 5.1: airgap asks the gate before every step
     status = c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 9})
     assert status is True
     assert len(c.artifacts) == 1
@@ -325,6 +326,7 @@ def test_run_agent_in_airgap_fails_closed_when_artifacts_cannot_be_written(monke
     monkeypatch.setattr(connector_module.LLMProvider, "chat",
                         lambda self, system_prompt, messages: "FINAL_ANSWER: ok")
     c = make_connector(airgap_mode=True)
+    c._policy_client = StubPolicyClient()   # 5.1: airgap asks the gate before every step
     c.save_artifact = lambda artifact: (False, "disk full", None)
     status = c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 9})
     assert status is False
@@ -415,7 +417,7 @@ def test_app_json_declares_broker_fields_in_order():
     with open("soar_agent_runtime.json") as f:
         app = json.load(f)
     cfg = app["configuration"]
-    assert app["app_version"] == "1.12.3"
+    assert app["app_version"] == "1.13.0"
     assert [cfg[k]["order"] for k in ("broker_url", "broker_timeout_s", "broker_client_cert", "broker_client_key", "broker_ca")] == [24, 25, 26, 27, 28]
     assert cfg["broker_client_key"]["data_type"] == "string"  # a path, never the key material
     assert len({f["order"] for f in cfg.values()}) == len(cfg)  # orders unique
