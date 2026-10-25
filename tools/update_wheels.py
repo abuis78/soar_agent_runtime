@@ -27,7 +27,7 @@ WHEEL_DIR = ROOT / "wheels" / "py313"
 # PolicyManager repo: scripts/build_wheel.sh --copy-to <this app>/wheels/py3
 EXTRA_WHEELS = [
     ROOT / "wheels" / "py3" / "ai_soc_telemetry-0.1.0-py3-none-any.whl",
-    ROOT / "wheels" / "py3" / "policy_manager-0.5.1-py3-none-any.whl",
+    ROOT / "wheels" / "py3" / "policy_manager-0.5.2-py3-none-any.whl",
 ]
 DEP_KEY = "pip313_dependencies"
 PIP_ARGS = [

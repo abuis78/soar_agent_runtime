@@ -1,7 +1,7 @@
 """Integration tests against the bundled policy_manager wheel (3.1b, 4.1b; RT-W01, W03, W06, W09).
 
 Run with the wheel on the path, e.g.
-  uv run --with pytest --with ./wheels/py3/policy_manager-0.5.1-py3-none-any.whl ... -m pytest
+  uv run --with pytest --with ./wheels/py3/policy_manager-0.5.2-py3-none-any.whl ... -m pytest
 Without the package the module is skipped; the stub-based tests cover the gate logic.
 """
 
