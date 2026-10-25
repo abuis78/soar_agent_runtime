@@ -1004,3 +1004,33 @@ def test_e4_policy_deny_is_audited_as_abgelehnt_with_its_decision(platform, llm,
 ])
 def test_e4_audit_phase_mapping(observation, halted, phase):
     assert utils._audit_phase(observation, halted) == phase
+
+
+# --- E2E finding E-6 (2026-10-25): runtime artifacts never raise the case severity -----------
+# SOAR lifts a container to a higher artifact severity without an audit entry; artifacts default
+# to "medium", so the audit artifact after update_severity(low) put container 212 back to medium.
+
+def test_e6_every_runtime_artifact_carries_the_lowest_severity(platform, llm, monkeypatch):
+    define_agent(platform, provider="local")
+    llm["responses"] = effect_script("update_severity", beleg_ids=[f"{RUN_ID}/1"])
+    c = policy_connector(monkeypatch, StubPolicyClient())
+    status, result = run(c)
+    assert status is True, result.message
+    assert c.artifacts and {a["severity"] for a in c.artifacts} == {"low"}
+
+
+def test_e6_proposal_and_gap_artifacts_are_low_too(platform, llm, monkeypatch):
+    define_agent(platform, provider="local")
+    llm["responses"] = effect_script("update_severity", beleg_ids=[f"{RUN_ID}/1"])
+    c = policy_connector(monkeypatch, StubPolicyClient(PolicyDecision(gate=GATE_APPROVE_2PERSON, decision_id="pm-7",
+                                                                      approval_id="fg-7", approvals_needed=2)))
+    run(c)
+    assert proposals(c) and all(a["severity"] == "low" for a in c.artifacts)
+
+
+def test_e6_every_artifact_dict_in_the_runtime_sets_the_severity():
+    import inspect
+    import soar_agent_runtime_audit as audit
+    sources = inspect.getsource(utils) + inspect.getsource(audit)
+    builders = sources.count('"run_automation": False,')
+    assert builders == 3 and sources.count('"severity": RUNTIME_ARTIFACT_SEVERITY') == builders
