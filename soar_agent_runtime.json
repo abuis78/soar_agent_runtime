@@ -877,6 +877,61 @@
                 }
             ],
             "versions": "EQ(*)"
+        },
+        {
+            "action": "test tools",
+            "identifier": "test_tools",
+            "description": "Calls every built-in tool for real, without the model, against a test container: reads it, writes one note '[tool self-test]', changes the severity and restores it, and checks broker and policy when configured. Use a container made for testing.",
+            "type": "generic",
+            "read_only": false,
+            "parameters": {
+                "container_id": {
+                    "description": "ID of a container made for testing; it gets one note and its severity is changed and restored",
+                    "data_type": "numeric",
+                    "required": true,
+                    "order": 0
+                },
+                "model_check": {
+                    "description": "Also ask the default model once whether it keeps one ACTION per response",
+                    "data_type": "boolean",
+                    "required": false,
+                    "default": false,
+                    "order": 1
+                }
+            },
+            "output": [
+                {
+                    "data_path": "action_result.data.*.tool",
+                    "data_type": "string",
+                    "column_name": "Tool",
+                    "column_order": 0
+                },
+                {
+                    "data_path": "action_result.data.*.status",
+                    "data_type": "string",
+                    "column_name": "Status",
+                    "column_order": 1
+                },
+                {
+                    "data_path": "action_result.data.*.detail",
+                    "data_type": "string",
+                    "column_name": "Detail",
+                    "column_order": 2
+                },
+                {
+                    "data_path": "action_result.summary.tools_failed",
+                    "data_type": "numeric"
+                },
+                {
+                    "data_path": "action_result.status",
+                    "data_type": "string"
+                },
+                {
+                    "data_path": "action_result.message",
+                    "data_type": "string"
+                }
+            ],
+            "versions": "EQ(*)"
         }
     ]
 }

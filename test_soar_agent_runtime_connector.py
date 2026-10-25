@@ -1422,3 +1422,85 @@ def test_setup_warns_about_stored_agents_with_unknown_tools(monkeypatch):
     c, _ = _setup(monkeypatch, lists)
     assert c._handle_setup_app({}) is True  # a warning is not a problem
     assert _rows(c)["agent tool names"] == ("WARN", "unknown tools are never offered - old: update_severety")
+
+
+# --- contract I: test tools (1.12.0) --------------------------------------------------------
+
+class _FakeCase:
+    """One SOAR container over REST plus phantom.rules.add_note, as the instance offers them."""
+
+    def __init__(self, severity="medium", stuck=False, restore_fails=False):
+        self.severity, self.stuck, self.restore_fails = severity, stuck, restore_fails
+        self.posts, self.notes = [], []
+
+    def __call__(self, method, url, body, timeout_s):
+        path = url.split("/rest/", 1)[1].split("?", 1)[0]
+        if method == "post":
+            self.posts.append(body["severity"])
+            if self.restore_fails and len(self.posts) == 2:
+                return 500, {"failed": True, "message": "boom"}
+            if not self.stuck:
+                self.severity = body["severity"]
+            return 200, {"success": True}
+        if path.endswith("/artifacts"):
+            return 200, {"count": 1, "data": [{"id": 1}]}
+        return 200, {"id": 185, "name": "Test case", "severity": self.severity}
+
+
+def _tool_test(monkeypatch, case, **config):
+    monkeypatch.setattr(utils_module.SoarRest, "transport", staticmethod(case))
+    rules = types.ModuleType("phantom.rules")
+    rules.add_note = lambda **kw: case.notes.append(kw)
+    monkeypatch.setitem(sys.modules, "phantom.rules", rules)
+    c = make_connector(**config)
+    ok = c._handle_test_tools({"container_id": 185})
+    return ok, c, {d["tool"]: (d["status"], d["detail"]) for d in c.action_results[-1].data}
+
+
+def test_test_tools_proves_each_tool_and_restores_the_severity(monkeypatch):
+    case = _FakeCase("medium")
+    ok, c, rows = _tool_test(monkeypatch, case)
+    assert ok is True, c.action_results[-1].message
+    assert rows["get_container_info"][0] == "OK" and "severity medium" in rows["get_container_info"][1]
+    assert rows["add_note"] == ("OK", "Note added: '[tool self-test]'")
+    assert rows["update_severity"] == ("OK", "set to 'low' and restored to 'medium'")
+    assert case.posts == ["low", "medium"] and case.severity == "medium"
+    assert rows["splunk_search"][0] == "OK" and rows["run_sub_agent"][0] == "SKIPPED"
+
+
+def test_test_tools_fails_loudly_when_the_severity_does_not_change(monkeypatch):
+    ok, c, rows = _tool_test(monkeypatch, _FakeCase("medium", stuck=True))
+    assert ok is False
+    assert rows["update_severity"][0] == "FAIL" and "did not take effect" in rows["update_severity"][1]
+    assert c.action_results[-1].message.startswith("test tools: 1 failed: update_severity:")
+
+
+def test_test_tools_says_when_the_container_was_left_changed(monkeypatch):
+    ok, _, rows = _tool_test(monkeypatch, _FakeCase("medium", restore_fails=True))
+    assert ok is False
+    assert rows["update_severity"][1].startswith("container 185 left at 'low' instead of 'medium' - restore it by hand")
+
+
+def test_test_tools_skips_the_effect_in_airgap(monkeypatch):
+    case = _FakeCase("medium")
+    _, _, rows = _tool_test(monkeypatch, case, airgap_mode=True)
+    assert rows["update_severity"][0] == "SKIPPED" and case.posts == []
+
+
+def test_test_tools_needs_a_container():
+    c = make_connector()
+    assert c._handle_test_tools({}) is False
+    assert c.action_results[-1].message == "container_id of a test container is required."
+
+
+@pytest.mark.parametrize("answer,status", [
+    ('THOUGHT: x\nACTION: update_severity\nPARAMS: {"severity": "high"}', "OK"),
+    ('THOUGHT: x\nACTION: update_severity\nPARAMS: {}\nACTION: add_note\nPARAMS: {}', "WARN"),
+    ("I would set it to high.", "FAIL"),
+])
+def test_model_check_counts_actions(monkeypatch, answer, status):
+    monkeypatch.setattr(connector_module.LLMProvider, "chat", lambda self, system, messages: answer)
+    c = make_connector(default_provider="local", local_llm_model="qwen2.5:7b")
+    rows = []
+    c._self_test_model(lambda tool, st, detail: rows.append((tool, st)))
+    assert rows == [("model format", status)]
