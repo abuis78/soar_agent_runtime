@@ -415,7 +415,7 @@ def test_app_json_declares_broker_fields_in_order():
     with open("soar_agent_runtime.json") as f:
         app = json.load(f)
     cfg = app["configuration"]
-    assert app["app_version"] == "1.11.2"
+    assert app["app_version"] == "1.12.0"
     assert [cfg[k]["order"] for k in ("broker_url", "broker_timeout_s", "broker_client_cert", "broker_client_key", "broker_ca")] == [24, 25, 26, 27, 28]
     assert cfg["broker_client_key"]["data_type"] == "string"  # a path, never the key material
     assert len({f["order"] for f in cfg.values()}) == len(cfg)  # orders unique
@@ -1384,3 +1384,123 @@ def test_note_names_actions_that_were_sent_but_not_executed():
     assert ("- step 1: `update_severity` - Container severity updated to: high "
             "(in the same response, not executed: add_note)") in block
     assert "**Warning:**" not in block
+
+
+# --- contract H: list tools, tool names checked (1.12.0) ---------------------------------
+
+def test_list_tools_shows_every_tool_with_availability():
+    c = make_connector()
+    assert c._handle_list_tools({}) is True
+    rows = {d["tool"]: d for d in c.action_results[-1].data}
+    assert set(rows) == set(utils_module.ToolRegistry.TOOL_DEFINITIONS)
+    assert rows["update_severity"]["effecting"] is True and rows["add_note"]["effecting"] is False
+    assert rows["splunk_search"]["availability"].startswith("not available")
+    assert rows["update_severity"]["availability"] == "available; outside airgap_mode no policy gate is consulted"
+    assert rows["broker_invoke"]["in_allowed_tools"] is False
+    assert c.action_results[-1].message == f"Found {len(rows)} tool(s)."
+
+
+def test_list_tools_in_airgap_without_policy_says_effects_are_denied():
+    c = make_connector(airgap_mode=True)
+    c._handle_list_tools({})
+    rows = {d["tool"]: d for d in c.action_results[-1].data}
+    assert rows["update_severity"]["availability"] == "denied: airgap_mode needs policy_mode for effecting tools"
+    assert rows["catalog_invoke"]["availability"] == "not offered: needs airgap_mode and policy_mode"
+
+
+def test_create_agent_rejects_a_misspelled_tool(soar_lists):
+    c = make_connector()
+    assert c._handle_create_agent({"agent_id": "a1", "allowed_tools": "get_container_info,update_severety"}) is False
+    msg = c.action_results[-1].message
+    assert msg.startswith("Unknown tool(s) in allowed_tools: update_severety. Valid tools: splunk_search, add_note")
+    assert not [call for call in soar_lists.calls if call[0] == "post"]  # nothing stored
+
+
+def test_setup_warns_about_stored_agents_with_unknown_tools(monkeypatch):
+    lists = {"agent_definitions": [["old", json.dumps({"allowed_tools": "add_note,update_severety"})]],
+             "agent_skills": [["", ""]]}
+    c, _ = _setup(monkeypatch, lists)
+    assert c._handle_setup_app({}) is True  # a warning is not a problem
+    assert _rows(c)["agent tool names"] == ("WARN", "unknown tools are never offered - old: update_severety")
+
+
+# --- contract I: test tools (1.12.0) --------------------------------------------------------
+
+class _FakeCase:
+    """One SOAR container over REST plus phantom.rules.add_note, as the instance offers them."""
+
+    def __init__(self, severity="medium", stuck=False, restore_fails=False):
+        self.severity, self.stuck, self.restore_fails = severity, stuck, restore_fails
+        self.posts, self.notes = [], []
+
+    def __call__(self, method, url, body, timeout_s):
+        path = url.split("/rest/", 1)[1].split("?", 1)[0]
+        if method == "post":
+            self.posts.append(body["severity"])
+            if self.restore_fails and len(self.posts) == 2:
+                return 500, {"failed": True, "message": "boom"}
+            if not self.stuck:
+                self.severity = body["severity"]
+            return 200, {"success": True}
+        if path.endswith("/artifacts"):
+            return 200, {"count": 1, "data": [{"id": 1}]}
+        return 200, {"id": 185, "name": "Test case", "severity": self.severity}
+
+
+def _tool_test(monkeypatch, case, **config):
+    monkeypatch.setattr(utils_module.SoarRest, "transport", staticmethod(case))
+    rules = types.ModuleType("phantom.rules")
+    rules.add_note = lambda **kw: case.notes.append(kw)
+    monkeypatch.setitem(sys.modules, "phantom.rules", rules)
+    c = make_connector(**config)
+    ok = c._handle_test_tools({"container_id": 185})
+    return ok, c, {d["tool"]: (d["status"], d["detail"]) for d in c.action_results[-1].data}
+
+
+def test_test_tools_proves_each_tool_and_restores_the_severity(monkeypatch):
+    case = _FakeCase("medium")
+    ok, c, rows = _tool_test(monkeypatch, case)
+    assert ok is True, c.action_results[-1].message
+    assert rows["get_container_info"][0] == "OK" and "severity medium" in rows["get_container_info"][1]
+    assert rows["add_note"] == ("OK", "Note added: '[tool self-test]'")
+    assert rows["update_severity"] == ("OK", "set to 'low' and restored to 'medium'")
+    assert case.posts == ["low", "medium"] and case.severity == "medium"
+    assert rows["splunk_search"][0] == "OK" and rows["run_sub_agent"][0] == "SKIPPED"
+
+
+def test_test_tools_fails_loudly_when_the_severity_does_not_change(monkeypatch):
+    ok, c, rows = _tool_test(monkeypatch, _FakeCase("medium", stuck=True))
+    assert ok is False
+    assert rows["update_severity"][0] == "FAIL" and "did not take effect" in rows["update_severity"][1]
+    assert c.action_results[-1].message.startswith("test tools: 1 failed: update_severity:")
+
+
+def test_test_tools_says_when_the_container_was_left_changed(monkeypatch):
+    ok, _, rows = _tool_test(monkeypatch, _FakeCase("medium", restore_fails=True))
+    assert ok is False
+    assert rows["update_severity"][1].startswith("container 185 left at 'low' instead of 'medium' - restore it by hand")
+
+
+def test_test_tools_skips_the_effect_in_airgap(monkeypatch):
+    case = _FakeCase("medium")
+    _, _, rows = _tool_test(monkeypatch, case, airgap_mode=True)
+    assert rows["update_severity"][0] == "SKIPPED" and case.posts == []
+
+
+def test_test_tools_needs_a_container():
+    c = make_connector()
+    assert c._handle_test_tools({}) is False
+    assert c.action_results[-1].message == "container_id of a test container is required."
+
+
+@pytest.mark.parametrize("answer,status", [
+    ('THOUGHT: x\nACTION: update_severity\nPARAMS: {"severity": "high"}', "OK"),
+    ('THOUGHT: x\nACTION: update_severity\nPARAMS: {}\nACTION: add_note\nPARAMS: {}', "WARN"),
+    ("I would set it to high.", "FAIL"),
+])
+def test_model_check_counts_actions(monkeypatch, answer, status):
+    monkeypatch.setattr(connector_module.LLMProvider, "chat", lambda self, system, messages: answer)
+    c = make_connector(default_provider="local", local_llm_model="qwen2.5:7b")
+    rows = []
+    c._self_test_model(lambda tool, st, detail: rows.append((tool, st)))
+    assert rows == [("model format", status)]

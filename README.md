@@ -42,6 +42,10 @@ None.
 3. Fill in API keys for the providers you want to use
 4. **Test Connectivity**
 5. Run the action **setup app** once: it creates the Custom Lists `agent_definitions` and `agent_skills` if they are missing and checks the asset (model, and in `airgap_mode` broker and policy fields, files and `halt.json`). `dry_run` only reports.
+6. Run **test tools** on a container made for testing: it calls every built-in tool for real (one note, severity changed and restored). Set `model_check` to also see whether the model keeps one ACTION per response.
+7. Before defining an agent, run **list tools** for the valid names in `allowed_tools`.
+
+**Routine after every install, upgrade or asset change:** `setup app`, then `test tools` on the same test container. Both can run from a daily playbook so a SOAR update that changes its API shows up the next morning, not in an incident.
 
 ---
 
@@ -190,6 +194,21 @@ Creates or updates a skill in the `agent_skills` Custom List.
 | `description` | string | No | Human-readable label |
 | `inject` | string | No | Text injected into system prompt |
 | `output_schema` | string | No | JSON schema enforced in FINAL_ANSWER |
+
+---
+
+### `list tools`
+Lists every tool: parameters, whether it takes effect, its source, whether it belongs in `allowed_tools` (broker, catalogue and gap tools are offered automatically) and whether it works with this asset's settings. `create agent` rejects names that are not in this list.
+
+---
+
+### `test tools`
+Calls every built-in tool directly, without the model, against a test container. Rows: `OK`, `FAIL` (with the exact error), `WARN` or `SKIPPED`. In `airgap_mode` the severity effect is skipped; test it with `run agent` through the policy gate.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `container_id` | numeric | Yes | A container made for testing; it gets one note `[tool self-test]`, its severity is changed and restored |
+| `model_check` | boolean | No | Ask the default model once whether it keeps one ACTION per response |
 
 ---
 
@@ -593,3 +612,4 @@ Unit and integration tests run with `uv` and the bundled wheels (see the command
 | 1.11.0 | 2026-10-25 | New action `setup app`: creates missing Custom Lists, removes older duplicate agent/skill rows, checks model and (in `airgap_mode`) broker, policy, files and `halt.json`; `dry_run`. `test connectivity` reports missing Custom Lists without writing |
 | 1.11.1 | 2026-10-25 | Strict parser: a model turn with several `ACTION`s or `ACTION` plus `FINAL_ANSWER` runs nothing and asks the model to send one action at a time (a second ACTION used to replace the first silently); the step log keeps the raw model turn (2000 characters). `splunk_search` answers that SOAR apps cannot search (`phantom.rules.run_query` does not exist) |
 | 1.11.2 | 2026-10-25 | A model turn with several `ACTION`s runs the first one; the others and a `FINAL_ANSWER` in the same turn are not executed and are named in the observation, the step log (`not_executed`) and the summary note (qwen2.5:7b sends two actions per turn and ignored the 1.11.1 rejection) |
+| 1.12.0 | 2026-10-25 | New actions `list tools` (every tool with availability on this asset) and `test tools` (calls each built-in tool for real against a test container, restores the severity, optional model format check); `create agent` rejects unknown tool names; `setup app` warns about stored agents with unknown names |

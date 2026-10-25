@@ -99,6 +99,44 @@ def executed_actions_block(final_answer: str, actions: list[dict]) -> str:
     return "\n".join(lines)
 
 
+# --- tool catalogue for the user (contract H, 1.12.0) -------------------------------------
+
+# Tools the runtime offers on its own when their source delivers them; listing them in
+# allowed_tools is harmless but not needed.
+IMPLICIT_TOOLS = ("broker_invoke", "catalog_invoke", "report_gap")
+
+
+def known_tool_names() -> list[str]:
+    return list(ToolRegistry.TOOL_DEFINITIONS)
+
+
+def unknown_tool_names(allowed_tools) -> list[str]:
+    names = allowed_tools.split(",") if isinstance(allowed_tools, str) else list(allowed_tools or [])
+    known = set(known_tool_names())
+    return [n.strip() for n in names if n.strip() and n.strip() not in known]
+
+
+def tool_availability(name: str, airgap: bool, broker_url: str, policy_mode: str) -> str:
+    """One sentence on whether and how a tool works with this asset's settings."""
+    gate = bool(policy_mode)
+    match name:
+        case "splunk_search":
+            return "not available: SOAR offers apps no search API; use broker_invoke templates"
+        case "update_severity" if airgap:
+            return ("available through the Policy Manager gate" if gate
+                    else "denied: airgap_mode needs policy_mode for effecting tools")
+        case "update_severity":
+            return "available; outside airgap_mode no policy gate is consulted"
+        case "broker_invoke":
+            return ("offered when the Tool Broker delivers templates" if broker_url
+                    else "not offered: set broker_url")
+        case "catalog_invoke" | "report_gap":
+            return ("offered in airgap_mode when the Policy Manager releases building blocks" if airgap and gate
+                    else "not offered: needs airgap_mode and policy_mode")
+        case _:
+            return "available"
+
+
 class SoarAgentRuntimeConnector(BaseConnector):
 
     def __init__(self):
@@ -681,6 +719,13 @@ class SoarAgentRuntimeConnector(BaseConnector):
             return action_result.set_status(
                 phantom.APP_ERROR, "agent_id must match [A-Za-z0-9_.-] and be 1-64 chars.")
 
+        # Contract H: an unknown name used to be stored silently and the tool never offered.
+        if unknown := unknown_tool_names(param.get("allowed_tools") or ""):
+            return action_result.set_status(
+                phantom.APP_ERROR,
+                f"Unknown tool(s) in allowed_tools: {', '.join(unknown)}. "
+                f"Valid tools: {', '.join(known_tool_names())} (see the action 'list tools').")
+
         skills_raw = param.get("skills", "")
         skills = [s.strip() for s in skills_raw.split(",") if s.strip()] if skills_raw else []
 
@@ -805,6 +850,153 @@ class SoarAgentRuntimeConnector(BaseConnector):
         return action_result.set_status(phantom.APP_SUCCESS, f"Found {len(skills)} skill(s).")
 
     # -----------------------------------------------------------------------
+    # Action: list tools (contract H, 1.12.0)
+    # -----------------------------------------------------------------------
+
+    def _handle_list_tools(self, param):
+        action_result = self.add_action_result(ActionResult(dict(param)))
+        for name, defn in ToolRegistry.TOOL_DEFINITIONS.items():
+            action_result.add_data({
+                "tool": name,
+                "description": defn.get("description", ""),
+                "parameters": ", ".join(defn.get("parameters", {})),
+                "effecting": bool(defn.get("wirkt", True)),
+                "source": defn.get("quelle", ""),
+                "in_allowed_tools": name not in IMPLICIT_TOOLS,
+                "availability": tool_availability(name, self._airgap_mode, self._broker_url, self._policy_mode),
+            })
+        count = len(ToolRegistry.TOOL_DEFINITIONS)
+        action_result.update_summary({"total_tools": count})
+        return action_result.set_status(phantom.APP_SUCCESS, f"Found {count} tool(s).")
+
+    # -----------------------------------------------------------------------
+    # Action: test tools (contract I, 1.12.0)
+    # -----------------------------------------------------------------------
+    # Calls every built-in tool for real, without the model, against a test container,
+    # because on SOAR 8.7 almost every tool was broken while all unit tests (which fake
+    # SOAR) were green. Changes it makes: one note, and the severity briefly, restored.
+
+    SELF_TEST_NOTE = "[tool self-test]"
+    MODEL_CHECK_TASK = "Call update_severity with severity high. Then add a note explaining why."
+
+    def _handle_test_tools(self, param):
+        action_result = self.add_action_result(ActionResult(dict(param)))
+        container_id = self._safe_int(param.get("container_id", 0), name="container_id")
+        if not container_id:
+            return action_result.set_status(phantom.APP_ERROR, "container_id of a test container is required.")
+        model_check = str(param.get("model_check", False)).lower() in ("true", "1", "yes")
+        rows: list[dict] = []
+
+        def row(tool: str, status: str, detail: str) -> None:
+            rows.append({"tool": tool, "status": status, "detail": str(detail)[:500]})
+
+        tools = ToolRegistry(self, container_id, known_tool_names(), airgap=self._airgap_mode)
+        original = self._self_test_read(tools, container_id, row)
+        self._self_test_note(tools, row)
+        self._self_test_severity(tools, container_id, original, row)
+        spl = tools._tool_splunk_search({"spl_query": "index=_internal | head 1"})
+        row("splunk_search", "OK" if spl == ToolRegistry.SPL_UNAVAILABLE else "FAIL",
+            "reports 'not available' as designed" if spl == ToolRegistry.SPL_UNAVAILABLE else spl)
+        row("run_sub_agent", "SKIPPED", "needs a second agent and the model; shown by run agent")
+        self._self_test_services(row)
+        if model_check:
+            self._self_test_model(row)
+
+        for r in rows:
+            action_result.add_data(r)
+        failed = [r for r in rows if r["status"] == "FAIL"]
+        action_result.update_summary({"tools_ok": sum(r["status"] == "OK" for r in rows),
+                                      "tools_failed": len(failed), "container_id": container_id})
+        if failed:
+            return action_result.set_status(
+                phantom.APP_ERROR, f"test tools: {len(failed)} failed: "
+                + "; ".join(f"{r['tool']}: {r['detail']}" for r in failed))
+        return action_result.set_status(
+            phantom.APP_SUCCESS, f"test tools: all {len(rows)} check(s) passed or skipped on container {container_id}.")
+
+    def _self_test_read(self, tools, container_id: int, row) -> str:
+        out = tools._tool_get_container_info({})
+        try:
+            data = json.loads(out)
+            container = data["container"]
+            if int(container.get("id", 0)) != container_id:
+                raise ValueError(f"returned container {container.get('id')}")
+        except (ValueError, KeyError, TypeError) as e:
+            row("get_container_info", "FAIL", out if out.startswith("Failed") else f"unexpected output ({e})")
+            return ""
+        severity = str(container.get("severity", "")).lower()
+        row("get_container_info", "OK", f"container {container_id} '{container.get('name', '')}', "
+            f"severity {severity or 'unknown'}, {data.get('artifact_count', 0)} artifact(s)")
+        return severity
+
+    def _self_test_note(self, tools, row) -> None:
+        out = tools._tool_add_note({"title": self.SELF_TEST_NOTE,
+                                    "content": "Written by the action 'test tools' to prove add_note works. Safe to delete."})
+        row("add_note", "OK" if out.startswith("Note added") else "FAIL", out)
+
+    def _self_test_severity(self, tools, container_id: int, original: str, row) -> None:
+        valid = ("low", "medium", "high", "critical")
+        if self._airgap_mode:
+            row("update_severity", "SKIPPED", "airgap_mode: effects run only through the policy gate; test it with run agent")
+            return
+        if original not in valid:
+            row("update_severity", "SKIPPED", f"current severity '{original or 'unknown'}' cannot be restored safely")
+            return
+        probe = "low" if original != "low" else "medium"
+        changed = tools._tool_update_severity({"severity": probe})
+        now = self._self_test_severity_now(tools)
+        restored = tools._tool_update_severity({"severity": original})
+        after = self._self_test_severity_now(tools)
+        if after != original:
+            row("update_severity", "FAIL", f"container {container_id} left at '{after}' instead of '{original}' "
+                f"- restore it by hand ({restored})")
+        elif not changed.startswith("Container severity updated") or now != probe:
+            row("update_severity", "FAIL", f"set to '{probe}' did not take effect (now '{now}'): {changed}")
+        else:
+            row("update_severity", "OK", f"set to '{probe}' and restored to '{original}'")
+
+    @staticmethod
+    def _self_test_severity_now(tools) -> str:
+        try:
+            return str(json.loads(tools._tool_get_container_info({}))["container"].get("severity", "")).lower()
+        except (ValueError, KeyError, TypeError):
+            return "unknown"
+
+    def _self_test_services(self, row) -> None:
+        results: dict = {}
+        if self._broker_url:
+            ok = self._test_broker(results)
+            row("broker_invoke", "OK" if ok else "FAIL", results.get("broker", ""))
+        else:
+            row("broker_invoke", "SKIPPED", "no broker_url")
+        if self._airgap_mode and self._policy_mode:
+            ok = self._test_policy(results)
+            row("catalog_invoke / report_gap", "OK" if ok else "FAIL", results.get("policy", ""))
+        else:
+            row("catalog_invoke / report_gap", "SKIPPED", "need airgap_mode and policy_mode")
+
+    def _self_test_model(self, row) -> None:
+        """Does the default model keep the ReAct format? Counts ACTION lines in one answer."""
+        system = ("You are a SOC agent. Tools:\n- update_severity(severity): set the case severity\n"
+                  "- add_note(title, content): add a note\nAnswer with THOUGHT, then exactly one ACTION and its "
+                  "PARAMS (JSON), or FINAL_ANSWER.")
+        try:
+            model = self._local_llm_model() if self._default_provider == "local" else ""
+            answer = self._build_llm_provider(self._default_provider, model).chat(
+                system, [{"role": "user", "content": self.MODEL_CHECK_TASK}])
+        except Exception as e:
+            row("model format", "FAIL", f"{type(e).__name__}: {e}")
+            return
+        count = sum(1 for line in answer.splitlines() if line.strip().startswith("ACTION:"))
+        if count == 1:
+            row("model format", "OK", "one ACTION per response")
+        elif count > 1:
+            row("model format", "WARN", f"{count} ACTIONs in one response; the runtime runs the first and asks "
+                "for the rest, so runs need more steps")
+        else:
+            row("model format", "FAIL", f"no ACTION line in the answer: {answer[:200]}")
+
+    # -----------------------------------------------------------------------
     # Action: setup app (contract B, 1.11.0)
     # -----------------------------------------------------------------------
     # SOAR runs no app code at install time, so this action does the one-time setup
@@ -855,6 +1047,8 @@ class SoarAgentRuntimeConnector(BaseConnector):
                         check(label, "CREATED", f"empty {kind} list created")
                     continue
                 compact, dropped = compact_rows(lst.rows())
+                if kind == "agents":
+                    self._setup_agent_tools(check, compact)
                 if not dropped:
                     check(label, "OK", f"{sum(1 for r in compact if r[0])} {kind}, no duplicate rows")
                 elif dry_run:
@@ -864,6 +1058,22 @@ class SoarAgentRuntimeConnector(BaseConnector):
                     check(label, "FIXED", f"{dropped} older duplicate row(s) removed, latest row per id kept")
             except ValueError as e:  # CustomListError / SoarRestError
                 check(label, "ERROR", str(e))
+
+    @staticmethod
+    def _setup_agent_tools(check, rows: list) -> None:
+        """Contract H: stored agents may predate the name check in create agent."""
+        bad = []
+        for row in rows:
+            if not row[0]:
+                continue
+            try:
+                tools = json.loads(row[1]).get("allowed_tools", "")
+            except (ValueError, AttributeError):
+                continue
+            if unknown := unknown_tool_names(tools):
+                bad.append(f"{row[0]}: {', '.join(unknown)}")
+        if bad:
+            check("agent tool names", "WARN", "unknown tools are never offered - " + "; ".join(bad))
 
     def _setup_llm(self, check) -> None:
         provider = self._default_provider
@@ -931,6 +1141,8 @@ class SoarAgentRuntimeConnector(BaseConnector):
             "list_agents":       self._handle_list_agents,
             "create_skill":      self._handle_create_skill,
             "setup_app":         self._handle_setup_app,
+            "list_tools":        self._handle_list_tools,
+            "test_tools":        self._handle_test_tools,
             "list_skills":       self._handle_list_skills,
         }
         action_id = self.get_action_identifier()
