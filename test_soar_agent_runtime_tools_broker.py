@@ -328,7 +328,8 @@ def test_get_container_info_reads_own_case(case_rules, params):
     data = json.loads(reg.execute("get_container_info", params))
     assert case_rules == [4711]
     assert data["container"]["id"] == 4711
-    assert (data["artifact_count"], data["artifacts_shown"], len(data["artifacts"])) == (7, 5, 5)
+    assert (data["artifact_count"], data["artifacts_shown"], len(data["artifacts"])) == (5, 5, 5)
+    assert data["artifacts_total"] == 7 and data["runtime_artifacts_hidden"] == 0
 
 
 @pytest.mark.parametrize("params", [{"container_id": 4712}, {"container_id": "99"}, {"case_id": 1}])
