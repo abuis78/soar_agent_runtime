@@ -965,3 +965,42 @@ def test_rtw04_service_decisions_and_catalogue_come_from_the_package_client(plat
     assert proposal["cef"]["gate"] == "ALLOW" and proposal["cef"]["entscheidung_id"] == "pm-s1"
     assert proposal["cef"]["policy_version"] == "v5" and platform["severity"] == []
     assert step_log(result)[1]["observation"].endswith("(entscheidung_id=pm-s1)")
+
+
+# --- E2E finding E-4 (2026-10-25): the audit phase follows the outcome ----------------------
+
+def test_e4_refused_effecting_call_is_audited_as_abgelehnt_not_erledigt(platform, llm, monkeypatch):
+    define_agent(platform, provider="local")
+    llm["responses"] = effect_script("update_severity", beleg_ids=[])   # RT-W05: no evidence
+    c = policy_connector(monkeypatch, StubPolicyClient())
+    status, result = run(c)
+    assert status is True and platform["severity"] == []
+    steps = [(e["werkzeug"], e["phase"]) for e in audit_events(c)]
+    assert steps == [("get_container_info", "erledigt"), ("update_severity", "beabsichtigt"),
+                     ("update_severity", "abgelehnt"), ("FINAL_ANSWER", "erledigt")]
+    obs = step_log(result)[1]["observation"]
+    assert f"Valid evidence ids now: {RUN_ID}/1." in obs                 # the real id, so it can be copied
+
+
+def test_e4_policy_deny_is_audited_as_abgelehnt_with_its_decision(platform, llm, monkeypatch):
+    from soar_agent_runtime_policy import PolicyDecision
+    define_agent(platform, provider="local")
+    llm["responses"] = effect_script("update_severity", beleg_ids=[f"{RUN_ID}/1"])
+    c = policy_connector(monkeypatch, StubPolicyClient(PolicyDecision.deny("DEFAULT_GATE", "no rule")))
+    run(c)
+    refused = [e for e in audit_events(c) if e["werkzeug"] == "update_severity" and e["phase"] != "beabsichtigt"]
+    assert [e["phase"] for e in refused] == ["abgelehnt"]
+
+
+@pytest.mark.parametrize("observation,halted,phase", [
+    ("Container severity updated to: high", False, "erledigt"),
+    ("HELD: 'update_severity' requires APPROVE_1CLICK", False, "erledigt"),
+    ("ERROR: Tool 'update_severity' has an effect and needs 'beleg_ids'", False, "abgelehnt"),
+    ("POLICY DENIED code=DEFAULT_GATE", False, "abgelehnt"),
+    ("BROKER REJECTED code=NOT_ALLOWED", False, "abgelehnt"),
+    ("BROKER UNAVAILABLE code=TIMEOUT", False, "fehler"),
+    ("Failed to update severity: SoarRestError", False, "fehler"),
+    ("anything", True, "fehler"),
+])
+def test_e4_audit_phase_mapping(observation, halted, phase):
+    assert utils._audit_phase(observation, halted) == phase
