@@ -65,7 +65,7 @@ None.
 | `default_max_steps` | Max ReAct steps | `25` |
 | `agent_list_name` | Custom List for agents | `agent_definitions` |
 | `skill_list_name` | Custom List for skills | `agent_skills` |
-| `definitions_path` | Directory on the SOAR host with a checkout of [soar-agent-definitions](https://github.com/abuis78/soar-agent-definitions) (`agents/<agent_id>.toml`, `skills/<skill_id>.toml`). Set = `run agent`, `list agents` and `list skills` read the TOML files instead of the Custom Lists, and the audit field `definition_version` becomes `<id>@<version>#<sha256 prefix>` for the agent and each skill (RT-B02). `create agent` / `create skill` still write the Custom Lists until 5.3 | — |
+| `definitions_path` | Directory on the SOAR host with a checkout of [soar-agent-definitions](https://github.com/abuis78/soar-agent-definitions) (`agents/<agent_id>.toml`, `skills/<skill_id>.toml`). Set = `run agent`, `list agents` and `list skills` read the TOML files instead of the Custom Lists, and the audit field `definition_version` becomes `<id>@<version>#<sha256 prefix>` for the agent and each skill (RT-B02). `create agent` / `create skill` are refused while it is set (E5) | — |
 
 Policy Manager (effecting actions in `airgap_mode`, RT-W01/RT-W03; the air-gap and Tool Broker fields are documented with sub-change 5.5):
 
@@ -168,7 +168,7 @@ makes no policy request: it writes the artifact `agent_action_gap` (CEF `lauf_id
 ---
 
 ### `create agent`
-Creates or updates an agent in the `agent_definitions` Custom List.
+Creates or updates an agent in the `agent_definitions` Custom List. With `definitions_path` set, the action is refused and saves nothing: agents then come only from Git (decision E5).
 
 **Prerequisite:** the Custom Lists `agent_definitions` and `agent_skills` (names from the asset fields `agent_list_name` and `skill_list_name`) must exist; create them once under **Home → Custom Lists**. The app reads and writes them over the SOAR REST API (`/rest/decided_list`) as the user who runs the action. Saving appends a row; for the same `agent_id` the latest row wins. If saving fails, the action message names the list and the cause.
 
@@ -190,7 +190,7 @@ Available tools: `splunk_search`, `add_note`, `update_severity`, `get_container_
 ---
 
 ### `create skill`
-Creates or updates a skill in the `agent_skills` Custom List.
+Creates or updates a skill in the `agent_skills` Custom List. With `definitions_path` set, the action is refused and saves nothing (E5).
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
@@ -622,3 +622,4 @@ Unit and integration tests run with `uv` and the bundled wheels (see the command
 | 1.12.3 | 2026-10-25 | `get_container_info` leaves out the runtime's own artifacts (`agent_audit`, proposals, gaps), which fed old thoughts and parameters back to the model (E2E finding E-7); new fields `runtime_artifacts_hidden`, `artifacts_total`. A turn in Markdown is still not executed, but the correction names it and shows the exact plain form |
 | 1.13.0 | 2026-10-25 | Phase 5.1 (RT-B01, AC-13): in `airgap_mode` the halt state is asked before every step; halted or unknown ends the run before the model is called, with audit phase `angehalten`. Airgap without a working policy gate now stops before step 1 (before: only effecting calls were denied) |
 | 1.14.0 | 2026-10-25 | Phase 5.2 (RT-B02): new asset field `definitions_path`; agents and skills come from TOML files in a checkout of the repository soar-agent-definitions, validated per file (id = file name, required fields, types, known tools). Audit `definition_version` = `<id>@<version>#<sha256 prefix>` for the agent and its skills. `test connectivity` reports the definitions. Empty field = Custom Lists as before |
+| 1.15.0 | 2026-10-25 | Phase 5.3 (E5): with `definitions_path` set, `create agent` and `create skill` are refused with a pointer to the definitions repository and write nothing; `list agents` / `list skills` read from Git since 1.14.0. Empty field = unchanged |

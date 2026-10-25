@@ -281,3 +281,43 @@ def test_app_json_declares_definitions_path_last():
     field = config["definitions_path"]
     assert field["data_type"] == "string" and field["required"] is False
     assert field["order"] == max(v["order"] for v in config.values())
+
+
+# --- create agent / create skill with definitions_path (E5, 5.3) ------------------
+
+class _NoWriteStore:
+    def __init__(self, *a, **kw):
+        raise AssertionError("a Custom List store must not be built")
+
+
+@pytest.mark.parametrize("handler,param,file", [
+    ("_handle_create_agent", {"agent_id": "triage", "system_prompt": "p", "provider": "local", "model": "m"},
+     "agents/triage.toml"),
+    ("_handle_create_skill", {"skill_id": "verdict", "inject": "x"}, "skills/verdict.toml"),
+])
+def test_create_is_refused_and_writes_nothing_with_definitions_path(monkeypatch, tmp_path, handler, param, file):
+    monkeypatch.setattr(connector_module, "AgentDefinitionStore", _NoWriteStore)
+    monkeypatch.setattr(connector_module, "SkillStore", _NoWriteStore)
+    c = make_connector(definitions_path=str(tmp_path))
+    assert getattr(c, handler)(param) is False
+    message = c.action_results[-1].message
+    assert "Definitions come from Git" in message and "nothing was saved" in message and file in message
+    assert not list(tmp_path.rglob("*.toml"))
+
+
+def test_create_agent_without_definitions_path_still_uses_the_custom_list(monkeypatch):
+    saved = []
+
+    class Store:
+        def __init__(self, *a, **kw):
+            pass
+
+        def save(self, agent_id, config):
+            saved.append(agent_id)
+            return True
+
+    monkeypatch.setattr(connector_module, "AgentDefinitionStore", Store)
+    c = make_connector()
+    assert c._handle_create_agent({"agent_id": "triage", "system_prompt": "p", "provider": "local",
+                                   "model": "m", "allowed_tools": "add_note"}) is True
+    assert saved == ["triage"]

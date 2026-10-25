@@ -749,6 +749,12 @@ class SoarAgentRuntimeConnector(BaseConnector):
             return definition_version(agent_def)
         return ", ".join(d["definition_version"] for d in [agent_def, *skills] if d.get("definition_version"))
 
+    def _git_refusal(self, kind: str, def_id: str) -> str:
+        """E5 (5.3): with definitions_path set, Git is the only source, so create writes nothing."""
+        return (f"Definitions come from Git (definitions_path {self._definitions_path}); nothing was saved. "
+                f"Add or edit {kind}/{def_id}.toml in the definitions repository and update the "
+                f"checkout on the SOAR host.")
+
     def _handle_create_agent(self, param):
         action_result = self.add_action_result(ActionResult(dict(param)))
         agent_id = param.get("agent_id", "")
@@ -757,6 +763,8 @@ class SoarAgentRuntimeConnector(BaseConnector):
         if not self._valid_id(agent_id):
             return action_result.set_status(
                 phantom.APP_ERROR, "agent_id must match [A-Za-z0-9_.-] and be 1-64 chars.")
+        if self._definitions_path:
+            return action_result.set_status(phantom.APP_ERROR, self._git_refusal(AGENTS_DIR, agent_id))
 
         # Contract H: an unknown name used to be stored silently and the tool never offered.
         if unknown := unknown_tool_names(param.get("allowed_tools") or ""):
@@ -840,6 +848,8 @@ class SoarAgentRuntimeConnector(BaseConnector):
         if not self._valid_id(skill_id):
             return action_result.set_status(
                 phantom.APP_ERROR, "skill_id must match [A-Za-z0-9_.-] and be 1-64 chars.")
+        if self._definitions_path:
+            return action_result.set_status(phantom.APP_ERROR, self._git_refusal(SKILLS_DIR, skill_id))
 
         output_schema_str = param.get("output_schema", "")
         output_schema = None
