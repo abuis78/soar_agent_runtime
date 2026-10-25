@@ -19,6 +19,7 @@ from soar_agent_runtime_utils import (
     AGENT_ROLES,
     DEFAULT_AGENT_ROLE,
     MAX_STEPS_HARD_LIMIT,
+    DEFAULT_SUBAGENT_DEPTH,
     new_run_id,
     SoarCustomList,
     compact_rows,
@@ -157,6 +158,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
         self._llm_max_tokens = 4096
         self._llm_seed = None
         self._max_observation_chars = 8000
+        self._max_subagent_depth = DEFAULT_SUBAGENT_DEPTH   # RT-B03 (5.4)
         self._audit_enabled = False
         # RT-L07 (Umsetzungskonzept 2.1): Tool Broker connection, mTLS via file paths
         self._broker_url = ""
@@ -191,6 +193,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
         self._llm_max_tokens = self._cfg_number("llm_max_tokens", 4096, int)
         self._llm_seed = self._cfg_number("llm_seed", None, int)
         self._max_observation_chars = self._cfg_number("max_observation_chars", 8000, int)
+        self._max_subagent_depth = max(0, self._cfg_number("max_subagent_depth", DEFAULT_SUBAGENT_DEPTH, int))
         self._audit_enabled = bool(self._config.get("audit_enabled", False))
         self._broker_url = (self._config.get("broker_url") or "").strip()
         self._broker_timeout_s = self._cfg_number("broker_timeout_s", 30.0, float)
@@ -588,22 +591,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
         except ValueError as e:
             return action_result.set_status(phantom.APP_ERROR, str(e))
 
-        # Resolve max steps with hard cap (Issue #4: DoS prevention)
-        max_steps = max_steps_override or agent_def.get("max_steps") or self._default_max_steps
-        if max_steps <= 0:
-            max_steps = self._default_max_steps
-        if max_steps > MAX_STEPS_HARD_LIMIT:
-            self.save_progress(f"Warning: max_steps capped at {MAX_STEPS_HARD_LIMIT} (requested: {max_steps}).")
-            max_steps = MAX_STEPS_HARD_LIMIT
-
-        # Build LLM provider
-        provider = agent_def.get("provider") or self._default_provider
-        model = agent_def.get("model", "")
-        self.save_progress(f"Provider: {provider} / {model}")
-        try:
-            llm = self._build_llm_provider(provider, model)
-        except ValueError as e:
-            return action_result.set_status(phantom.APP_ERROR, str(e))
+        max_steps = self._capped_steps(max_steps_override or agent_def.get("max_steps"))
 
         # Tool Broker (RT-L07): misconfiguration is fatal in airgap_mode,
         # a warning otherwise. Unreachable brokers are handled per run (RT-L06).
@@ -620,59 +608,6 @@ class SoarAgentRuntimeConnector(BaseConnector):
             self.save_progress(f"[policy] mode={getattr(policy, 'mode', '') or 'none'} "
                                f"({'ready' if policy and policy.health()[0] else 'not available - effecting actions denied'})")
 
-        # One lauf_id for broker context, audit and result (RT-P01)
-        run_id = new_run_id()
-
-        # Build tool registry
-        allowed_tools_raw = agent_def.get("allowed_tools", ["add_note"])
-        if isinstance(allowed_tools_raw, str):
-            allowed_tools = [t.strip() for t in allowed_tools_raw.split(",")]
-        else:
-            allowed_tools = allowed_tools_raw
-        tools = ToolRegistry(
-            self,
-            container_id,
-            allowed_tools,
-            telemetry=self._telemetry,
-            agent_id=agent_id,
-            agent_role=agent_def.get("agent_role", DEFAULT_AGENT_ROLE),
-            broker=broker,
-            run_id=run_id,
-            airgap=self._airgap_mode,
-            policy=policy,
-            stage=stage,
-            domain=domain,
-        )
-        tools.load_broker_tools()  # RT-L03: templates once per run
-        tools.load_catalog()       # RT-W09: building blocks once per run (empty outside airgap)
-        if tools.halted:
-            # RT-B01 / RT-L05: halt state known before the first step -> do not start.
-            return action_result.set_status(
-                phantom.APP_ERROR, "Tool Broker is HALTED - run not started (RT-B01)")
-
-        # Load and inject skills
-        skill_ids = agent_def.get("skills", [])
-        if isinstance(skill_ids, str):
-            skill_ids = [s.strip() for s in skill_ids.split(",") if s.strip()]
-        skill_injection = ""
-        required_keys: list[str] = []
-        loaded_skills: list[dict] = []
-        if skill_ids:
-            self.save_progress(f"Loading skills: {skill_ids}")
-            skill_store = self._skill_store()
-            try:
-                loaded_skills = skill_store.load_many(skill_ids)
-            except ValueError as e:  # the agent asks for skills, so an unreadable list is fatal
-                return action_result.set_status(phantom.APP_ERROR, str(e))
-            skill_injection = SkillStore.build_injection(loaded_skills)
-            # RT-P04 (E3): a skill's output_schema template is a required
-            # top-level key set for FINAL_ANSWER.
-            for skill in loaded_skills:
-                schema = skill.get("output_schema")
-                if isinstance(schema, dict):
-                    required_keys += [k for k in schema if k not in required_keys]
-            self.save_progress(f"Injected {len(loaded_skills)} skill(s).")
-
         # Audit sink (RT-P02/P03, E2): artifact per step; mandatory and
         # fail-closed in airgap_mode, optional and fail-open otherwise.
         if self._airgap_mode or self._audit_enabled:
@@ -680,25 +615,12 @@ class SoarAgentRuntimeConnector(BaseConnector):
         else:
             audit = NullAuditSink()
 
-        # Run ReAct loop
-        system_prompt = agent_def.get("system_prompt", "You are a SOC analyst agent.")
-        loop = ReActLoop(
-            connector=self,
-            llm=llm,
-            tools=tools,
-            run_id=run_id,
-            agent_id=agent_id,
-            system_prompt=system_prompt,
-            max_steps=max_steps,
-            container_id=container_id,
-            extra_context=extra_context_str,
-            skill_injection=skill_injection,
-            audit=audit,
-            def_version=self._definition_version(agent_def, loaded_skills),
-            strict_schema=self._airgap_mode,
-            required_keys=required_keys,
-            max_observation_chars=self._max_observation_chars,
-        )
+        # One lauf_id for broker context, audit, sub-agents and result (RT-P01, RT-B03)
+        run = {"run_id": new_run_id(), "container_id": container_id, "broker": broker, "policy": policy,
+               "audit": audit, "stage": stage, "domain": domain}
+        loop, error = self._build_loop(run, agent_id, agent_def, max_steps, depth=0, extra_context=extra_context_str)
+        if error:
+            return action_result.set_status(phantom.APP_ERROR, error)
         result = loop.run(task)
         audit.flush()
         actions = executed_actions(result.get("step_log"))
@@ -741,6 +663,120 @@ class SoarAgentRuntimeConnector(BaseConnector):
     # -----------------------------------------------------------------------
     # Action: create agent
     # -----------------------------------------------------------------------
+
+    def _capped_steps(self, requested) -> int:
+        """Step limit of a definition or override, hard-capped (Issue #4: DoS prevention)."""
+        max_steps = requested or self._default_max_steps
+        if max_steps <= 0:
+            max_steps = self._default_max_steps
+        if max_steps > MAX_STEPS_HARD_LIMIT:
+            self.save_progress(f"Warning: max_steps capped at {MAX_STEPS_HARD_LIMIT} (requested: {max_steps}).")
+            max_steps = MAX_STEPS_HARD_LIMIT
+        return max_steps
+
+    def _build_loop(self, run: dict, agent_id: str, agent_def: dict, max_steps: int, *, depth: int,
+                    extra_context: str = "", step_id_prefix: str | None = None):
+        """ReActLoop for one agent of a run: the started agent (depth 0) or a sub-agent
+        (RT-B03). Returns (loop, None) or (None, error text)."""
+        provider = agent_def.get("provider") or self._default_provider
+        model = agent_def.get("model", "")
+        self.save_progress(f"Provider: {provider} / {model}")
+        try:
+            llm = self._build_llm_provider(provider, model)
+        except ValueError as e:
+            return None, str(e)
+
+        allowed_tools_raw = agent_def.get("allowed_tools", ["add_note"])
+        if isinstance(allowed_tools_raw, str):
+            allowed_tools = [t.strip() for t in allowed_tools_raw.split(",")]
+        else:
+            allowed_tools = allowed_tools_raw
+        tools = ToolRegistry(
+            self,
+            run["container_id"],
+            allowed_tools,
+            telemetry=self._telemetry,
+            agent_id=agent_id,
+            agent_role=agent_def.get("agent_role", DEFAULT_AGENT_ROLE),
+            broker=run["broker"],
+            run_id=run["run_id"],
+            airgap=self._airgap_mode,
+            policy=run["policy"],
+            stage=run["stage"],
+            domain=run["domain"],
+            spawn=lambda **kw: self._run_sub_agent(run, **kw),
+            depth=depth,
+            max_depth=self._max_subagent_depth,
+        )
+        tools.load_broker_tools()  # RT-L03: templates once per agent, with its own agent_id
+        tools.load_catalog()       # RT-W09: building blocks once per agent (empty outside airgap)
+        if tools.halted:
+            # RT-B01 / RT-L05: halt state known before the first step -> do not start.
+            return None, "Tool Broker is HALTED - run not started (RT-B01)"
+
+        # Load and inject skills
+        skill_ids = agent_def.get("skills", [])
+        if isinstance(skill_ids, str):
+            skill_ids = [s.strip() for s in skill_ids.split(",") if s.strip()]
+        skill_injection = ""
+        required_keys: list[str] = []
+        loaded_skills: list[dict] = []
+        if skill_ids:
+            self.save_progress(f"Loading skills: {skill_ids}")
+            skill_store = self._skill_store()
+            try:
+                loaded_skills = skill_store.load_many(skill_ids)
+            except ValueError as e:  # the agent asks for skills, so an unreadable list is fatal
+                return None, str(e)
+            skill_injection = SkillStore.build_injection(loaded_skills)
+            # RT-P04 (E3): a skill's output_schema template is a required
+            # top-level key set for FINAL_ANSWER.
+            for skill in loaded_skills:
+                schema = skill.get("output_schema")
+                if isinstance(schema, dict):
+                    required_keys += [k for k in schema if k not in required_keys]
+            self.save_progress(f"Injected {len(loaded_skills)} skill(s).")
+
+        loop = ReActLoop(
+            connector=self,
+            llm=llm,
+            tools=tools,
+            run_id=run["run_id"],
+            step_id_prefix=step_id_prefix,
+            agent_id=agent_id,
+            system_prompt=agent_def.get("system_prompt", "You are a SOC analyst agent."),
+            max_steps=max_steps,
+            container_id=run["container_id"],
+            extra_context=extra_context,
+            skill_injection=skill_injection,
+            audit=run["audit"],
+            def_version=self._definition_version(agent_def, loaded_skills),
+            strict_schema=self._airgap_mode,
+            required_keys=required_keys,
+            max_observation_chars=self._max_observation_chars,
+        )
+        return loop, None
+
+    def _run_sub_agent(self, run: dict, *, agent_id: str, task: str, depth: int, step_id: str,
+                       max_steps: int | None) -> dict:
+        """spawn() of RT-B03: same run, the child's own definition, allowlist and broker
+        context; its steps go below the calling step (rt-.../3/1) and use up the caller's budget."""
+        if not self._valid_id(agent_id):
+            return {"final_answer": "ERROR: agent_id must match [A-Za-z0-9_.-] and be 1-64 chars.", "steps_taken": 0}
+        try:
+            agent_def = self._agent_store().load(agent_id)
+        except ValueError as e:
+            return {"final_answer": f"ERROR: {e}", "steps_taken": 0}
+        steps = self._capped_steps(agent_def.get("max_steps"))
+        if max_steps is not None:
+            steps = min(steps, max_steps)
+        loop, error = self._build_loop(run, agent_id, agent_def, steps, depth=depth, step_id_prefix=step_id)
+        if error:
+            return {"final_answer": f"ERROR: {error}", "steps_taken": 0}
+        result = loop.run(task)
+        result["halted"] = bool(loop.tools.halted)
+        result["halt_source"] = loop.tools.halt_source
+        return result
 
     @staticmethod
     def _definition_version(agent_def: dict, skills: list[dict]) -> str:

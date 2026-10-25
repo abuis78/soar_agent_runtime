@@ -275,12 +275,12 @@ def test_connectivity_definitions_without_path_or_with_a_wrong_one(config, expec
     assert results["definitions"].startswith(expected)
 
 
-def test_app_json_declares_definitions_path_last():
+def test_app_json_declares_definitions_path():
     with open("soar_agent_runtime.json") as fh:
         config = json.load(fh)["configuration"]
     field = config["definitions_path"]
     assert field["data_type"] == "string" and field["required"] is False
-    assert field["order"] == max(v["order"] for v in config.values())
+    assert field["order"] == 37
 
 
 # --- create agent / create skill with definitions_path (E5, 5.3) ------------------
