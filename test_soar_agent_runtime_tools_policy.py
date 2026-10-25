@@ -423,9 +423,10 @@ def test_loop_ends_when_the_policy_manager_is_halted(rules):
     rules.get_container = lambda cid: {"id": cid}
     rules.get_artifacts = lambda container_id: []
     result = loop.run("t")
-    assert result["final_answer"] == "ERROR: run halted by Policy Manager (HALTED)"
-    assert result["steps_taken"] == 2 and len(llm.seen) == 2 and rules.calls == []
-    assert sink.events[-1]["phase"] == "fehler" and sink.events[-1]["werkzeug"] == "update_severity"
+    # 5.1 (RT-B01): the halt state is asked before step 1, so the model is never called.
+    assert result["final_answer"] == "ERROR: run halted by Policy Manager (halted: stub halt)"
+    assert result["steps_taken"] == 1 and len(llm.seen) == 0 and rules.calls == []
+    assert sink.events[-1]["phase"] == "angehalten" and sink.events[-1]["werkzeug"] == "HALT"
 
 
 def test_loop_continues_after_a_held_proposal(rules):

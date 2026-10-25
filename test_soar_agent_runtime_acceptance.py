@@ -109,6 +109,11 @@ def make_connector(**config) -> SoarAgentRuntimeConnector:
     c = SoarAgentRuntimeConnector()
     c._fake_config = {"anthropic_api_key": "k", "local_llm_url": LOCAL_URL, **config}
     assert c.initialize() is True
+    if config.get("airgap_mode") and not config.get("policy_mode"):
+        # 5.1 (RT-B01): airgap asks the Policy Manager before every step and an unknown
+        # halt state stops the run. Tests that are not about the gate get a healthy,
+        # not-halted one; gate tests replace it (policy_connector) or set policy_mode.
+        c._policy_client = StubPolicyClient()
     return c
 
 
@@ -590,11 +595,13 @@ def test_ac06_missing_policy_mode_executes_nothing_and_names_the_reason(platform
     llm["responses"] = effect_script("update_severity")
     c = policy_connector(monkeypatch)                                 # no policy_mode in the asset
     status, result = run(c)
-    assert status is True, result.message
-    assert platform["severity"] == []
-    obs = step_log(result)[1]["observation"]
-    assert obs.startswith("POLICY DENIED code=NO_POLICY_MODE (policy_mode missing or invalid")
-    assert "'update_severity' was not executed" in obs
+    # 5.1 (RT-B01, D25): without a gate the halt state is unknown, so the run stops
+    # before step 1 - stricter than AC-06 asks: no model call, nothing executed.
+    assert status is False and platform["severity"] == [] and llm["calls"] == 0
+    log = step_log(result)
+    assert len(log) == 1 and log[0]["action"] == "HALT"
+    assert log[0]["observation"].startswith(
+        "run halted by Policy Manager before step 1: halt state unknown: policy_mode missing or invalid")
     assert any("policy_mode not set" in m for m in c.progress)
 
 
@@ -606,10 +613,10 @@ def test_ac06_missing_policy_package_executes_nothing_and_names_the_reason(platf
     c = policy_connector(monkeypatch, policy_mode="embedded", policy_path="/etc/pm/policy.json",
                          policy_state_dir="/var/pm")
     status, result = run(c)
-    assert status is True, result.message
-    assert platform["severity"] == []
-    obs = step_log(result)[1]["observation"]
-    assert obs.startswith("POLICY DENIED code=UNAVAILABLE (policy_client package not available (ModuleNotFoundError)")
+    assert status is False and platform["severity"] == [] and llm["calls"] == 0     # 5.1: stops before step 1
+    obs = step_log(result)[0]["observation"]
+    assert obs.startswith("run halted by Policy Manager before step 1: halt state unknown: "
+                          "policy_client package not available (ModuleNotFoundError)")
     assert any(m.startswith("[policy] mode=none (not available") for m in c.progress)
 
 
@@ -627,11 +634,9 @@ def test_ac06_unreachable_policy_manager_executes_nothing_and_names_the_reason(p
     llm["responses"] = effect_script("update_severity")
     c = policy_connector(monkeypatch, PolicyClientAdapter(Unreachable(), Req, "embedded"))
     status, result = run(c)
-    assert status is True, result.message
-    assert platform["severity"] == []
-    obs = step_log(result)[1]["observation"]
-    assert obs.startswith("POLICY DENIED code=UNAVAILABLE (") and "ConnectionError" in obs
-    assert "'update_severity' was not executed" in obs
+    assert status is False and platform["severity"] == [] and llm["calls"] == 0     # 5.1: stops before step 1
+    obs = step_log(result)[0]["observation"]
+    assert obs.startswith("run halted by Policy Manager before step 1: halt state unknown: policy client failed")
 
 
 # --- AC-07 ------------------------------------------------------------------
@@ -850,9 +855,9 @@ def test_rtw10_report_gap_exists_only_with_a_policy_gate(platform, llm, monkeypa
     llm["responses"] = script("report_gap", GAP)
     c = policy_connector(monkeypatch)                                  # airgap, but no policy_mode (RT-W03)
     status, result = run(c)
-    assert status is True, result.message
-    assert "report_gap" not in llm["system_prompts"][0] and gaps(c) == [] and agent_notes(platform) == []
-    assert step_log(result)[1]["observation"] == "ERROR: Tool 'report_gap' is not in the allowed tools list."
+    # 5.1: without a gate the run stops before step 1, so report_gap is never offered.
+    assert status is False and llm["calls"] == 0 and gaps(c) == [] and agent_notes(platform) == []
+    assert step_log(result)[0]["action"] == "HALT"
 
 
 def test_ac15_report_gap_does_not_exist_outside_airgap(platform, llm):
@@ -937,11 +942,10 @@ def test_rtw04_service_without_certificates_denies_every_effecting_action(platfo
     llm["responses"] = effect_script("update_severity")
     c = policy_connector(monkeypatch, policy_mode="service", policy_service_url="https://pm.internal:8443")
     status, result = run(c)
-    assert status is True, result.message
-    assert platform["severity"] == [] and svc.instances == []          # the client was never built
-    obs = step_log(result)[1]["observation"]
-    assert obs.startswith("POLICY DENIED code=NO_POLICY_MODE (policy_mode 'service' needs policy_client_cert, "
-                          "policy_client_key, policy_ca")
+    assert status is False and platform["severity"] == [] and svc.instances == []   # client never built
+    obs = step_log(result)[0]["observation"]                            # 5.1: stops before step 1
+    assert obs.startswith("run halted by Policy Manager before step 1: halt state unknown: "
+                          "policy_mode 'service' needs policy_client_cert, policy_client_key, policy_ca")
     assert any(m.startswith("[policy] mode=none (not available - effecting actions denied)") for m in c.progress)
 
 
@@ -965,3 +969,64 @@ def test_rtw04_service_decisions_and_catalogue_come_from_the_package_client(plat
     assert proposal["cef"]["gate"] == "ALLOW" and proposal["cef"]["entscheidung_id"] == "pm-s1"
     assert proposal["cef"]["policy_version"] == "v5" and platform["severity"] == []
     assert step_log(result)[1]["observation"].endswith("(entscheidung_id=pm-s1)")
+
+
+
+# --- AC-13 (RT-B01, 5.1): emergency stop before every step ---------------------------------
+
+class _HaltAfter:
+    """Healthy gate that reports halted from the n-th halt query on."""
+
+    def __init__(self, healthy_queries, known=True):
+        self.left, self.known, self.queries = healthy_queries, known, 0
+
+    def __getattr__(self, name):
+        return getattr(StubPolicyClient(), name)
+
+    def halt_status(self):
+        from soar_agent_runtime_policy import HaltState
+        self.queries += 1
+        if self.queries <= self.left:
+            return HaltState(halted=False, reason="", known=True)
+        return HaltState(halted=True, reason="operator stop" if self.known else "halt.json unreadable", known=self.known)
+
+
+def test_ac13_halted_policy_manager_stops_before_the_first_step(platform, llm, monkeypatch):
+    define_agent(platform, provider="local")
+    llm["responses"] = effect_script("update_severity")
+    c = policy_connector(monkeypatch, StubPolicyClient(halted=True))
+    status, result = run(c)
+    assert status is False and llm["calls"] == 0 and platform["severity"] == []
+    assert result.message == "ERROR: run halted by Policy Manager (halted: stub halt)"
+    assert [e["phase"] for e in audit_events(c)] == ["angehalten"]
+
+
+def test_ac13_unknown_halt_state_counts_as_halted(platform, llm, monkeypatch):
+    define_agent(platform, provider="local")
+    llm["responses"] = effect_script("update_severity")
+    c = policy_connector(monkeypatch, _HaltAfter(0, known=False))
+    status, result = run(c)
+    assert status is False and llm["calls"] == 0
+    assert result.message == "ERROR: run halted by Policy Manager (halt state unknown: halt.json unreadable)"
+
+
+def test_ac13_halt_during_the_run_stops_before_the_next_step(platform, llm, monkeypatch):
+    define_agent(platform, provider="local")
+    llm["responses"] = ["THOUGHT: look\nACTION: get_container_info", "THOUGHT: more\nACTION: get_container_info",
+                        "FINAL_ANSWER: never"]
+    gate = _HaltAfter(1)
+    c = policy_connector(monkeypatch, gate)
+    status, result = run(c)
+    log = step_log(result)
+    assert status is False and llm["calls"] == 1                       # step 1 ran, step 2 never asked the model
+    assert [e["action"] for e in log] == ["get_container_info", "HALT"]
+    assert log[1]["observation"] == "run halted by Policy Manager before step 2: halted: operator stop"
+
+
+def test_ac13_outside_airgap_the_halt_state_is_not_asked(platform, llm):
+    define_agent(platform, provider="local", allowed_tools=["add_note"])
+    llm["responses"] = ["FINAL_ANSWER: done"]
+    c = make_connector()
+    c._policy_client = StubPolicyClient(halted=True)                   # ignored outside airgap (E4)
+    status, result = run(c)
+    assert status is True and llm["calls"] == 1

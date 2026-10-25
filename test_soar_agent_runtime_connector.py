@@ -310,6 +310,7 @@ def test_run_agent_in_airgap_writes_audit_artifacts_end_to_end(monkeypatch):
     monkeypatch.setattr(connector_module.LLMProvider, "chat",
                         lambda self, system_prompt, messages: _VALID_VERDICT)
     c = make_connector(airgap_mode=True)
+    c._policy_client = StubPolicyClient()   # 5.1: airgap asks the gate before every step
     status = c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 9})
     assert status is True
     assert len(c.artifacts) == 1
@@ -325,6 +326,7 @@ def test_run_agent_in_airgap_fails_closed_when_artifacts_cannot_be_written(monke
     monkeypatch.setattr(connector_module.LLMProvider, "chat",
                         lambda self, system_prompt, messages: "FINAL_ANSWER: ok")
     c = make_connector(airgap_mode=True)
+    c._policy_client = StubPolicyClient()   # 5.1: airgap asks the gate before every step
     c.save_artifact = lambda artifact: (False, "disk full", None)
     status = c._handle_run_agent({"agent_id": "triage", "task": "look", "container_id": 9})
     assert status is False
