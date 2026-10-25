@@ -36,6 +36,64 @@ except ImportError:
 _ID_RE = re.compile(r'^[A-Za-z0-9_.\-]{1,64}$')
 
 
+# --- what really happened in a run (contract E, 1.10.3) ---------------------------------
+# The model's FINAL_ANSWER is a claim. A 7B model once answered "severity updated to
+# high" without ever calling update_severity (run rt-20261025T050736Z-cf477c13), so the
+# summary note lists the executed actions from the step log next to the claim.
+
+# Effecting tools: name -> (observation prefix that means it took effect, claim pattern).
+EFFECT_CHECKS = {
+    "update_severity": ("Container severity updated to:", r"\bseverit(y|ies)\b"),
+    "catalog_invoke":  ("ALLOWED:", r"\b(propos(al|ed)|building block|baustein)"),
+}
+
+
+def executed_actions(step_log) -> list[dict]:
+    """Tool calls of a run (FINAL_ANSWER excluded) with a one-line outcome each."""
+    if isinstance(step_log, str):
+        try:
+            step_log = json.loads(step_log)
+        except ValueError:
+            return []
+    actions = []
+    for entry in step_log or []:
+        tool = (entry or {}).get("action") or ""
+        if not tool or tool == "FINAL_ANSWER":
+            continue
+        observation = str(entry.get("observation", "")).strip()
+        first_line = observation.splitlines()[0] if observation else ""
+        if observation.startswith("{"):
+            first_line = "data returned"
+        effect_prefix = EFFECT_CHECKS.get(tool, (None,))[0]
+        actions.append({
+            "step": entry.get("step"),
+            "tool": tool,
+            "outcome": first_line[:160],
+            "took_effect": bool(effect_prefix and observation.startswith(effect_prefix)),
+        })
+    return actions
+
+
+def unbacked_claims(final_answer: str, actions: list[dict]) -> list[str]:
+    """Effecting tools the answer seems to talk about although none of their calls took effect."""
+    import re
+    warnings = []
+    for tool, (_prefix, pattern) in EFFECT_CHECKS.items():
+        if re.search(pattern, final_answer or "", re.IGNORECASE) and not any(
+                a["tool"] == tool and a["took_effect"] for a in actions):
+            warnings.append(f"The answer mentions what {tool} does, but no {tool} call took effect in this run.")
+    return warnings
+
+
+def executed_actions_block(final_answer: str, actions: list[dict]) -> str:
+    lines = ["**Executed actions** (from the step log, not from the model):"]
+    lines += [f"- step {a['step']}: `{a['tool']}` - {a['outcome'] or 'no observation'}" for a in actions] or [
+        "- none"]
+    if warnings := unbacked_claims(final_answer, actions):
+        lines += ["", *[f"**Warning:** {w}" for w in warnings]]
+    return "\n".join(lines)
+
+
 class SoarAgentRuntimeConnector(BaseConnector):
 
     def __init__(self):
@@ -552,6 +610,9 @@ class SoarAgentRuntimeConnector(BaseConnector):
         )
         result = loop.run(task)
         audit.flush()
+        actions = executed_actions(result.get("step_log"))
+        result["executed_actions"] = actions
+        result["unbelegte_behauptungen"] = unbacked_claims(result["final_answer"], actions)
         action_result.add_data(result)
 
         # Add summary note
@@ -563,6 +624,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
                 title=f"[Agent: {agent_id}] {task[:60]}",
                 content=(
                     f"**Final Answer:**\n{result['final_answer']}\n\n"
+                    f"{executed_actions_block(result['final_answer'], actions)}\n\n"
                     f"**Steps:** {result['steps_taken']} | **Provider:** {result['provider']} / {result['model']} "
                     f"| **lauf_id:** {result['lauf_id']}"
                 )
@@ -577,7 +639,8 @@ class SoarAgentRuntimeConnector(BaseConnector):
             "audit_ereignisse": result["audit_ereignisse"],
             "audit_fehler": result["audit_fehler"],
             "provider": result["provider"],
-            "model": result["model"]
+            "model": result["model"],
+            "unbelegte_behauptungen": len(result["unbelegte_behauptungen"]),
         })
 
         if result["final_answer"].startswith("ERROR"):

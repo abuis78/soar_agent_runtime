@@ -263,6 +263,14 @@ def test_ac12_every_step_is_audited_with_lauf_id_and_schritt_id(platform, llm, m
     assert all(e["lauf_id"] == lauf_id for e in cefs)
     assert platform["severity"] == [(23, "high")]
     assert cefs[2]["entscheidung_id"] == "pm-stub-1"
+    # Contract E (1.10.3): the summary note lists what really ran.
+    summary = next(n for n in platform["notes"] if n["title"].startswith("[Agent:"))["content"]
+    assert "**Executed actions** (from the step log, not from the model):" in summary
+    assert "- step 2: `update_severity` - Container severity updated to: high" in summary
+    assert "**Warning:**" not in summary
+    assert result.data[0]["executed_actions"][1] == {
+        "step": 2, "tool": "update_severity", "took_effect": True,
+        "outcome": "Container severity updated to: high (entscheidung_id=pm-stub-1)"}
     assert result.summary["audit_ereignisse"] == 4 and result.summary["audit_fehler"] == 0
 
 
