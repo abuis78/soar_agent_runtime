@@ -41,6 +41,7 @@ None.
 2. **Apps → SOAR Agent Runtime → Configure New Asset**
 3. Fill in API keys for the providers you want to use
 4. **Test Connectivity**
+5. Run the action **setup app** once: it creates the Custom Lists `agent_definitions` and `agent_skills` if they are missing and checks the asset (model, and in `airgap_mode` broker and policy fields, files and `halt.json`). `dry_run` only reports.
 
 ---
 
@@ -187,6 +188,15 @@ Creates or updates a skill in the `agent_skills` Custom List.
 | `description` | string | No | Human-readable label |
 | `inject` | string | No | Text injected into system prompt |
 | `output_schema` | string | No | JSON schema enforced in FINAL_ANSWER |
+
+---
+
+### `setup app`
+Creates missing Custom Lists, removes older duplicate agent and skill rows (the latest row per id stays) and checks the asset configuration. Returns one row per check with the status `OK`, `CREATED`, `FIXED`, `MISSING`, `ERROR` or, with `dry_run`, `WOULD_CREATE` / `WOULD_FIX`. The action fails when any check is `MISSING` or `ERROR`; the message names each one.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `dry_run` | boolean | No | Only check and report; create and change nothing |
 
 ---
 
@@ -578,3 +588,4 @@ Unit and integration tests run with `uv` and the bundled wheels (see the command
 | 1.10.1 | 2026-10-25 | `get_container_info` reads the case over the SOAR REST API (`/rest/container/<id>` and its artifacts, at most 5) instead of `phantom.rules.get_container`/`get_artifacts`, which need a playbook context and failed on SOAR 8.7 |
 | 1.10.2 | 2026-10-25 | `update_severity` sets the severity over the SOAR REST API (`POST /rest/container/<id>`) after an allowed policy decision instead of `phantom.rules.update_container`, which apps cannot call on SOAR 8.7; a rejected value is named in the observation |
 | 1.10.3 | 2026-10-25 | `run agent` summary note lists the executed actions from the step log and warns when the answer claims an effect (`update_severity`, `catalog_invoke`) that did not take effect; result data `executed_actions` and `unbelegte_behauptungen` |
+| 1.11.0 | 2026-10-25 | New action `setup app`: creates missing Custom Lists, removes older duplicate agent/skill rows, checks model and (in `airgap_mode`) broker, policy, files and `halt.json`; `dry_run`. `test connectivity` reports missing Custom Lists without writing |
