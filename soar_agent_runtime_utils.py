@@ -729,7 +729,7 @@ class ToolRegistry:
                     "begruendung (text), gegenargumente and unsicherheiten (text or list of strings, "
                     "'keine erkannt' if none), konfidenz (number 0..1), beleg_ids (non-empty JSON list of this "
                     "run's aufruf_id or earlier schritt_id values). Nothing was executed. "
-                    + (f"{'; '.join(hints)}. " if hints else "")
+                    + (f"{' '.join(hints)} " if hints else "")   # each hint ends with '?'
                     + f"Valid evidence ids now: {valid_now}.")
         valid = self.valid_evidence()
         bad = [str(b) for b in beleg_ids if not isinstance(b, str) or b not in valid]

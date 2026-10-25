@@ -699,7 +699,8 @@ def test_misspelled_judgement_key_is_named_and_the_call_still_refused(rules):
     del params["begruendung"]
     result = reg.execute("update_severity", params)
     assert result.startswith("ERROR: Tool 'update_severity' has an effect and needs 'begruendung':")
-    assert "unknown key 'begrün dung' - did you mean 'begruendung'?" in result
+    assert "unknown key 'begrün dung' - did you mean 'begruendung'? Valid evidence ids now:" in result
+    assert "?." not in result
     assert rules.calls == [] and reg._policy.requests == []
 
 
