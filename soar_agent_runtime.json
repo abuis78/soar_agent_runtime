@@ -6,7 +6,7 @@
     "package_name": "phantom_soar_agent_runtime",
     "type": "generic",
     "license": "Copyright 2026 Andreas Buis",
-    "app_version": "1.10.1",
+    "app_version": "1.10.2",
     "product_vendor": "OpenClaw SOC",
     "product_name": "SOAR Agent Runtime",
     "product_version_regex": ".*",
