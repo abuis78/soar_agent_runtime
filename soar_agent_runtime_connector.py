@@ -20,6 +20,8 @@ from soar_agent_runtime_utils import (
     DEFAULT_AGENT_ROLE,
     MAX_STEPS_HARD_LIMIT,
     new_run_id,
+    SoarCustomList,
+    compact_rows,
 )
 from soar_agent_runtime_audit import ArtifactAuditSink, NullAuditSink, definition_version
 from soar_agent_runtime_broker import BrokerClient, BrokerConfig, BrokerConfigError
@@ -385,6 +387,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
         # the policy gate is not used at all (E4).
         broker_ok = self._test_broker(results)
         policy_ok = self._test_policy(results)
+        self._test_custom_lists(results)  # informational only: never fails the test (contract B)
 
         if not any_success:
             return action_result.set_status(
@@ -420,6 +423,21 @@ class SoarAgentRuntimeConnector(BaseConnector):
             client_key=self._policy_client_key,
             ca=self._policy_ca,
         )
+
+    def _test_custom_lists(self, results: dict) -> None:
+        """Report missing Custom Lists without writing anything; 'setup app' creates them."""
+        missing = []
+        for name in (self._agent_list_name, self._skill_list_name):
+            lst = SoarCustomList(self, name)
+            if not lst.available():
+                return
+            try:
+                if not lst.exists():
+                    missing.append(name)
+            except ValueError as e:
+                results["custom_lists"] = f"ERROR: {e}"
+                return
+        results["custom_lists"] = (f"MISSING: {', '.join(missing)} (run 'setup app')" if missing else "OK")
 
     def _test_broker(self, results: dict) -> bool:
         """Fill results["broker"]; True only when a configured broker answers /health."""
@@ -784,6 +802,121 @@ class SoarAgentRuntimeConnector(BaseConnector):
         return action_result.set_status(phantom.APP_SUCCESS, f"Found {len(skills)} skill(s).")
 
     # -----------------------------------------------------------------------
+    # Action: setup app (contract B, 1.11.0)
+    # -----------------------------------------------------------------------
+    # SOAR runs no app code at install time, so this action does the one-time setup
+    # (Custom Lists) and checks the asset configuration in one place.
+
+    def _handle_setup_app(self, param):
+        action_result = self.add_action_result(ActionResult(dict(param)))
+        dry_run = str(param.get("dry_run", False)).lower() in ("true", "1", "yes")
+        checks: list[dict] = []
+
+        def check(name: str, status: str, detail: str) -> None:
+            checks.append({"check": name, "status": status, "detail": detail})
+
+        self._setup_lists(check, dry_run)
+        self._setup_llm(check)
+        if self._airgap_mode:
+            self._setup_airgap(check)
+        else:
+            check("airgap", "OK", "airgap_mode is off; broker and policy fields are not needed")
+
+        for row in checks:
+            action_result.add_data(row)
+        problems = [c for c in checks if c["status"] in ("MISSING", "ERROR")]
+        changed = [c for c in checks if c["status"] in ("CREATED", "FIXED")]
+        action_result.update_summary({"checks": len(checks), "problems": len(problems),
+                                      "changed": len(changed), "dry_run": dry_run})
+        if problems:
+            return action_result.set_status(
+                phantom.APP_ERROR, f"Setup: {len(problems)} problem(s): "
+                + "; ".join(f"{c['check']}: {c['detail']}" for c in problems))
+        return action_result.set_status(
+            phantom.APP_SUCCESS, f"Setup {'checked (dry run)' if dry_run else 'complete'}: "
+            f"{len(checks)} check(s), {len(changed)} change(s).")
+
+    def _setup_lists(self, check, dry_run: bool) -> None:
+        for kind, name in (("agents", self._agent_list_name), ("skills", self._skill_list_name)):
+            label = f"custom list {name}"
+            lst = SoarCustomList(self, name)
+            if not lst.available():
+                check(label, "ERROR", "SOAR REST not available")
+                continue
+            try:
+                if not lst.exists():
+                    if dry_run:
+                        check(label, "WOULD_CREATE", "list missing; run without dry_run to create it")
+                    else:
+                        lst.create([["", ""]])
+                        check(label, "CREATED", f"empty {kind} list created")
+                    continue
+                compact, dropped = compact_rows(lst.rows())
+                if not dropped:
+                    check(label, "OK", f"{sum(1 for r in compact if r[0])} {kind}, no duplicate rows")
+                elif dry_run:
+                    check(label, "WOULD_FIX", f"{dropped} older duplicate row(s) would be removed")
+                else:
+                    lst.replace(compact)
+                    check(label, "FIXED", f"{dropped} older duplicate row(s) removed, latest row per id kept")
+            except ValueError as e:  # CustomListError / SoarRestError
+                check(label, "ERROR", str(e))
+
+    def _setup_llm(self, check) -> None:
+        provider = self._default_provider
+        if self._airgap_mode and provider != "local":
+            check("default_provider", "MISSING", f"'{provider}' is not allowed in airgap_mode; set it to local")
+            return
+        if provider == "local":
+            missing = [f for f in ("local_llm_url", "local_llm_model") if not self._config.get(f)]
+            if missing:
+                check("local llm fields", "MISSING", f"set {', '.join(missing)}")
+                return
+        elif not self._config.get(f"{provider}_api_key"):
+            check(f"{provider} key", "MISSING", f"set {provider}_api_key")
+            return
+        try:
+            model = self._local_llm_model() if provider == "local" else ""
+            ok, message = self._build_llm_provider(provider, model).test_connection()
+        except Exception as e:
+            ok, message = False, f"{type(e).__name__}: {e}"
+        check(f"llm {provider}", "OK" if ok else "ERROR", message)
+
+    def _setup_airgap(self, check) -> None:
+        import os
+
+        def readable_files(label: str, fields: tuple[str, ...]) -> None:
+            values = {f: (self._config.get(f) or "").strip() for f in fields}
+            if missing := [f for f, v in values.items() if not v]:
+                check(label, "MISSING", f"set {', '.join(missing)}")
+            elif bad := [f"{f}={v}" for f, v in values.items() if not os.access(v, os.R_OK)]:
+                check(label, "MISSING", f"not readable by the app user: {', '.join(bad)}")
+            else:
+                check(label, "OK", "files readable")
+
+        if not self._broker_url.startswith("https://"):
+            check("broker_url", "MISSING", "set broker_url (https) - read tools come only from the broker")
+        else:
+            check("broker_url", "OK", self._broker_url)
+            readable_files("broker certificates", ("broker_client_cert", "broker_client_key"))
+        if self._policy_mode == "embedded":
+            readable_files("policy_path", ("policy_path",))
+            state = (self._policy_state_dir or "").strip()
+            if not state or not os.access(state, os.W_OK):
+                check("policy_state_dir", "MISSING", "set a directory the app user can write")
+            elif not os.path.isfile(os.path.join(state, "halt.json")):
+                check("halt.json", "MISSING",
+                      f'create {state}/halt.json with {{"angehalten": false, "grund": ""}} (missing file = halted)')
+            else:
+                check("policy_state_dir", "OK", "writable, halt.json present")
+        elif self._policy_mode == "service":
+            check("policy_service_url", "OK" if self._policy_service_url.startswith("https://") else "MISSING",
+                  self._policy_service_url or "set policy_service_url (https)")
+            readable_files("policy certificates", ("policy_client_cert", "policy_client_key", "policy_ca"))
+        else:
+            check("policy_mode", "MISSING", "set policy_mode to embedded or service - otherwise every effect is denied")
+
+    # -----------------------------------------------------------------------
     # Action dispatcher
     # -----------------------------------------------------------------------
 
@@ -794,6 +927,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
             "create_agent":      self._handle_create_agent,
             "list_agents":       self._handle_list_agents,
             "create_skill":      self._handle_create_skill,
+            "setup_app":         self._handle_setup_app,
             "list_skills":       self._handle_list_skills,
         }
         action_id = self.get_action_identifier()
