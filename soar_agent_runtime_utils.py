@@ -124,6 +124,16 @@ def new_run_id() -> str:
 # RT-P05 (strict parser): observation returned to the model instead of
 # executing a tool with silently-emptied parameters.
 _PARAMS_PARSE_ERROR = "ERROR: PARAMS is not valid JSON object. Fix the PARAMS line and retry."
+# Raw model turn kept in the step log (truncated) so a dropped action can be proven later.
+_RAW_RESPONSE_CHARS = 2000
+
+
+def _multi_action_error(actions: list[str], with_final: bool) -> str:
+    """RT-P05: one ACTION per turn. Nothing of such a turn is executed (1.11.1)."""
+    sent = ", ".join(actions) + (" and FINAL_ANSWER" if with_final else "")
+    return (f"ERROR: one ACTION per response; you sent {sent}. Nothing was executed. "
+            "Send them one at a time: one ACTION with its PARAMS, wait for the OBSERVATION, "
+            "and give FINAL_ANSWER only in a response without ACTION.")
 
 # RT-P04/P06 (decision E3): mandatory FINAL_ANSWER fields in airgap_mode.
 # Spec names on the wire; checked by validate_final_answer().
@@ -1649,6 +1659,7 @@ class ReActLoop:
         params: dict = {}
         final_answer: str | None = None
         parse_error: str | None = None
+        actions: list[str] = []
 
         lines = text.strip().split("\n")
         i = 0
@@ -1659,6 +1670,7 @@ class ReActLoop:
                     thought = rest.strip()
                 case ["ACTION", rest]:
                     tool_name = rest.strip()
+                    actions.append(tool_name)
                 case ["PARAMS", rest]:
                     params_str = rest.strip()
                     j = i + 1
@@ -1681,6 +1693,10 @@ class ReActLoop:
                     break
             i += 1
 
+        # Before 1.11.1 a second ACTION silently replaced the first, and ACTION plus
+        # FINAL_ANSWER ran no action at all. Such a turn is now rejected as a whole.
+        if len(actions) > 1 or (actions and final_answer is not None):
+            return tool_name, {}, thought, None, _multi_action_error(actions, final_answer is not None)
         return tool_name, params, thought, final_answer, parse_error
 
     # -- audit (RT-P02/P03) -------------------------------------------------
@@ -1763,6 +1779,7 @@ class ReActLoop:
                 "thought": thought,
                 "action":  tool_name or "FINAL_ANSWER",
                 "params":  params,
+                "raw_response": (response_text or "")[:_RAW_RESPONSE_CHARS],
             }
 
             if final_answer is not None:
