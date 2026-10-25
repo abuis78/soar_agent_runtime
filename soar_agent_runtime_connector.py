@@ -620,7 +620,9 @@ class SoarAgentRuntimeConnector(BaseConnector):
 
         store = AgentDefinitionStore(self, self._agent_list_name)
         if not store.save(agent_id, config):
-            return action_result.set_status(phantom.APP_ERROR, f"Failed to save agent '{agent_id}'.")
+            detail = getattr(store, "last_error", "")
+            return action_result.set_status(
+                phantom.APP_ERROR, f"Failed to save agent '{agent_id}'" + (f": {detail}" if detail else "."))
 
         action_result.add_data({
             "agent_id": agent_id, "status": "created", "skills": skills, "agent_role": agent_role
@@ -681,7 +683,9 @@ class SoarAgentRuntimeConnector(BaseConnector):
 
         skill_store = SkillStore(self, self._skill_list_name)
         if not skill_store.save(skill_id, config):
-            return action_result.set_status(phantom.APP_ERROR, f"Failed to save skill '{skill_id}'.")
+            detail = getattr(skill_store, "last_error", "")
+            return action_result.set_status(
+                phantom.APP_ERROR, f"Failed to save skill '{skill_id}'" + (f": {detail}" if detail else "."))
 
         action_result.add_data({"skill_id": skill_id, "status": "created"})
         action_result.update_summary({"skill_id": skill_id})

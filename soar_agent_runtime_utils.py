@@ -1233,6 +1233,7 @@ class AgentDefinitionStore:
     def __init__(self, connector, list_name: str) -> None:
         self.connector = connector
         self.list_name = list_name
+        self.last_error = ""  # text of the last failed save, for the action message
 
     def load(self, agent_id: str) -> dict:
         try:
@@ -1269,9 +1270,12 @@ class AgentDefinitionStore:
                 list_name=self.list_name,
                 values=[[agent_id, json.dumps(config | {"agent_id": agent_id})]]
             )
+            self.last_error = ""
             return True
         except Exception as e:
-            self.connector.save_progress(f"Failed to save agent: {e}")
+            # SOAR keeps only the final action message, so the caller puts this text there.
+            self.last_error = f"{type(e).__name__}: {e} (Custom List '{self.list_name}')"
+            self.connector.save_progress(f"Failed to save agent: {self.last_error}")
             return False
 
     def list_all(self) -> list[dict]:
@@ -1310,6 +1314,7 @@ class SkillStore:
     def __init__(self, connector, list_name: str | None = None) -> None:
         self.connector = connector
         self.list_name = list_name or self.DEFAULT_LIST_NAME
+        self.last_error = ""
 
     def load(self, skill_id: str) -> dict:
         try:
@@ -1342,9 +1347,11 @@ class SkillStore:
                 list_name=self.list_name,
                 values=[[skill_id, json.dumps(config)]]
             )
+            self.last_error = ""
             return True
         except Exception as e:
-            self.connector.save_progress(f"Failed to save skill '{skill_id}': {e}")
+            self.last_error = f"{type(e).__name__}: {e} (Custom List '{self.list_name}')"
+            self.connector.save_progress(f"Failed to save skill '{skill_id}': {self.last_error}")
             return False
 
     def list_all(self) -> list[dict]:

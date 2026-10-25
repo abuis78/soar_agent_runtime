@@ -1004,3 +1004,54 @@ def test_app_json_declares_local_llm_model_next_to_the_local_url():
     assert cfg["local_llm_model"]["default"] == "llama3"
     assert cfg["local_llm_model"]["data_type"] == "string" and cfg["local_llm_model"]["required"] is False
     assert [cfg[k]["order"] for k in keys] == list(range(len(keys)))  # contiguous after the insert
+
+
+# --- create agent / create skill: the save error reaches the final message ---------
+
+class _FailingRules(types.ModuleType):
+    def add_to_list(self, list_name, values):
+        raise RuntimeError("list write not permitted")
+
+
+@pytest.fixture
+def failing_phantom_rules(monkeypatch):
+    rules = _FailingRules("phantom.rules")
+    monkeypatch.setitem(sys.modules, "phantom.rules", rules)
+    if "phantom" in sys.modules:
+        monkeypatch.setattr(sys.modules["phantom"], "rules", rules, raising=False)
+    return rules
+
+
+def test_create_agent_failure_names_the_exception(failing_phantom_rules):
+    c = make_connector()
+    assert c._handle_create_agent({"agent_id": "a1", "provider": "local", "model": "m"}) is False
+    msg = c.action_results[-1].message
+    assert msg == ("Failed to save agent 'a1': RuntimeError: list write not permitted "
+                   "(Custom List 'agent_definitions')")
+
+
+def test_create_skill_failure_names_the_exception(failing_phantom_rules):
+    c = make_connector()
+    c._handle_create_skill({"skill_id": "s1", "inject": "be brief"})
+    assert c.action_results[-1].message.startswith("Failed to save skill 's1': RuntimeError: list write not permitted")
+
+
+def test_create_agent_failure_without_detail_keeps_the_old_message(monkeypatch):
+    class Store:
+        def __init__(self, *a, **kw):
+            pass
+
+        def save(self, agent_id, config):
+            return False
+
+    monkeypatch.setattr(connector_module, "AgentDefinitionStore", Store)
+    c = make_connector()
+    c._handle_create_agent({"agent_id": "a1"})
+    assert c.action_results[-1].message == "Failed to save agent 'a1'."
+
+
+def test_failed_save_message_carries_no_asset_secret(failing_phantom_rules):
+    c = make_connector(anthropic_api_key="sk-secret-123", local_llm_api_key="ollama-secret")
+    c._handle_create_agent({"agent_id": "a1"})
+    msg = c.action_results[-1].message
+    assert "sk-secret-123" not in msg and "ollama-secret" not in msg
