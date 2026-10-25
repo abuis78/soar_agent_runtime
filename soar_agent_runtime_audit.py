@@ -25,6 +25,7 @@ AUDIT_LABEL = "agent_audit"
 PHASE_INTENDED = "beabsichtigt"
 PHASE_DONE = "erledigt"
 PHASE_ERROR = "fehler"
+PHASE_REJECTED = "abgelehnt"  # the call was refused, nothing was executed (RT-W05, policy DENY, broker)
 PHASE_HALTED = "angehalten"   # RT-B01: run stopped by the emergency stop before a step
 
 _SENSITIVE_KEY_RE = re.compile(
