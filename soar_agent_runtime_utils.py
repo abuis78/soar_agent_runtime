@@ -694,10 +694,14 @@ class ToolRegistry:
         if not isinstance(beleg_ids, list) or not beleg_ids:
             missing.append("beleg_ids")
         if missing:
+            # Name the ids that count, so a small model copies a real one instead of a
+            # placeholder like "<schritt_id of step 1>" (E2E run rt-20261025T083337Z-d08d1865).
+            valid_now = ", ".join(sorted(self.valid_evidence())) or "none yet - read data first"
             return (f"ERROR: Tool '{tool_name}' has an effect and needs {', '.join(repr(m) for m in missing)}: "
                     "begruendung (text), gegenargumente and unsicherheiten (text or list of strings, "
                     "'keine erkannt' if none), konfidenz (number 0..1), beleg_ids (non-empty JSON list of this "
-                    "run's aufruf_id or earlier schritt_id values). Nothing was executed.")
+                    "run's aufruf_id or earlier schritt_id values). Nothing was executed. "
+                    f"Valid evidence ids now: {valid_now}.")
         valid = self.valid_evidence()
         bad = [str(b) for b in beleg_ids if not isinstance(b, str) or b not in valid]
         if bad:
@@ -1565,6 +1569,17 @@ Container ID: {container_id}
 """
 
 
+def _audit_phase(observation: str | None, halted: bool) -> str:
+    """Audit phase from what really happened (E2E finding E-4, 2026-10-25): a call refused
+    before or by a gate was logged as "erledigt" although nothing ran."""
+    text = (observation or "").lstrip()
+    if halted or text.startswith(("Failed ", "BROKER UNAVAILABLE")):
+        return "fehler"        # execution attempted or source unreachable
+    if text.startswith(("ERROR:", "POLICY DENIED", "BROKER REJECTED")):
+        return "abgelehnt"     # refused: evidence check, allowlist, validation, policy DENY, broker
+    return "erledigt"
+
+
 class ReActLoop:
     """Executes the ReAct loop for an agent, with optional skill injection."""
 
@@ -1846,7 +1861,7 @@ class ReActLoop:
                 halted = bool(getattr(self.tools, "halted", False))
                 call_id = str(getattr(self.tools, "last_call_id", "") or "")
                 decision_id = str(getattr(self.tools, "last_decision_id", "") or "")
-                if not self._audit("fehler" if halted else "erledigt", step_entry, observation,
+                if not self._audit(_audit_phase(observation, halted), step_entry, observation,
                                    call_id=call_id, decision_id=decision_id) and fail_closed:
                     return self._audit_abort(step_entry, steps_taken, f" after '{tool_name}'")
                 if halted:
