@@ -99,6 +99,44 @@ def executed_actions_block(final_answer: str, actions: list[dict]) -> str:
     return "\n".join(lines)
 
 
+# --- tool catalogue for the user (contract H, 1.12.0) -------------------------------------
+
+# Tools the runtime offers on its own when their source delivers them; listing them in
+# allowed_tools is harmless but not needed.
+IMPLICIT_TOOLS = ("broker_invoke", "catalog_invoke", "report_gap")
+
+
+def known_tool_names() -> list[str]:
+    return list(ToolRegistry.TOOL_DEFINITIONS)
+
+
+def unknown_tool_names(allowed_tools) -> list[str]:
+    names = allowed_tools.split(",") if isinstance(allowed_tools, str) else list(allowed_tools or [])
+    known = set(known_tool_names())
+    return [n.strip() for n in names if n.strip() and n.strip() not in known]
+
+
+def tool_availability(name: str, airgap: bool, broker_url: str, policy_mode: str) -> str:
+    """One sentence on whether and how a tool works with this asset's settings."""
+    gate = bool(policy_mode)
+    match name:
+        case "splunk_search":
+            return "not available: SOAR offers apps no search API; use broker_invoke templates"
+        case "update_severity" if airgap:
+            return ("available through the Policy Manager gate" if gate
+                    else "denied: airgap_mode needs policy_mode for effecting tools")
+        case "update_severity":
+            return "available; outside airgap_mode no policy gate is consulted"
+        case "broker_invoke":
+            return ("offered when the Tool Broker delivers templates" if broker_url
+                    else "not offered: set broker_url")
+        case "catalog_invoke" | "report_gap":
+            return ("offered in airgap_mode when the Policy Manager releases building blocks" if airgap and gate
+                    else "not offered: needs airgap_mode and policy_mode")
+        case _:
+            return "available"
+
+
 class SoarAgentRuntimeConnector(BaseConnector):
 
     def __init__(self):
@@ -681,6 +719,13 @@ class SoarAgentRuntimeConnector(BaseConnector):
             return action_result.set_status(
                 phantom.APP_ERROR, "agent_id must match [A-Za-z0-9_.-] and be 1-64 chars.")
 
+        # Contract H: an unknown name used to be stored silently and the tool never offered.
+        if unknown := unknown_tool_names(param.get("allowed_tools") or ""):
+            return action_result.set_status(
+                phantom.APP_ERROR,
+                f"Unknown tool(s) in allowed_tools: {', '.join(unknown)}. "
+                f"Valid tools: {', '.join(known_tool_names())} (see the action 'list tools').")
+
         skills_raw = param.get("skills", "")
         skills = [s.strip() for s in skills_raw.split(",") if s.strip()] if skills_raw else []
 
@@ -805,6 +850,26 @@ class SoarAgentRuntimeConnector(BaseConnector):
         return action_result.set_status(phantom.APP_SUCCESS, f"Found {len(skills)} skill(s).")
 
     # -----------------------------------------------------------------------
+    # Action: list tools (contract H, 1.12.0)
+    # -----------------------------------------------------------------------
+
+    def _handle_list_tools(self, param):
+        action_result = self.add_action_result(ActionResult(dict(param)))
+        for name, defn in ToolRegistry.TOOL_DEFINITIONS.items():
+            action_result.add_data({
+                "tool": name,
+                "description": defn.get("description", ""),
+                "parameters": ", ".join(defn.get("parameters", {})),
+                "effecting": bool(defn.get("wirkt", True)),
+                "source": defn.get("quelle", ""),
+                "in_allowed_tools": name not in IMPLICIT_TOOLS,
+                "availability": tool_availability(name, self._airgap_mode, self._broker_url, self._policy_mode),
+            })
+        count = len(ToolRegistry.TOOL_DEFINITIONS)
+        action_result.update_summary({"total_tools": count})
+        return action_result.set_status(phantom.APP_SUCCESS, f"Found {count} tool(s).")
+
+    # -----------------------------------------------------------------------
     # Action: setup app (contract B, 1.11.0)
     # -----------------------------------------------------------------------
     # SOAR runs no app code at install time, so this action does the one-time setup
@@ -855,6 +920,8 @@ class SoarAgentRuntimeConnector(BaseConnector):
                         check(label, "CREATED", f"empty {kind} list created")
                     continue
                 compact, dropped = compact_rows(lst.rows())
+                if kind == "agents":
+                    self._setup_agent_tools(check, compact)
                 if not dropped:
                     check(label, "OK", f"{sum(1 for r in compact if r[0])} {kind}, no duplicate rows")
                 elif dry_run:
@@ -864,6 +931,22 @@ class SoarAgentRuntimeConnector(BaseConnector):
                     check(label, "FIXED", f"{dropped} older duplicate row(s) removed, latest row per id kept")
             except ValueError as e:  # CustomListError / SoarRestError
                 check(label, "ERROR", str(e))
+
+    @staticmethod
+    def _setup_agent_tools(check, rows: list) -> None:
+        """Contract H: stored agents may predate the name check in create agent."""
+        bad = []
+        for row in rows:
+            if not row[0]:
+                continue
+            try:
+                tools = json.loads(row[1]).get("allowed_tools", "")
+            except (ValueError, AttributeError):
+                continue
+            if unknown := unknown_tool_names(tools):
+                bad.append(f"{row[0]}: {', '.join(unknown)}")
+        if bad:
+            check("agent tool names", "WARN", "unknown tools are never offered - " + "; ".join(bad))
 
     def _setup_llm(self, check) -> None:
         provider = self._default_provider
@@ -931,6 +1014,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
             "list_agents":       self._handle_list_agents,
             "create_skill":      self._handle_create_skill,
             "setup_app":         self._handle_setup_app,
+            "list_tools":        self._handle_list_tools,
             "list_skills":       self._handle_list_skills,
         }
         action_id = self.get_action_identifier()

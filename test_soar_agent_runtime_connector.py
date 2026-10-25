@@ -1384,3 +1384,41 @@ def test_note_names_actions_that_were_sent_but_not_executed():
     assert ("- step 1: `update_severity` - Container severity updated to: high "
             "(in the same response, not executed: add_note)") in block
     assert "**Warning:**" not in block
+
+
+# --- contract H: list tools, tool names checked (1.12.0) ---------------------------------
+
+def test_list_tools_shows_every_tool_with_availability():
+    c = make_connector()
+    assert c._handle_list_tools({}) is True
+    rows = {d["tool"]: d for d in c.action_results[-1].data}
+    assert set(rows) == set(utils_module.ToolRegistry.TOOL_DEFINITIONS)
+    assert rows["update_severity"]["effecting"] is True and rows["add_note"]["effecting"] is False
+    assert rows["splunk_search"]["availability"].startswith("not available")
+    assert rows["update_severity"]["availability"] == "available; outside airgap_mode no policy gate is consulted"
+    assert rows["broker_invoke"]["in_allowed_tools"] is False
+    assert c.action_results[-1].message == f"Found {len(rows)} tool(s)."
+
+
+def test_list_tools_in_airgap_without_policy_says_effects_are_denied():
+    c = make_connector(airgap_mode=True)
+    c._handle_list_tools({})
+    rows = {d["tool"]: d for d in c.action_results[-1].data}
+    assert rows["update_severity"]["availability"] == "denied: airgap_mode needs policy_mode for effecting tools"
+    assert rows["catalog_invoke"]["availability"] == "not offered: needs airgap_mode and policy_mode"
+
+
+def test_create_agent_rejects_a_misspelled_tool(soar_lists):
+    c = make_connector()
+    assert c._handle_create_agent({"agent_id": "a1", "allowed_tools": "get_container_info,update_severety"}) is False
+    msg = c.action_results[-1].message
+    assert msg.startswith("Unknown tool(s) in allowed_tools: update_severety. Valid tools: splunk_search, add_note")
+    assert not [call for call in soar_lists.calls if call[0] == "post"]  # nothing stored
+
+
+def test_setup_warns_about_stored_agents_with_unknown_tools(monkeypatch):
+    lists = {"agent_definitions": [["old", json.dumps({"allowed_tools": "add_note,update_severety"})]],
+             "agent_skills": [["", ""]]}
+    c, _ = _setup(monkeypatch, lists)
+    assert c._handle_setup_app({}) is True  # a warning is not a problem
+    assert _rows(c)["agent tool names"] == ("WARN", "unknown tools are never offered - old: update_severety")
