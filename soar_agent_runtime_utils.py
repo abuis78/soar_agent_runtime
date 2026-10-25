@@ -5,6 +5,7 @@ Python 3.13 compatible.
 """
 
 from __future__ import annotations
+import difflib
 import json
 import re
 import secrets
@@ -158,6 +159,24 @@ FINAL_ANSWER: {"belege": ["<schritt_id>"], "begruendung": "...", "gegenargumente
 """
 
 
+def _normalise_key(key: str) -> str:
+    return re.sub(r"[\s_\-]", "", str(key).lower()).replace("ä", "ae").replace("ö", "oe").replace("ü", "ue")
+
+
+def unknown_key_hints(data: dict, missing, known=()) -> list[str]:
+    """E-8: name keys the model sent that look like a missing field, e.g.
+    "unknown key 'begrün dung' - did you mean 'begruendung'?". The key is never
+    accepted in place of the field; the hint only lets the model fix the spelling."""
+    known = set(known)
+    candidates = {_normalise_key(k): k for k in data if k not in known and k not in missing}
+    hints = []
+    for field in missing:
+        match = difflib.get_close_matches(_normalise_key(field), list(candidates), n=1, cutoff=0.8)
+        if match:
+            hints.append(f"unknown key {candidates.pop(match[0])!r} - did you mean {field!r}?")
+    return hints
+
+
 def validate_final_answer(
     text: str,
     *,
@@ -179,9 +198,9 @@ def validate_final_answer(
         return None, ["FINAL_ANSWER must be a JSON object"]
     errors: list[str] = []
     if strict:
-        for field in REQUIRED_ANSWER_FIELDS:
-            if field not in data:
-                errors.append(f"missing field '{field}'")
+        missing = [f for f in REQUIRED_ANSWER_FIELDS if f not in data]
+        errors += [f"missing field '{f}'" for f in missing]
+        errors += unknown_key_hints(data, missing, known=(*REQUIRED_ANSWER_FIELDS, *required_keys))
         if "belege" in data:
             if not isinstance(data["belege"], list):
                 errors.append("'belege' must be a list")
@@ -204,9 +223,9 @@ def validate_final_answer(
                 errors.append("'konfidenz' must be a number between 0 and 1")
         if "datenlage" in data and data["datenlage"] not in DATENLAGE_VALUES:
             errors.append(f"'datenlage' must be one of {list(DATENLAGE_VALUES)}")
-    for key in required_keys:
-        if key not in data:
-            errors.append(f"missing skill field '{key}'")
+    missing_skill = [k for k in required_keys if k not in data]
+    errors += [f"missing skill field '{k}'" for k in missing_skill]
+    errors += unknown_key_hints(data, missing_skill, known=(*REQUIRED_ANSWER_FIELDS, *required_keys))
     return data, errors
 
 # Exception scrubbing (open item #2: secret leakage via tracebacks). Patterns
@@ -702,6 +721,7 @@ class ToolRegistry:
         if not isinstance(beleg_ids, list) or not beleg_ids:
             missing.append("beleg_ids")
         if missing:
+            hints = unknown_key_hints(params, missing, known=self.META_PARAMS)
             # Name the ids that count, so a small model copies a real one instead of a
             # placeholder like "<schritt_id of step 1>" (E2E run rt-20261025T083337Z-d08d1865).
             valid_now = ", ".join(sorted(self.valid_evidence())) or "none yet - read data first"
@@ -709,7 +729,8 @@ class ToolRegistry:
                     "begruendung (text), gegenargumente and unsicherheiten (text or list of strings, "
                     "'keine erkannt' if none), konfidenz (number 0..1), beleg_ids (non-empty JSON list of this "
                     "run's aufruf_id or earlier schritt_id values). Nothing was executed. "
-                    f"Valid evidence ids now: {valid_now}.")
+                    + (f"{'; '.join(hints)}. " if hints else "")
+                    + f"Valid evidence ids now: {valid_now}.")
         valid = self.valid_evidence()
         bad = [str(b) for b in beleg_ids if not isinstance(b, str) or b not in valid]
         if bad:
@@ -1877,10 +1898,15 @@ class ReActLoop:
                                 f"FINAL_ANSWER invalid after correction round: {detail}", steps_taken)
                         self.correction_used = True
                         self.connector.save_progress(f"FINAL_ANSWER invalid, correction round: {detail}")
+                        # E-9: name every required key at once; a fix for the skill keys alone
+                        # used to drop the judgement fields in the only correction round.
+                        all_keys = dict.fromkeys((REQUIRED_ANSWER_FIELDS if self.strict_schema else ()) + self.required_keys)
                         messages += [
                             {"role": "assistant", "content": response_text},
                             {"role": "user",
-                             "content": f"OBSERVATION: {msg}. Respond again with a corrected FINAL_ANSWER."}
+                             "content": f"OBSERVATION: {msg}. Respond again with a corrected FINAL_ANSWER: "
+                                        f"one JSON object that contains ALL of these keys: "
+                                        f"{', '.join(all_keys)}. Keep the values that were already right."}
                         ]
                         continue
                     self.verdict = verdict

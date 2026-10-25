@@ -161,7 +161,8 @@ def test_strict_invalid_answer_gets_exactly_one_correction_round_then_succeeds()
     assert result["steps_taken"] == 2 and result["urteil"]["datenlage"] == "teilweise"
     feedback = llm.seen[1][-1]["content"]
     assert feedback.startswith("OBSERVATION: ERROR: FINAL_ANSWER invalid: FINAL_ANSWER must be a JSON object")
-    assert feedback.endswith("Respond again with a corrected FINAL_ANSWER.")
+    assert feedback.endswith("Respond again with a corrected FINAL_ANSWER: one JSON object that contains ALL of "
+                             "these keys: " + ", ".join(REQUIRED_ANSWER_FIELDS) + ". Keep the values that were already right.")
     assert loop.step_log[0]["observation"].startswith("ERROR: FINAL_ANSWER invalid")
 
 
@@ -193,3 +194,43 @@ def test_correction_round_counts_against_max_steps():
     loop, _ = make_loop(["FINAL_ANSWER: nope"], strict=True, max_steps=1)
     result = loop.run("t")
     assert result["final_answer"].startswith("Max steps (1) reached")
+
+
+# --- E-8 / E-9 (1.15.2): misspelled keys named, full key set in the correction ----
+
+def test_misspelled_field_is_named_with_the_right_spelling_but_not_accepted():
+    data = good()
+    data["begrün dung"] = data.pop("begruendung")
+    _, errors = validate_final_answer(json.dumps(data), strict=True)
+    assert "missing field 'begruendung'" in errors
+    assert "unknown key 'begrün dung' - did you mean 'begruendung'?" in errors
+
+
+def test_misspelled_skill_key_is_named():
+    _, errors = validate_final_answer(json.dumps({"next step": "x"}), required_keys=("next_step",))
+    assert errors == ["missing skill field 'next_step'", "unknown key 'next step' - did you mean 'next_step'?"]
+
+
+def test_unrelated_extra_keys_get_no_hint():
+    data = good()
+    del data["datenlage"]
+    data["summary"] = "s"
+    _, errors = validate_final_answer(json.dumps(data), strict=True, required_keys=("summary",))
+    assert errors == ["missing field 'datenlage'"]
+
+
+def test_correction_names_judgement_and_skill_keys_together():
+    loop, llm = make_loop(["FINAL_ANSWER: " + json.dumps({"summary": "s"}),
+                           "FINAL_ANSWER: " + json.dumps(good(summary="s", severity="low"))],
+                          strict=True, required_keys=("summary", "severity"))
+    result = loop.run("t")
+    assert result["urteil"]["severity"] == "low"
+    feedback = llm.seen[1][-1]["content"]
+    assert "ALL of these keys: " + ", ".join((*REQUIRED_ANSWER_FIELDS, "summary", "severity")) + "." in feedback
+
+
+def test_correction_outside_strict_names_only_the_skill_keys():
+    loop, llm = make_loop(["FINAL_ANSWER: " + json.dumps({"a": 1}), "FINAL_ANSWER: " + json.dumps({"summary": "s"})],
+                          required_keys=("summary",))
+    loop.run("t")
+    assert "ALL of these keys: summary." in llm.seen[1][-1]["content"]
