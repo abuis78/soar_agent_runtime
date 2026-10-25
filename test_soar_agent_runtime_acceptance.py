@@ -269,7 +269,7 @@ def test_ac12_every_step_is_audited_with_lauf_id_and_schritt_id(platform, llm, m
     assert "- step 2: `update_severity` - Container severity updated to: high" in summary
     assert "**Warning:**" not in summary
     assert result.data[0]["executed_actions"][1] == {
-        "step": 2, "tool": "update_severity", "took_effect": True,
+        "step": 2, "tool": "update_severity", "took_effect": True, "not_executed": [],
         "outcome": "Container severity updated to: high (entscheidung_id=pm-stub-1)"}
     assert result.summary["audit_ereignisse"] == 4 and result.summary["audit_fehler"] == 0
 

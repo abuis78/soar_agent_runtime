@@ -120,12 +120,16 @@ _PARAMS_PARSE_ERROR = "ERROR: PARAMS is not valid JSON object. Fix the PARAMS li
 _RAW_RESPONSE_CHARS = 2000
 
 
-def _multi_action_error(actions: list[str], with_final: bool) -> str:
-    """RT-P05: one ACTION per turn. Nothing of such a turn is executed (1.11.1)."""
-    sent = ", ".join(actions) + (" and FINAL_ANSWER" if with_final else "")
-    return (f"ERROR: one ACTION per response; you sent {sent}. Nothing was executed. "
-            "Send them one at a time: one ACTION with its PARAMS, wait for the OBSERVATION, "
-            "and give FINAL_ANSWER only in a response without ACTION.")
+def _extra_actions_notice(dropped: list[str], final_dropped: bool) -> str:
+    """RT-P05 with weak models (1.11.2): only the first ACTION of a turn runs; say what did not."""
+    parts = []
+    if dropped:
+        parts.append(f"{', '.join(dropped)} was NOT executed - send it in your next response, "
+                     "one ACTION per response.")
+    if final_dropped:
+        parts.append("Your FINAL_ANSWER in the same response was ignored - give it in a response "
+                     "without ACTION, after reading this observation.")
+    return "NOTE: only the first ACTION of your response was executed. " + " ".join(parts)
 
 # RT-P04/P06 (decision E3): mandatory FINAL_ANSWER fields in airgap_mode.
 # Spec names on the wire; checked by validate_final_answer().
@@ -1583,6 +1587,8 @@ class ReActLoop:
         required_keys=(),
         max_observation_chars: int = _MAX_OBSERVATION_LEN,
     ) -> None:
+        self._dropped_actions: list[str] = []   # set by _parse_response (1.11.2)
+        self._final_dropped = False
         self.connector       = connector
         self.llm             = llm
         self.tools           = tools
@@ -1638,6 +1644,9 @@ class ReActLoop:
         final_answer: str | None = None
         parse_error: str | None = None
         actions: list[str] = []
+        # Read by run(): later ACTIONs and a FINAL_ANSWER next to an ACTION (1.11.2).
+        self._dropped_actions: list[str] = []
+        self._final_dropped = False
 
         lines = text.strip().split("\n")
         i = 0
@@ -1647,8 +1656,11 @@ class ReActLoop:
                 case ["THOUGHT", rest]:
                     thought = rest.strip()
                 case ["ACTION", rest]:
-                    tool_name = rest.strip()
-                    actions.append(tool_name)
+                    actions.append(rest.strip())
+                    if len(actions) == 1:
+                        tool_name = actions[0]
+                case ["PARAMS", rest] if len(actions) > 1:
+                    pass  # PARAMS of an ACTION that will not run
                 case ["PARAMS", rest]:
                     params_str = rest.strip()
                     j = i + 1
@@ -1666,15 +1678,19 @@ class ReActLoop:
                         params = {}
                         parse_error = _PARAMS_PARSE_ERROR
                 case ["FINAL_ANSWER", rest]:
+                    if actions:
+                        self._final_dropped = True  # the action runs first; the answer comes later
+                        break
                     tail = "\n".join(lines[i:])
                     final_answer = tail.removeprefix("FINAL_ANSWER:").strip()
                     break
             i += 1
 
         # Before 1.11.1 a second ACTION silently replaced the first, and ACTION plus
-        # FINAL_ANSWER ran no action at all. Such a turn is now rejected as a whole.
-        if len(actions) > 1 or (actions and final_answer is not None):
-            return tool_name, {}, thought, None, _multi_action_error(actions, final_answer is not None)
+        # FINAL_ANSWER ran no action at all. 1.11.1 rejected such turns, but qwen2.5:7b
+        # repeated them every step. Since 1.11.2 the first ACTION runs and the rest is
+        # named in the observation, the step log and the summary note - nothing silent.
+        self._dropped_actions = actions[1:]
         return tool_name, params, thought, final_answer, parse_error
 
     # -- audit (RT-P02/P03) -------------------------------------------------
@@ -1823,6 +1839,9 @@ class ReActLoop:
                     set_step(steps_taken, step_entry["schritt_id"])  # broker context (RT-L01)
                 observation = self.tools.execute(tool_name, params)
                 step_entry["observation"] = observation  # raw kept for forensics
+                dropped, final_dropped = list(self._dropped_actions), self._final_dropped
+                if dropped or final_dropped:
+                    step_entry["not_executed"] = dropped + (["FINAL_ANSWER"] if final_dropped else [])
                 self.step_log.append(step_entry)
                 halted = bool(getattr(self.tools, "halted", False))
                 call_id = str(getattr(self.tools, "last_call_id", "") or "")
@@ -1843,9 +1862,10 @@ class ReActLoop:
                 # In strict mode the model must cite schritt_ids as belege, so
                 # every observation names its own id (RT-P06).
                 obs_tag = f"OBSERVATION [schritt_id {step_entry['schritt_id']}]:" if self.strict_schema else "OBSERVATION:"
+                notice = f"\n{_extra_actions_notice(dropped, final_dropped)}" if (dropped or final_dropped) else ""
                 messages += [
                     {"role": "assistant", "content": response_text},
-                    {"role": "user",      "content": f"{obs_tag} {safe_obs}"}
+                    {"role": "user",      "content": f"{obs_tag} {safe_obs}{notice}"}
                 ]
             else:
                 step_entry["observation"] = "ERROR: No ACTION or FINAL_ANSWER found."
