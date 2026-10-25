@@ -65,6 +65,7 @@ None.
 | `default_max_steps` | Max ReAct steps | `25` |
 | `agent_list_name` | Custom List for agents | `agent_definitions` |
 | `skill_list_name` | Custom List for skills | `agent_skills` |
+| `max_subagent_depth` | Maximum nesting of `run_sub_agent`: the started agent has depth 0, its sub-agents 1, theirs 2; deeper is refused (RT-B03, AC-14). `0` = no sub-agents | `2` |
 | `definitions_path` | Directory on the SOAR host with a checkout of [soar-agent-definitions](https://github.com/abuis78/soar-agent-definitions) (`agents/<agent_id>.toml`, `skills/<skill_id>.toml`). Set = `run agent`, `list agents` and `list skills` read the TOML files instead of the Custom Lists, and the audit field `definition_version` becomes `<id>@<version>#<sha256 prefix>` for the agent and each skill (RT-B02). `create agent` / `create skill` are refused while it is set (E5) | — |
 
 Policy Manager (effecting actions in `airgap_mode`, RT-W01/RT-W03; the air-gap and Tool Broker fields are documented with sub-change 5.5):
@@ -185,6 +186,8 @@ Creates or updates an agent in the `agent_definitions` Custom List. With `defini
 | `agent_role` | string | No | `triage`, `enrichment`, `response` or `generic` (default); groups the Agent Precision panel in AI-SOC Telemetry |
 
 Available tools: `splunk_search`, `add_note`, `update_severity`, `get_container_info`, `run_sub_agent`
+
+`run_sub_agent(agent_id, task)` runs another agent inside the same run (since 1.16.0, RT-B03): same `lauf_id`, the child's own definition, skills, `allowed_tools` and Tool Broker context, the same policy gate, `stufe`, `domaene` and audit. Its steps are numbered below the calling step (`<lauf_id>/3/1`, `<lauf_id>/3/2`, …) and use up the caller's remaining steps, so the whole run never makes more model calls than the started agent's `max_steps`. The child's checked FINAL_ANSWER comes back as the observation; the calling step's `schritt_id` is the evidence for it. A child deeper than `max_subagent_depth` is refused (AC-14); a halt in the child also stops the caller.
 
 `splunk_search` is not available in SOAR apps (SOAR offers apps no search API); it answers with an error and runs no SPL. Read data via `broker_invoke` templates.
 
@@ -627,3 +630,4 @@ Unit and integration tests run with `uv` and the bundled wheels (see the command
 | 1.15.1 | 2026-10-25 | Bundled `policy_manager` 0.5.2 (PolicyManager tag `v0.5.2`, P0 review fixes F1-F14). Operator checklist: halt file and directory permissions (F13), agent playbooks need `[playbook_categories]` (F2), `[category_min_stage]` (F10), service principals and TLS. Runtime code unchanged |
 | 1.15.2 | 2026-10-25 | Error texts name misspelled keys with the right spelling (`unknown key 'begrün dung' - did you mean 'begruendung'?`) for effecting calls and FINAL_ANSWER; the key is still not accepted (E2E finding E-8). The FINAL_ANSWER correction round lists every required key, judgement fields and skill keys together (E-9) |
 | 1.15.3 | 2026-10-25 | Cosmetic: the misspelled-key hint in the error of an effecting call no longer ends with `?.` |
+| 1.16.0 | 2026-10-25 | Phase 5.4 (RT-B03, AC-14, E6): `run_sub_agent` really runs the named agent in the same run (was a placeholder): own definition, allowlist and broker context, same `lauf_id`, policy, `stufe`, `domaene` and audit; step ids below the calling step; shared step budget; new asset field `max_subagent_depth` (default 2) |

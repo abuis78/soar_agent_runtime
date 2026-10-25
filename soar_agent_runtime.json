@@ -6,7 +6,7 @@
     "package_name": "phantom_soar_agent_runtime",
     "type": "generic",
     "license": "Copyright 2026 Andreas Buis",
-    "app_version": "1.15.3",
+    "app_version": "1.16.0",
     "product_vendor": "OpenClaw SOC",
     "product_name": "SOAR Agent Runtime",
     "product_version_regex": ".*",
@@ -444,6 +444,13 @@
             "data_type": "string",
             "required": false,
             "order": 37
+        },
+        "max_subagent_depth": {
+            "description": "Maximum nesting of run_sub_agent (RT-B03): the started agent has depth 0, its sub-agents 1, theirs 2. A sub-agent deeper than this is refused. 0 = no sub-agents",
+            "data_type": "numeric",
+            "required": false,
+            "default": 2,
+            "order": 38
         }
     },
     "actions": [

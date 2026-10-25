@@ -52,6 +52,7 @@ except ImportError:
 
 AGENT_ROLES: tuple[str, ...] = ("triage", "enrichment", "response", "generic")
 DEFAULT_AGENT_ROLE = "generic"
+DEFAULT_SUBAGENT_DEPTH = 2   # RT-B03: asset max_subagent_depth
 
 # Only tools that represent a real agent DECISION are reported as agent_action.
 # Enrichment and documentation tools (splunk_search, get_container_info,
@@ -461,7 +462,7 @@ class ToolRegistry:
             "parameters":  {}
         },
         "run_sub_agent": {
-            "description": "Invoke another agent as a sub-task and return its result",
+            "description": "Run another agent on a sub-task in this run and return its checked FINAL_ANSWER",
             "wirkt": False,
             "quelle": "builtin",
             "parameters": {
@@ -546,9 +547,19 @@ class ToolRegistry:
         policy=None,
         stage: int | None = None,
         domain: str = "",
+        spawn=None,
+        depth: int = 0,
+        max_depth: int = DEFAULT_SUBAGENT_DEPTH,
     ) -> None:
         self.connector = connector
         self.container_id = container_id
+        # RT-B03 (5.4): spawn(agent_id, task, depth, step_id, max_steps) -> child result dict,
+        # provided by the connector; depth 0 = the agent the playbook started.
+        self.spawn = spawn
+        self.depth = int(depth)
+        self.max_depth = int(max_depth)
+        self.steps_left: int | None = None    # set by the loop before every tool call
+        self.sub_steps_used = 0               # model steps spent by sub-agents (shared budget)
         self.airgap = bool(airgap)
         # RT-L02: free-form SPL does not exist in airgap_mode - not in the
         # prompt, not callable. Outside airgap it stays, marked deprecated.
@@ -1274,16 +1285,35 @@ class ToolRegistry:
             return f"Failed to get container info: {_scrub_exc(e)}"
 
     def _tool_run_sub_agent(self, params: dict) -> str:
-        agent_id = params.get("agent_id", "")
-        task     = params.get("task", "")
+        """RT-B03 (5.4): run another agent in this run (same lauf_id, own allowlist and
+        broker context). Bounded by max_subagent_depth (AC-14) and by the steps the
+        caller has left, which the child's steps then use up (open item #6)."""
+        agent_id = str(params.get("agent_id") or "").strip()
+        task     = str(params.get("task") or "").strip()
         if not agent_id or not task:
             return "ERROR: agent_id and task are required."
-        # Open item #6: recursive sub-agent execution is intentionally NOT
-        # implemented. Wiring it to run_agent without a recursion-depth guard
-        # would let an agent bypass its own max_steps budget and spawn unbounded
-        # nested LLM loops (cost/DoS). Any future implementation must enforce a
-        # hard depth limit and propagate the remaining step budget.
-        return f"[Sub-agent '{agent_id}' is not executed: recursive invocation is disabled for safety.]"
+        if self.spawn is None:
+            return "ERROR: run_sub_agent is not available in this run. Nothing was run."
+        depth = self.depth + 1
+        if depth > self.max_depth:
+            return (f"ERROR: sub-agent '{agent_id}' refused: depth {depth} exceeds max_subagent_depth "
+                    f"{self.max_depth} (RT-B03). Nothing was run.")
+        budget = self.steps_left
+        if budget is not None and budget < 1:
+            return f"ERROR: sub-agent '{agent_id}' refused: no steps left in this run. Nothing was run."
+        self.connector.save_progress(f"[sub-agent] {self.agent_id} -> {agent_id} (depth {depth})")
+        result = self.spawn(agent_id=agent_id, task=task, depth=depth,
+                            step_id=self.current_step_id, max_steps=budget)
+        self.sub_steps_used += int(result.get("steps_total", result.get("steps_taken", 0)) or 0)
+        if result.get("halted"):
+            self.halted, self.halt_source = True, str(result.get("halt_source") or "Tool Broker")
+        answer = str(result.get("final_answer") or "")
+        if answer.startswith("ERROR"):
+            return f"Failed sub-agent '{agent_id}': {answer}"
+        verdict = result.get("urteil")
+        body = json.dumps(verdict, ensure_ascii=False) if isinstance(verdict, dict) else answer
+        return (f"SUB-AGENT RESULT agent_id={agent_id} steps={result.get('steps_taken', 0)} "
+                f"schritt_ids={self.current_step_id}/1..:\n{body}")
 
 
 # ---------------------------------------------------------------------------
@@ -1838,7 +1868,7 @@ class ReActLoop:
         final_answer: str | None = None
         fail_closed = self._audit_fail_closed()
 
-        while steps_taken < self.max_steps:
+        while steps_taken + self._sub_steps() < self.max_steps:
             steps_taken += 1
             self.connector.save_progress(f"Step {steps_taken}/{self.max_steps}...")
             step_entry: dict = {
@@ -1943,6 +1973,8 @@ class ReActLoop:
                         return self._audit_abort(step_entry, steps_taken, f" before '{tool_name}'")
                 if set_step := getattr(self.tools, "set_step", None):
                     set_step(steps_taken, step_entry["schritt_id"])  # broker context (RT-L01)
+                if hasattr(self.tools, "steps_left"):
+                    self.tools.steps_left = self.max_steps - steps_taken - self._sub_steps()  # RT-B03 budget
                 observation = self.tools.execute(tool_name, params)
                 step_entry["observation"] = observation  # raw kept for forensics
                 dropped, final_dropped = list(self._dropped_actions), self._final_dropped
@@ -1988,12 +2020,16 @@ class ReActLoop:
 
         return self._result(final_answer, steps_taken)
 
+    def _sub_steps(self) -> int:
+        return int(getattr(self.tools, "sub_steps_used", 0) or 0)
+
     def _result(self, final_answer: str | None, steps: int) -> dict:
         return {
             "agent_id":         self.agent_id,
             "lauf_id":          self.run_id,
             "final_answer":     final_answer,
             "steps_taken":      steps,
+            "steps_total":      steps + self._sub_steps(),   # incl. sub-agents (RT-B03)
             "provider":         self.llm.provider,
             "model":            self.llm.model,
             "audit_ereignisse": self.audit_written,
