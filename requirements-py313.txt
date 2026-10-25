@@ -2,7 +2,7 @@
 # Resolved 2026-10-19 with: uv pip compile --python-version 3.13 --python-platform x86_64-manylinux2014
 # Regenerate wheels and the app.json wheel list with: python3 tools/update_wheels.py
 # Local wheels not on PyPI (wheels/py3/, listed in tools/update_wheels.py EXTRA_WHEELS):
-#   ai_soc_telemetry 0.1.0, policy_manager 0.5.1 (built from the PolicyManager repo at tag rp/p5-3, scripts/build_wheel.sh)
+#   ai_soc_telemetry 0.1.0, policy_manager 0.5.2 (release asset of PolicyManager tag v0.5.2 = c9e5982, sha256 b710eda193d9f2b6c58bc33e6eb267bfae0e05e2445f070f7a86327f2ab92f8e)
 
 annotated-types==0.8.0
 anthropic==0.52.0

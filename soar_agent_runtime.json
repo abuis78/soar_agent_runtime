@@ -6,7 +6,7 @@
     "package_name": "phantom_soar_agent_runtime",
     "type": "generic",
     "license": "Copyright 2026 Andreas Buis",
-    "app_version": "1.15.0",
+    "app_version": "1.15.1",
     "product_vendor": "OpenClaw SOC",
     "product_name": "SOAR Agent Runtime",
     "product_version_regex": ".*",
@@ -187,7 +187,7 @@
             },
             {
                 "module": "policy-manager",
-                "input_file": "wheels/py3/policy_manager-0.5.1-py3-none-any.whl"
+                "input_file": "wheels/py3/policy_manager-0.5.2-py3-none-any.whl"
             }
         ]
     },

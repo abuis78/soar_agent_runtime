@@ -53,7 +53,7 @@ def test_every_listed_wheel_exists_and_every_bundled_wheel_is_listed():
 
 def test_local_wheels_are_bundled():
     assert LOCAL_WHEELS == ["wheels/py3/ai_soc_telemetry-0.1.0-py3-none-any.whl",
-                            "wheels/py3/policy_manager-0.5.1-py3-none-any.whl"]
+                            "wheels/py3/policy_manager-0.5.2-py3-none-any.whl"]
 
 
 def test_every_pin_is_bundled_with_the_pinned_version():
