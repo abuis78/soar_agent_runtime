@@ -6,7 +6,7 @@
     "package_name": "phantom_soar_agent_runtime",
     "type": "generic",
     "license": "Copyright 2026 Andreas Buis",
-    "app_version": "1.13.0",
+    "app_version": "1.14.0",
     "product_vendor": "OpenClaw SOC",
     "product_name": "SOAR Agent Runtime",
     "product_version_regex": ".*",
@@ -438,6 +438,12 @@
             "data_type": "string",
             "required": false,
             "order": 36
+        },
+        "definitions_path": {
+            "description": "Directory on the SOAR host with a checkout of the definitions repository (agents/<agent_id>.toml, skills/<skill_id>.toml, RT-B02). Set = run agent, list agents and list skills read from there instead of the Custom Lists. Empty = Custom Lists",
+            "data_type": "string",
+            "required": false,
+            "order": 37
         }
     },
     "actions": [
@@ -627,7 +633,7 @@
         {
             "action": "list agents",
             "identifier": "list_agents",
-            "description": "Lists all agent definitions from the agent_definitions Custom List",
+            "description": "Lists all agent definitions from definitions_path, or from the agent_definitions Custom List when it is empty",
             "type": "investigate",
             "read_only": true,
             "parameters": {},
@@ -728,7 +734,7 @@
         {
             "action": "list skills",
             "identifier": "list_skills",
-            "description": "Lists all skill definitions from the agent_skills Custom List",
+            "description": "Lists all skill definitions from definitions_path, or from the agent_skills Custom List when it is empty",
             "type": "investigate",
             "read_only": true,
             "parameters": {},
