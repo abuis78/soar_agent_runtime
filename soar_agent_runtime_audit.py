@@ -19,7 +19,7 @@ import json
 import re
 from datetime import datetime, timezone
 
-from soar_agent_runtime_utils import _scrub
+from soar_agent_runtime_utils import RUNTIME_ARTIFACT_SEVERITY, _scrub
 
 AUDIT_LABEL = "agent_audit"
 PHASE_INTENDED = "beabsichtigt"
@@ -132,6 +132,7 @@ class ArtifactAuditSink(AuditSink):
             "label": AUDIT_LABEL,
             "name": f"{event.get('schritt_id', '')} {event.get('werkzeug') or event.get('phase', '')}".strip(),
             "type": "agent_audit",
+            "severity": RUNTIME_ARTIFACT_SEVERITY,   # E-6: never raises the case severity
             "source_data_identifier": f"{event.get('schritt_id', '')}:{event.get('phase', '')}",
             "cef": dict(event),
             "run_automation": False,
