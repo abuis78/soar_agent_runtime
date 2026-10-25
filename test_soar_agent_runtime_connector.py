@@ -1262,3 +1262,113 @@ def test_catalogue_claim_needs_an_allowed_call():
 
 def test_block_says_none_when_nothing_ran():
     assert "- none" in connector_module.executed_actions_block("done", [])
+
+
+# --- contract B: setup app (1.11.0) ------------------------------------------------------
+
+class _ListServer(_FakeSoarLists):
+    """_FakeSoarLists plus list creation (POST decided_list) and replacement (content)."""
+
+    def __call__(self, method, url, body, timeout_s):
+        tail = url.split("/rest/", 1)[1]
+        if method == "post" and tail == "decided_list":
+            self.calls.append(("create", body["name"], body))
+            self.lists[body["name"]] = [list(r) for r in body["content"]]
+            return 200, {"success": True, "id": 9}
+        if method == "post" and body and "content" in body:
+            name = tail.split("/", 1)[1]
+            self.calls.append(("replace", name, body))
+            self.lists[name] = [list(r) for r in body["content"]]
+            return 200, {"success": True}
+        return super().__call__(method, url, body, timeout_s)
+
+
+def _setup(monkeypatch, lists, **config):
+    server = _ListServer(lists)
+    monkeypatch.setattr(utils_module.SoarRest, "transport", staticmethod(server))
+    monkeypatch.setattr(connector_module.LLMProvider, "test_connection",
+                        lambda self: (True, f"{self.provider} ({self.model}): OK"))
+    c = make_connector(default_provider="local", local_llm_url="http://10.0.0.5:11434/v1",
+                       local_llm_model="qwen2.5:7b", **config)
+    return c, server
+
+
+def _rows(c):
+    return {d["check"]: (d["status"], d["detail"]) for d in c.action_results[-1].data}
+
+
+def test_setup_creates_missing_lists(monkeypatch):
+    c, server = _setup(monkeypatch, {})
+    assert c._handle_setup_app({}) is True
+    assert server.lists == {"agent_definitions": [["", ""]], "agent_skills": [["", ""]]}
+    assert _rows(c)["custom list agent_definitions"] == ("CREATED", "empty agents list created")
+    assert _rows(c)["llm local"] == ("OK", "local (qwen2.5:7b): OK")
+    assert c.action_results[-1].message.startswith("Setup complete:")
+
+
+def test_setup_dry_run_changes_nothing(monkeypatch):
+    c, server = _setup(monkeypatch, {"agent_definitions": [["a", "{}"], ["a", "{}"]]})
+    assert c._handle_setup_app({"dry_run": True}) is True
+    assert not [call for call in server.calls if call[0] in ("create", "replace", "post")]
+    rows = _rows(c)
+    assert rows["custom list agent_skills"][0] == "WOULD_CREATE"
+    assert rows["custom list agent_definitions"] == ("WOULD_FIX", "1 older duplicate row(s) would be removed")
+
+
+def test_setup_keeps_the_latest_row_per_agent(monkeypatch):
+    lists = {"agent_definitions": [["", ""], ["test_local", '{"model": "old"}'], ["x", "{}"],
+                                   ["test_local", '{"model": "new"}']],
+             "agent_skills": [["", ""]]}
+    c, server = _setup(monkeypatch, lists)
+    c._handle_setup_app({})
+    assert server.lists["agent_definitions"] == [["test_local", '{"model": "new"}'], ["x", "{}"]]
+    assert _rows(c)["custom list agent_definitions"][0] == "FIXED"
+    assert _rows(c)["custom list agent_skills"] == ("OK", "0 skills, no duplicate rows")
+
+
+def test_setup_reports_missing_model_fields(monkeypatch):
+    c, _ = _setup(monkeypatch, {"agent_definitions": [["", ""]], "agent_skills": [["", ""]]})
+    c._config["local_llm_model"] = ""
+    assert c._handle_setup_app({}) is False
+    assert _rows(c)["local llm fields"] == ("MISSING", "set local_llm_model")
+    assert "local llm fields: set local_llm_model" in c.action_results[-1].message
+
+
+def test_setup_in_airgap_names_each_missing_piece(monkeypatch):
+    c, _ = _setup(monkeypatch, {"agent_definitions": [["", ""]], "agent_skills": [["", ""]]}, airgap_mode=True)
+    assert c._handle_setup_app({}) is False
+    rows = _rows(c)
+    assert rows["broker_url"][0] == "MISSING" and rows["policy_mode"][0] == "MISSING"
+
+
+def test_setup_in_airgap_checks_the_halt_file(monkeypatch, tmp_path):
+    policy = tmp_path / "policy.toml"
+    policy.write_text("")
+    c, _ = _setup(monkeypatch, {"agent_definitions": [["", ""]], "agent_skills": [["", ""]]}, airgap_mode=True,
+                  policy_mode="embedded", policy_path=str(policy), policy_state_dir=str(tmp_path))
+    c._handle_setup_app({})
+    assert _rows(c)["halt.json"][0] == "MISSING"
+    (tmp_path / "halt.json").write_text('{"angehalten": false, "grund": ""}')
+    c._handle_setup_app({})
+    assert _rows(c)["policy_state_dir"] == ("OK", "writable, halt.json present")
+    assert _rows(c)["policy_path"] == ("OK", "files readable")
+
+
+def test_setup_rejects_a_cloud_provider_in_airgap(monkeypatch):
+    c, _ = _setup(monkeypatch, {"agent_definitions": [["", ""]], "agent_skills": [["", ""]]}, airgap_mode=True)
+    c._default_provider = "anthropic"
+    c._handle_setup_app({})
+    assert _rows(c)["default_provider"][0] == "MISSING"
+
+
+def test_connectivity_reports_missing_lists_without_writing(monkeypatch):
+    c, server = _setup(monkeypatch, {"agent_definitions": [["", ""]]})
+    c._handle_test_connectivity({})
+    assert '"custom_lists": "MISSING: agent_skills (run \'setup app\')"' in c.action_results[-1].message
+    assert all(call[0] == "get" for call in server.calls)
+
+
+def test_compact_rows_drops_empty_and_older_rows():
+    rows = [["", ""], ["a", "1"], ["b", "2"], ["a", "3"], "junk"]
+    assert utils_module.compact_rows(rows) == ([["a", "3"], ["b", "2"]], 1)
+    assert utils_module.compact_rows([["", ""]]) == ([["", ""]], 0)

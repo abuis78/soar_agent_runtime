@@ -1327,6 +1327,27 @@ class SoarCustomList(SoarRest):
     def append(self, row: list[str]) -> None:
         self._call("post", {"append_rows": [row]})
 
+    def exists(self) -> bool:
+        """True if the list exists, False on HTTP 404; other failures raise CustomListError."""
+        try:
+            self._call("get")
+            return True
+        except CustomListError as e:
+            if "(HTTP 404)" in str(e):
+                return False
+            raise
+
+    def create(self, content: list[list[str]]) -> None:
+        """POST /rest/decided_list {"name", "content"}, as phantom.set_list does for a new list."""
+        try:
+            self.post("decided_list", {"name": self.name, "content": content})
+        except SoarRestError as e:
+            raise CustomListError(f"{e} (Custom List '{self.name}')") from e
+
+    def replace(self, content: list[list[str]]) -> None:
+        """POST /rest/decided_list/<name> {"content": ...} replaces every row (phantom.set_list)."""
+        self._call("post", {"content": content})
+
 
 def _requests_transport(method: str, url: str, body: dict | None, timeout_s: float):
     import requests  # bundled wheel; imported lazily so the module loads without it
@@ -1338,6 +1359,22 @@ def _requests_transport(method: str, url: str, body: dict | None, timeout_s: flo
     except ValueError:
         data = {"message": response.text[:200]}
     return response.status_code, data
+
+
+def compact_rows(rows: list) -> tuple[list[list[str]], int]:
+    """Rows reduced to the latest row per id, in the order ids first appeared, plus the number of
+    duplicate rows dropped. Empty rows are left out; an all-empty list keeps one empty row."""
+    latest: dict[str, list] = {}
+    order: list[str] = []
+    filled = 0
+    for row in rows:
+        if isinstance(row, list) and len(row) >= 2 and isinstance(row[0], str) and row[0].strip():
+            filled += 1
+            if row[0] not in latest:
+                order.append(row[0])
+            latest[row[0]] = list(row)
+    compact = [latest[id_] for id_ in order] or [["", ""]]
+    return compact, filled - len(order)
 
 
 def _rows_by_id(rows: list) -> dict[str, dict]:

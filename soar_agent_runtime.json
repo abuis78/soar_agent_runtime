@@ -759,6 +759,59 @@
                 }
             ],
             "versions": "EQ(*)"
+        },
+        {
+            "action": "setup app",
+            "identifier": "setup_app",
+            "description": "Creates the Custom Lists the app needs, removes older duplicate agent and skill rows, and checks the asset configuration (model, and in airgap_mode broker and policy fields and files). Run it once after installing or changing the asset.",
+            "type": "generic",
+            "read_only": false,
+            "parameters": {
+                "dry_run": {
+                    "description": "Only check and report; create and change nothing",
+                    "data_type": "boolean",
+                    "required": false,
+                    "default": false,
+                    "order": 0
+                }
+            },
+            "output": [
+                {
+                    "data_path": "action_result.data.*.check",
+                    "data_type": "string",
+                    "column_name": "Check",
+                    "column_order": 0
+                },
+                {
+                    "data_path": "action_result.data.*.status",
+                    "data_type": "string",
+                    "column_name": "Status",
+                    "column_order": 1
+                },
+                {
+                    "data_path": "action_result.data.*.detail",
+                    "data_type": "string",
+                    "column_name": "Detail",
+                    "column_order": 2
+                },
+                {
+                    "data_path": "action_result.status",
+                    "data_type": "string"
+                },
+                {
+                    "data_path": "action_result.message",
+                    "data_type": "string"
+                },
+                {
+                    "data_path": "action_result.summary.problems",
+                    "data_type": "numeric"
+                },
+                {
+                    "data_path": "action_result.summary.changed",
+                    "data_type": "numeric"
+                }
+            ],
+            "versions": "EQ(*)"
         }
     ]
 }
