@@ -45,15 +45,17 @@ def platform(monkeypatch):
     state = {"agents": {}, "notes": [], "severity": [], "queries": []}
     rules = types.ModuleType("phantom.rules")
     rules.add_note = lambda **kw: state["notes"].append(kw)
-    rules.update_container = lambda container=None, severity=None: state["severity"].append((container, severity))
     rules.run_query = lambda **kw: state["queries"].append(kw) or []
     monkeypatch.setitem(sys.modules, "phantom.rules", rules)
     monkeypatch.setattr(sys.modules["phantom"], "rules", rules, raising=False)
 
     def custom_lists(method, url, body, timeout_s):
         # Agent definitions over /rest/decided_list (1.10.0), the case over /rest/container (1.10.1).
-        assert method == "get"
         path = url.split("/rest/", 1)[1].split("?", 1)[0]
+        if method == "post" and path.startswith("container/"):  # update_severity (1.10.2)
+            state["severity"].append((int(path.split("/")[1]), body["severity"]))
+            return 200, {"success": True, "id": int(path.split("/")[1])}
+        assert method == "get"
         if path == "decided_list/agent_definitions":
             return 200, {"content": [[aid, json.dumps(cfg)] for aid, cfg in state["agents"].items()]}
         if path.endswith("/artifacts"):

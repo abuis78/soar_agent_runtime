@@ -49,6 +49,16 @@ def rules(monkeypatch):
     mod.update_container = lambda **kw: mod.calls.append(kw)
     monkeypatch.setitem(sys.modules, "phantom", pkg)
     monkeypatch.setitem(sys.modules, "phantom.rules", mod)
+
+    def rest(method, url, body, timeout_s):
+        # update_severity runs over POST /rest/container/<id> (1.10.2); the hook
+        # mod.update_container stays so tests can record or fail the effect.
+        assert method == "post"
+        mod.update_container(container=int(url.rsplit("/", 1)[1]), severity=body["severity"])
+        return 200, {"success": True}
+
+    import soar_agent_runtime_utils as utils_module
+    monkeypatch.setattr(utils_module.SoarRest, "transport", staticmethod(rest))
     return mod
 
 
@@ -258,7 +268,8 @@ def test_allow_with_failing_handler_reports_the_error_with_decision_id(rules):
         raise RuntimeError("platform down")
     rules.update_container = boom
     assert registry().execute("update_severity", GOOD) == \
-        "Failed to update severity: RuntimeError: platform down (entscheidung_id=pm-stub-1)"
+        ("Failed to update severity: SoarRestError: RuntimeError: platform down "
+         "(POST /rest/container/4711) (entscheidung_id=pm-stub-1)")
 
 
 def test_outside_airgap_the_gate_is_not_consulted(rules):
@@ -348,8 +359,9 @@ def test_every_effecting_handler_is_guarded_and_update_container_has_one_call_si
     import inspect
     import soar_agent_runtime_utils as u
     source = inspect.getsource(u)
-    assert source.count("ph_rules.update_container(") == 1
-    assert "ph_rules.update_container(" in inspect.getsource(ToolRegistry._tool_update_severity)
+    assert source.count('rest.post(f"container/') == 1
+    assert 'rest.post(f"container/' in inspect.getsource(ToolRegistry._tool_update_severity)
+    assert "update_container(" not in source  # no playbook API for the effect (1.10.2)
     for name, defn in ToolRegistry.TOOL_DEFINITIONS.items():
         if defn.get("wirkt", True) and (handler := getattr(ToolRegistry, f"_tool_{name}", None)):
             assert "_require_decision(" in inspect.getsource(handler), name

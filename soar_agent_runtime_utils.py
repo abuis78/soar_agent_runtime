@@ -1091,8 +1091,12 @@ class ToolRegistry:
         if severity not in valid:
             return f"ERROR: severity must be one of {valid}"
         try:
-            import phantom.rules as ph_rules
-            ph_rules.update_container(container=self.container_id, severity=severity)
+            # Over REST (1.10.2): phantom.rules has no update_container for apps, and the
+            # playbook function takes (container, data) and only wraps this POST.
+            rest = SoarRest(self.connector)
+            if not rest.available():
+                return "Failed to update severity: SOAR REST not available (off-platform)"
+            rest.post(f"container/{int(self.container_id)}", {"severity": severity})
             return f"Container severity updated to: {severity}"
         except Exception as e:
             return f"Failed to update severity: {_scrub_exc(e)}"
@@ -1270,15 +1274,23 @@ class SoarRest:
 
     def get(self, path: str, params: dict | None = None) -> dict:
         """GET /rest/<path>; raises SoarRestError naming the path on any failure."""
+        return self._request("get", path, params=params)
+
+    def post(self, path: str, body: dict) -> dict:
+        """POST /rest/<path> with a JSON body; raises SoarRestError naming the path on any failure."""
+        return self._request("post", path, body=body)
+
+    def _request(self, method: str, path: str, params: dict | None = None, body: dict | None = None) -> dict:
         from urllib.parse import urlencode
         url = f"{self._base_url().rstrip('/')}/rest/{path}" + (f"?{urlencode(params)}" if params else "")
+        label = f"{method.upper()} /rest/{path}"
         try:
-            status, data = (self.transport or _requests_transport)("get", url, None, self.timeout_s)
+            status, data = (self.transport or _requests_transport)(method, url, body, self.timeout_s)
         except Exception as e:
-            raise SoarRestError(f"{type(e).__name__}: {e} (GET /rest/{path})") from e
+            raise SoarRestError(f"{type(e).__name__}: {e} ({label})") from e
         data = data if isinstance(data, dict) else {}
         if status != 200 or data.get("failed"):
-            raise SoarRestError(f"GET /rest/{path}: HTTP {status}: {data.get('message', 'no message')}")
+            raise SoarRestError(f"{label}: HTTP {status}: {data.get('message', 'no message')}")
         return data
 
 

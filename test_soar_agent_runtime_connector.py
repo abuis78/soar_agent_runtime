@@ -1182,3 +1182,35 @@ def test_container_info_off_platform_says_so():
     tools = utils_module.ToolRegistry(make_connector(), 185, ["get_container_info"])
     assert tools._tool_get_container_info({}) == (
         "Failed to get container info: SOAR REST not available (off-platform)")
+
+
+# --- update_severity over POST /rest/container (1.10.2) --------------------------------
+
+def _severity_tools(monkeypatch, reply=(200, {"success": True})):
+    calls = []
+
+    def fake(method, url, body, timeout_s):
+        calls.append((method, url.split("/rest/", 1)[1], body))
+        return reply
+
+    monkeypatch.setattr(utils_module.SoarRest, "transport", staticmethod(fake))
+    tools = utils_module.ToolRegistry(make_connector(), 185, ["update_severity"])
+    return tools, calls
+
+
+def test_update_severity_posts_only_the_severity(monkeypatch):
+    tools, calls = _severity_tools(monkeypatch)
+    assert tools._tool_update_severity({"severity": "High"}) == "Container severity updated to: high"
+    assert calls == [("post", "container/185", {"severity": "high"})]
+
+
+def test_update_severity_names_the_rest_error(monkeypatch):
+    tools, _ = _severity_tools(monkeypatch, (400, {"failed": True, "message": "Invalid severity critical"}))
+    assert tools._tool_update_severity({"severity": "critical"}) == (
+        "Failed to update severity: SoarRestError: POST /rest/container/185: HTTP 400: Invalid severity critical")
+
+
+def test_update_severity_rejects_unknown_values_without_a_call(monkeypatch):
+    tools, calls = _severity_tools(monkeypatch)
+    assert tools._tool_update_severity({"severity": "banana"}).startswith("ERROR: severity must be one of")
+    assert calls == []
