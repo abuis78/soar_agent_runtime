@@ -46,18 +46,23 @@ def platform(monkeypatch):
     rules = types.ModuleType("phantom.rules")
     rules.add_note = lambda **kw: state["notes"].append(kw)
     rules.update_container = lambda container=None, severity=None: state["severity"].append((container, severity))
-    rules.get_container = lambda cid: {"id": cid, "name": "case"}
-    rules.get_artifacts = lambda **kw: []
     rules.run_query = lambda **kw: state["queries"].append(kw) or []
     monkeypatch.setitem(sys.modules, "phantom.rules", rules)
     monkeypatch.setattr(sys.modules["phantom"], "rules", rules, raising=False)
 
     def custom_lists(method, url, body, timeout_s):
-        # Agent definitions come from the Custom List over /rest/decided_list (1.10.0).
-        assert method == "get" and url.endswith("/rest/decided_list/agent_definitions")
-        return 200, {"content": [[aid, json.dumps(cfg)] for aid, cfg in state["agents"].items()]}
+        # Agent definitions over /rest/decided_list (1.10.0), the case over /rest/container (1.10.1).
+        assert method == "get"
+        path = url.split("/rest/", 1)[1].split("?", 1)[0]
+        if path == "decided_list/agent_definitions":
+            return 200, {"content": [[aid, json.dumps(cfg)] for aid, cfg in state["agents"].items()]}
+        if path.endswith("/artifacts"):
+            return 200, {"count": 0, "data": []}
+        if path.startswith("container/"):
+            return 200, {"id": int(path.split("/")[1]), "name": "case"}
+        raise AssertionError(f"unexpected REST call {url}")
 
-    monkeypatch.setattr(utils.SoarCustomList, "transport", staticmethod(custom_lists))
+    monkeypatch.setattr(utils.SoarRest, "transport", staticmethod(custom_lists))
     return state
 
 

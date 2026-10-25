@@ -303,13 +303,19 @@ def test_outside_airgap_splunk_search_is_marked_deprecated_but_callable(monkeypa
 
 @pytest.fixture
 def case_rules(monkeypatch):
-    import sys
-    import types as _t
+    """The case over /rest/container (1.10.1): 7 artifacts, the server returns a page of 5."""
+    import soar_agent_runtime_utils as utils
     calls = []
-    rules = _t.ModuleType("phantom.rules")
-    rules.get_container = lambda cid: calls.append(cid) or {"id": cid, "name": "case", "blob": "X" * 300}
-    rules.get_artifacts = lambda **kw: [{"id": i, "cef": {"n": i}} for i in range(7)]
-    monkeypatch.setitem(sys.modules, "phantom.rules", rules)
+
+    def fake(method, url, body, timeout_s):
+        path = url.split("/rest/", 1)[1].split("?", 1)[0]
+        cid = int(path.split("/")[1])
+        if path.endswith("/artifacts"):
+            return 200, {"count": 7, "data": [{"id": i, "cef": {"n": i}} for i in range(5)]}
+        calls.append(cid)
+        return 200, {"id": cid, "name": "case", "blob": "X" * 300}
+
+    monkeypatch.setattr(utils.SoarRest, "transport", staticmethod(fake))
     return calls
 
 
