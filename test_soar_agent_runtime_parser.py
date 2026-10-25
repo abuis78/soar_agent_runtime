@@ -324,3 +324,54 @@ def test_has_effect_flags():
     for name in ("splunk_search", "add_note", "get_container_info", "run_sub_agent"):
         assert ToolRegistry.has_effect(name) is False, name
     assert ToolRegistry.has_effect("unknown_tool") is True
+
+
+# --- RT-P05: one ACTION per turn (1.11.1) --------------------------------------------------
+# On SOAR 8.7 qwen2.5:7b planned "update the severity to high and add a note", yet only
+# add_note ran: a second ACTION used to replace the first without any error.
+
+TWO_ACTIONS = ('THOUGHT: I will update the severity to high and add a note.\n'
+               'ACTION: update_severity\nPARAMS: {"severity": "high"}\n'
+               'ACTION: add_note\nPARAMS: {"title": "Why", "content": "malware URL"}')
+
+
+def test_two_actions_in_one_turn_are_rejected_not_merged():
+    loop, _, _ = make_loop([])
+    tool, params, _thought, final, err = loop._parse_response(TWO_ACTIONS)
+    assert params == {} and final is None
+    assert err.startswith("ERROR: one ACTION per response; you sent update_severity, add_note. Nothing was executed.")
+
+
+def test_action_with_final_answer_is_rejected():
+    loop, _, _ = make_loop([])
+    _tool, _params, _t, final, err = loop._parse_response(
+        'THOUGHT: done\nACTION: update_severity\nPARAMS: {"severity": "high"}\nFINAL_ANSWER: severity set')
+    assert final is None
+    assert "you sent update_severity and FINAL_ANSWER" in err
+
+
+def test_rejected_turn_runs_nothing_and_the_model_retries_one_at_a_time():
+    loop, llm, tools = make_loop([
+        TWO_ACTIONS,
+        'THOUGHT: one at a time\nACTION: update_severity\nPARAMS: {"severity": "high"}',
+        'THOUGHT: now the note\nACTION: add_note\nPARAMS: {"title": "Why", "content": "malware URL"}',
+        "THOUGHT: done\nFINAL_ANSWER: severity high, note added",
+    ])
+    result = loop.run("Call update_severity with severity high. Then add a note.")
+    assert tools.calls == [("update_severity", {"severity": "high"}), ("add_note", {"title": "Why", "content": "malware URL"})]
+    log = json.loads(result["step_log"])
+    assert log[0]["observation"].startswith("ERROR: one ACTION per response")
+    assert "you sent update_severity, add_note" in llm.seen_messages[1][-1]["content"]
+    assert result["final_answer"] == "severity high, note added"
+
+
+def test_step_log_keeps_the_raw_model_turn_truncated():
+    loop, _, _ = make_loop(["THOUGHT: x\nACTION: get_container_info", "THOUGHT: y\nFINAL_ANSWER: " + "z" * 5000])
+    log = json.loads(loop.run("t")["step_log"])
+    assert log[0]["raw_response"] == "THOUGHT: x\nACTION: get_container_info"
+    assert len(log[1]["raw_response"]) == 2000
+
+
+def test_a_single_action_still_parses_as_before():
+    loop, _, _ = make_loop([])
+    assert loop._parse_response('ACTION: add_note\nPARAMS: {"title": "t", "content": "c"}')[4] is None
