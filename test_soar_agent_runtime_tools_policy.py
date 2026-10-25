@@ -689,3 +689,21 @@ def test_report_gap_note_failure_is_reported_not_fatal(rules):
     reg = catalog_registry()
     assert reg.execute("report_gap", GAP).startswith("GAP recorded")
     assert len(reg._artifacts) == 1 and any("gap note failed: RuntimeError: notes disabled" in m for m in reg._progress)
+
+
+# --- E-8 (1.15.2): a misspelled judgement key is named, never accepted ---------------
+
+def test_misspelled_judgement_key_is_named_and_the_call_still_refused(rules):
+    reg = registry()
+    params = {**GOOD, "begrün dung": GOOD["begruendung"]}
+    del params["begruendung"]
+    result = reg.execute("update_severity", params)
+    assert result.startswith("ERROR: Tool 'update_severity' has an effect and needs 'begruendung':")
+    assert "unknown key 'begrün dung' - did you mean 'begruendung'?" in result
+    assert rules.calls == [] and reg._policy.requests == []
+
+
+def test_tool_parameters_are_not_mistaken_for_misspelled_judgement_keys(rules):
+    reg = registry()
+    result = reg.execute("update_severity", {"severity": "high"})
+    assert "did you mean" not in result
