@@ -85,16 +85,8 @@ def _outcome_from_result(result: str) -> str:
 # external data (artifacts, SPL results) fed back into the LLM conversation.
 _REACT_KEYWORDS = ("THOUGHT:", "ACTION:", "PARAMS:", "FINAL_ANSWER:", "OBSERVATION:")
 
-# Issue #5 (SPL Injection): Destructive/exfiltrating/command-executing SPL pipe
-# commands. NOTE: a blocklist is defense-in-depth, not a guarantee — it can be
-# evaded via macros, subsearches, or novel commands. The primary control is the
-# per-agent `allowed_tools` allowlist that gates access to splunk_search at all.
-_BLOCKED_SPL_RE = re.compile(
-    r'\|\s*(delete|drop|truncate|map\s|outputlookup\b|outputcsv\b|rest\s+/services'
-    r'|collect\b|tscollect\b|mcollect\b|sendemail\b|sendalert\b|runshellscript\b'
-    r'|script\b|dump\b|crawl\b)',
-    re.IGNORECASE
-)
+# Issue #5 (SPL injection) is moot since 1.11.1: splunk_search runs no SPL at all,
+# because SOAR offers apps no search API (phantom.rules.run_query does not exist).
 
 # Issue #3 (SSRF): Allowed URL schemes per provider.
 _HTTPS_ONLY_PROVIDERS = {"anthropic", "openai", "gemini"}
@@ -492,7 +484,7 @@ class ToolRegistry:
     GAP_TOOL = "report_gap"
     GAP_LABEL = "agent_action_gap"
     LEGACY_SPL_TOOL = "splunk_search"
-    DEPRECATED_NOTE = " (deprecated: prefer broker_invoke templates)"
+    DEPRECATED_NOTE = " (not available in SOAR apps: always returns an error; use broker_invoke templates)"
     # RT-W05: every effecting tool needs a complete judgement and evidence that
     # originated in this run, checked locally (OQ-8) before any policy request
     # is made. The Policy Manager denies an incomplete judgement anyway
@@ -1048,27 +1040,13 @@ class ToolRegistry:
                     "Data gap: report datenlage 'unbekannt' or 'blinder_fleck'; there is no other access path.")
         return f"BROKER REJECTED code={result.code} aufruf_id={result.aufruf_id or '-'} detail={result.detail}"
 
+    SPL_UNAVAILABLE = ("ERROR: splunk_search is not available in SOAR apps (SOAR has no search API for apps); "
+                       "nothing was searched. Read data via broker_invoke templates.")
+
     def _tool_splunk_search(self, params: dict) -> str:
-        spl      = params.get("spl_query", "")
-        earliest = params.get("earliest", "-24h")
-        latest   = params.get("latest", "now")
-        if not spl:
-            return "ERROR: spl_query parameter is required."
-        # Issue #5: Block destructive/exfiltrating/command-executing SPL commands
-        if _BLOCKED_SPL_RE.search(spl):
-            return ("ERROR: Query contains blocked SPL commands "
-                    "(e.g. delete/drop/outputlookup/collect/sendemail/script/rest).")
-        self.connector.save_progress(f"Executing SPL: {spl[:80]}...")
-        try:
-            import phantom.rules as ph_rules
-            results = ph_rules.run_query(query=spl, start_time=earliest, end_time=latest)
-            if not results:
-                return "SPL search returned 0 results."
-            # Issue #2 sanitization is applied centrally at the LLM boundary
-            # (ReActLoop); returned raw here so step_log keeps forensic fidelity.
-            return f"SPL results ({len(results)} rows):\n{json.dumps(results[:20], indent=2)}"
-        except Exception as e:
-            return f"SPL search error: {_scrub_exc(e)}"
+        # Option 1 (2026-10-25): phantom.rules.run_query does not exist in SOAR 8.7, so this
+        # tool could never run. It answers clearly instead of failing with an AttributeError.
+        return self.SPL_UNAVAILABLE
 
     def _tool_add_note(self, params: dict) -> str:
         title   = params.get("title", "Agent Note")

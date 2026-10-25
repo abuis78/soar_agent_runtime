@@ -287,16 +287,19 @@ def test_airgap_prompt_with_broker_has_templates_but_no_spl_tool():
     assert "splunk_search" not in desc and "broker_invoke" in desc and "cve_offen_auf_assets" in desc
 
 
-def test_outside_airgap_splunk_search_is_marked_deprecated_but_callable(monkeypatch):
+def test_outside_airgap_splunk_search_says_it_is_unavailable(monkeypatch):
+    # Option 1 (1.11.1): SOAR has no run_query for apps, so the tool never searches.
     import sys
     import types as _t
     rules = _t.ModuleType("phantom.rules")
-    rules.run_query = lambda **kw: [{"host": "a"}]
+    rules.run_query = lambda **kw: (_ for _ in ()).throw(AssertionError("no SPL may run"))
     monkeypatch.setitem(sys.modules, "phantom.rules", rules)
     reg = registry(allowed=("splunk_search", "add_note"))
-    assert "- splunk_search(" in reg.get_tool_descriptions()
-    assert "(deprecated: prefer broker_invoke templates)" in reg.get_tool_descriptions()
-    assert reg.execute("splunk_search", {"spl_query": "index=main"}).startswith("SPL results (1 rows)")
+    assert "(not available in SOAR apps: always returns an error; use broker_invoke templates)" in \
+        reg.get_tool_descriptions()
+    assert reg.execute("splunk_search", {"spl_query": "index=main"}) == (
+        "ERROR: splunk_search is not available in SOAR apps (SOAR has no search API for apps); "
+        "nothing was searched. Read data via broker_invoke templates.")
 
 
 # --- get_container_info: own case only, size-capped (RT-L08, sub-change 2.5) --
