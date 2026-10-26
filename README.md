@@ -2,35 +2,44 @@
 
 ## 1. Overview
 
-SOAR Agent Runtime is a Splunk SOAR custom app implementing an autonomous **ReAct-Loop** (Reason → Act → Observe) agent framework. Instead of a fixed playbook sequence, an agent receives a natural language task and autonomously decides which tools to call until it reaches a `FINAL_ANSWER`.
+SOAR Agent Runtime is a Splunk SOAR custom app implementing an autonomous **ReAct-Loop** (Reason → Act → Observe) agent framework. Instead of a fixed playbook sequence, an agent receives a natural language task and decides which tools to call until it reaches a `FINAL_ANSWER`.
+
+The app runs in two modes:
+
+| | Normal mode | Air-gap mode (`airgap_mode`, chapter 5) |
+|---|---|---|
+| Models | Anthropic, OpenAI, Gemini or a local server (Ollama) | only the local server; cloud providers are refused before any call |
+| Reading data | the run's own container (`get_container_info`) | the own container plus read-only Tool Broker templates (`broker_invoke`) |
+| Taking effect | tools act directly (`update_severity`, `add_note`) | every effecting call needs a judgement with evidence and an `ALLOW` from the Policy Manager; catalogue measures are only proposed, a follow-up playbook executes them |
+| Audit | optional (`audit_enabled`) | one artifact `agent_audit` per step, fail-closed |
+| FINAL_ANSWER | free text, or the keys of a skill's `output_schema` | one JSON judgement with six mandatory fields, checked |
 
 **Key features:**
-- Multi-provider LLM support: Anthropic, OpenAI, Gemini, local (Ollama)
-- Agent definitions stored in SOAR Custom Lists — no code deployment needed
-- Skills system for reusable prompt injections and structured output schemas
-- Full audit trail: every ReAct step logged as Container Note
-- Agent chaining: agents can invoke sub-agents as tools
+- Agent and skill definitions in SOAR Custom Lists, or versioned as TOML files from Git (`definitions_path`, repository [soar-agent-definitions](https://github.com/abuis78/soar-agent-definitions)); the version of every definition goes into the audit
+- Skills: reusable prompt rules and required output keys
+- One `lauf_id` per run; every step has a `schritt_id` that later steps and the FINAL_ANSWER cite as evidence
+- Audit artifact per step (`agent_audit`) and a summary note per run that lists the actions that really took effect
+- Emergency stop: in air-gap mode the Policy Manager's halt state is checked before every step
+- Sub-agents: `run_sub_agent` runs another agent in the same run, bounded by depth and the step budget
+- Self-checks: `setup app`, `test connectivity`, `list tools`, `test tools`
 
 ---
 
 ## 2. Prerequisites
 
-### Python packages (auto-installed on import)
-| Package | Purpose |
-|---|---|
-| `requests` | HTTP |
-| `anthropic` | Claude API |
-| `openai` | OpenAI + local LLM |
-| `google-generativeai` | Gemini API |
+### Python packages (bundled)
+The package carries every wheel for SOAR's Python 3.13 under `wheels/` and SOAR installs them offline. Besides the LLM SDKs (`anthropic`, `openai`, `google-generativeai`) and `requests`, two local wheels are bundled: `ai_soc_telemetry` (optional HEC telemetry) and `policy_manager` (the Policy Manager client, chapter 4).
 
 ### System dependencies
-None.
+None on the SOAR host. For tests on a workstation: `uv` and, for the mTLS tests, the `openssl` CLI (chapter 10).
 
 ### Network
-- `api.anthropic.com` (Anthropic)
-- `api.openai.com` (OpenAI)
-- `generativelanguage.googleapis.com` (Gemini)
-- Internal URL for local LLM (Ollama etc.)
+| Mode | Outgoing connections from the SOAR host |
+|---|---|
+| Normal | the configured cloud APIs (`api.anthropic.com`, `api.openai.com`, `generativelanguage.googleapis.com`) and/or the local LLM URL |
+| Air-gap | only internal services: the local LLM (`local_llm_url`, e.g. Ollama on port 11434), the Tool Broker (`broker_url`, https with mTLS) and, with `policy_mode = service`, the Policy Manager (`policy_service_url`, https with mTLS). No internet. |
+
+Every run also calls the SOAR REST API of its own instance (Custom Lists, container, artifacts), authenticated by the app framework as the user who runs the action.
 
 ---
 
@@ -39,7 +48,7 @@ None.
 0. Build the package from a checkout of `main`: `python3 tools/build_app.py` writes `soar_agent_runtime_v<app_version>.tar` next to app.json (`--dry-run` lists the files, `--out DIR` picks the directory). The tar carries all bundled wheels, so the SOAR host needs no internet access (SOAR ≥ 7.0.0 with Python 3.13 on Linux x86_64).
 1. **Apps → Install App** → upload the tar from step 0
 2. **Apps → SOAR Agent Runtime → Configure New Asset**
-3. Fill in API keys for the providers you want to use
+3. Fill in the fields for the mode you want (chapter 4); for air-gap mode follow the checklist in chapter 5
 4. **Test Connectivity**
 5. Run the action **setup app** once: it creates the Custom Lists `agent_definitions` and `agent_skills` if they are missing and checks the asset (model, and in `airgap_mode` broker and policy fields, files and `halt.json`). `dry_run` only reports.
 6. Run **test tools** on a container made for testing: it calls every built-in tool for real (one note, severity changed and restored). Set `model_check` to also see whether the model keeps one ACTION per response.
@@ -51,6 +60,8 @@ None.
 
 ## 4. Asset Configuration
 
+**LLM providers**
+
 | Field | Description | Default |
 |---|---|---|
 | `anthropic_api_key` | Anthropic API Key | — |
@@ -58,17 +69,44 @@ None.
 | `openai_api_key` | OpenAI API Key | — |
 | `openai_api_url` | OpenAI base URL | `https://api.openai.com/v1` |
 | `gemini_api_key` | Google Gemini API Key | — |
-| `local_llm_url` | Local LLM URL | `http://localhost:11434/v1` |
-| `local_llm_api_key` | Local LLM key | `ollama` |
+| `local_llm_url` | Local LLM base URL (Ollama: `http://<host>:11434/v1`) | `http://localhost:11434/v1` |
+| `local_llm_api_key` | Local LLM key (`ollama` for Ollama, or empty) | — |
 | `local_llm_model` | Local model when the agent definition names none; also used by `test connectivity` (Ollama tag, e.g. `qwen2.5:7b`) | `llama3` |
-| `default_provider` | Fallback provider | `anthropic` |
-| `default_max_steps` | Max ReAct steps | `25` |
+| `default_provider` | Provider when the agent definition names none (`anthropic`, `openai`, `gemini`, `local`) | `anthropic` |
+| `llm_timeout_s` | Timeout in seconds for one model call (RT-A03) | `120` |
+| `llm_temperature` | Sampling temperature; `0` = as deterministic as the model allows | `0` |
+| `llm_max_tokens` | Maximum output tokens per model call | `4096` |
+| `llm_seed` | Optional sampling seed, sent only when set and supported by the server | — |
+
+**Agents and definitions**
+
+| Field | Description | Default |
+|---|---|---|
+| `default_max_steps` | Step limit when the definition and the action name none (hard cap 50) | `25` |
 | `agent_list_name` | Custom List for agents | `agent_definitions` |
 | `skill_list_name` | Custom List for skills | `agent_skills` |
-| `max_subagent_depth` | Maximum nesting of `run_sub_agent`: the started agent has depth 0, its sub-agents 1, theirs 2; deeper is refused (RT-B03, AC-14). `0` = no sub-agents | `2` |
 | `definitions_path` | Directory on the SOAR host with a checkout of [soar-agent-definitions](https://github.com/abuis78/soar-agent-definitions) (`agents/<agent_id>.toml`, `skills/<skill_id>.toml`). Set = `run agent`, `list agents` and `list skills` read the TOML files instead of the Custom Lists, and the audit field `definition_version` becomes `<id>@<version>#<sha256 prefix>` for the agent and each skill (RT-B02). `create agent` / `create skill` are refused while it is set (E5) | — |
+| `max_subagent_depth` | Maximum nesting of `run_sub_agent`: the started agent has depth 0, its sub-agents 1, theirs 2; deeper is refused (RT-B03, AC-14). `0` = no sub-agents | `2` |
+| `max_observation_chars` | Maximum characters of one tool observation, the `extra_context` block or a container payload passed to the model; longer input is truncated and marked (RT-B04) | `8000` |
 
-Policy Manager (effecting actions in `airgap_mode`, RT-W01/RT-W03; the air-gap and Tool Broker fields are documented with sub-change 5.5):
+**Air-gap mode and audit** (chapter 5)
+
+| Field | Description | Default |
+|---|---|---|
+| `airgap_mode` | Only the `local` provider; cloud providers are refused at run start, `splunk_search` is removed, reading goes through the Tool Broker and every effect through the Policy Manager (RT-A01) | off |
+| `audit_enabled` | One audit artifact `agent_audit` per step outside air-gap mode (RT-P02); always on and fail-closed in `airgap_mode` | off |
+
+**Tool Broker** (read-only templates, RT-L07)
+
+| Field | Description | Default |
+|---|---|---|
+| `broker_url` | Tool Broker base URL, `https://` only (mTLS); required in `airgap_mode` | — |
+| `broker_timeout_s` | Timeout in seconds for every broker call | `30` |
+| `broker_client_cert` | Path on the SOAR host to the client certificate (PEM) | — |
+| `broker_client_key` | Path on the SOAR host to its private key (PEM); the key never leaves the host | — |
+| `broker_ca` | Path on the SOAR host to the CA bundle (PEM) that signed the broker's server certificate | — |
+
+**Policy Manager** (effecting actions in `airgap_mode`, RT-W01/RT-W03)
 
 | Field | Description | Default |
 |---|---|---|
@@ -80,6 +118,16 @@ Policy Manager (effecting actions in `airgap_mode`, RT-W01/RT-W03; the air-gap a
 | `policy_client_cert` | Path to the client certificate (PEM); its CN is the runtime's identity at the Policy Manager | — |
 | `policy_client_key` | Path to the private key (PEM); the key never leaves the host | — |
 | `policy_ca` | Path to the CA bundle (PEM) that signed the service certificate | — |
+
+**Telemetry** (optional, AI-SOC Telemetry; never changes agent behaviour)
+
+| Field | Description | Default |
+|---|---|---|
+| `telemetry_enabled` | Send `agent_action` events to Splunk HEC | off |
+| `hec_url` | HEC event endpoint, e.g. `https://splunk.example.com:8088/services/collector/event` | — |
+| `hec_token` | HEC token, scoped to the telemetry index | — |
+| `telemetry_index` | Splunk index for the events | `ai_soc_audit` |
+| `telemetry_verify_tls` | Verify the HEC certificate; disable only for a self-signed test instance | on |
 
 The bundled wheel `wheels/py3/policy_manager-0.5.2-py3-none-any.whl` is Policy Manager 0.5.2, the release asset of PolicyManager tag `v0.5.2` (commit `c9e5982`, SHA-256 `b710eda193d9f2b6c58bc33e6eb267bfae0e05e2445f070f7a86327f2ab92f8e`): `embedded`, `service` and the action catalogue work with it. Breaking changes against 0.5.1 are listed in the PolicyManager [MIGRATION.md](https://github.com/abuis78/PolicyManager/blob/v0.5.2/docs/MIGRATION.md). Refresh it with `scripts/build_wheel.sh --copy-to wheels/py3` from the PolicyManager repo, then `python3 tools/update_wheels.py`.
 
