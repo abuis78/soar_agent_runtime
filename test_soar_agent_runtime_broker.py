@@ -234,3 +234,13 @@ def test_requests_transport_maps_timeout_and_non_json(monkeypatch):
     assert send("GET", "https://b/x", None, None, 1.0) == (502, "bad gateway")
     with pytest.raises(TimeoutError):
         send("GET", "https://b/slow", None, None, 1.0)
+
+
+@pytest.mark.parametrize("payload,expected", [
+    ({"aufruf_id": "tb-9", "datenlage": "vorhanden", "zeilen": 0, "daten": []}, "vorhanden"),
+    ({"aufruf_id": "tb-9", "datenlage": "leer", "zeilen": 0, "daten": []}, "leer"),
+    ({"aufruf_id": "tb-9", "zeilen": 0, "daten": []}, ""),          # broker before TB-F18
+])
+def test_invoke_passes_the_datenlage_through(payload, expected):
+    c, _ = client(payload=payload)
+    assert c.invoke("v", {}, KONTEXT).datenlage == expected
