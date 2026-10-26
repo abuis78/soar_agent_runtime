@@ -321,3 +321,9 @@ def test_e10_parent_may_cite_the_childs_steps_in_its_final_answer(monkeypatch, t
     # E-11: the summary counts the child's audit events too
     assert result["audit_ereignisse"] == len(c.artifacts) == 3
     assert c.action_results[-1].summary["audit_ereignisse"] == 3
+
+
+def test_e13_data_gaps_of_the_child_reach_the_caller():
+    reg = registry(Spawn({"final_answer": "ok", "steps_taken": 1, "data_gaps": ["vuln: datenlage=leer"]}))
+    reg.execute("run_sub_agent", {"agent_id": "child", "task": "look"})
+    assert reg.data_gaps == ["child: vuln: datenlage=leer"]

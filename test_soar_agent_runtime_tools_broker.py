@@ -375,3 +375,29 @@ def test_broker_datenlage_is_in_the_observation_with_its_meaning(datenlage, expe
     head, hint, _ = obs.split("\n", 2)
     assert head.endswith(f"zeilen=0 gekuerzt=false datenlage={datenlage}")
     assert expected in hint
+
+
+# --- E-13 (1.16.3): reads without data are recorded as data gaps (D16) ----------------------
+
+@pytest.mark.parametrize("datenlage,gap", [("vorhanden", None), ("leer", "cve_offen_auf_assets: datenlage=leer"),
+                                           ("unbekannt", "cve_offen_auf_assets: datenlage=unbekannt"),
+                                           ("", "cve_offen_auf_assets: datenlage=nicht gemeldet")])
+def test_broker_reads_without_data_are_recorded_as_gaps(datenlage, gap):
+    ok = InvokeResult(ok=True, aufruf_id="tb-6", vorlage_id="cve_offen_auf_assets", vorlage_version=3,
+                      zeilen=0, daten=[], datenlage=datenlage)
+    reg = registry(FakeBroker(invoke=ok))
+    reg.load_broker_tools()
+    reg.execute("broker_invoke", {"vorlage_id": "cve_offen_auf_assets", "parameter": {"cve": "CVE-2026-5678"}})
+    assert reg.data_gaps == ([gap] if gap else [])
+
+
+def test_unreachable_source_is_recorded_as_gap():
+    gone = InvokeResult(ok=False, vorlage_id="cve_offen_auf_assets", art="fehler", code="SOURCE_ERROR", detail="down")
+    reg = registry(FakeBroker(invoke=gone))
+    reg.load_broker_tools()
+    reg.execute("broker_invoke", {"vorlage_id": "cve_offen_auf_assets", "parameter": {"cve": "CVE-2026-1"}})
+    assert reg.data_gaps == ["cve_offen_auf_assets: SOURCE_ERROR"]
+
+
+def test_vorhanden_hint_names_when_vollstaendig_is_right():
+    assert "'vollstaendig' only if every source" in ToolRegistry.DATENLAGE_HINTS["vorhanden"]
