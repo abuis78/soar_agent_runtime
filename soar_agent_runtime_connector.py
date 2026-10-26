@@ -776,6 +776,8 @@ class SoarAgentRuntimeConnector(BaseConnector):
         result = loop.run(task)
         result["halted"] = bool(loop.tools.halted)
         result["halt_source"] = loop.tools.halt_source
+        # E-10: everything the child could cite is evidence of this run for the caller
+        result["evidence_ids"] = sorted(loop.tools.evidence | {e["schritt_id"] for e in loop.step_log})
         return result
 
     @staticmethod
