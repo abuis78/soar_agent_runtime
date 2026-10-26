@@ -98,6 +98,7 @@ class InvokeResult:
     gekuerzt: bool = False
     ergebnis_hash: str = ""
     daten: Any = None
+    datenlage: str = ""          # TB-F18: vorhanden | leer | unbekannt; "" = not reported (older broker)
     art: str = ""
     code: str = ""
     detail: str = ""
@@ -218,6 +219,7 @@ class BrokerClient:
             gekuerzt=bool(payload.get("gekuerzt", False)),
             ergebnis_hash=str(payload.get("ergebnis_hash", "")),
             daten=payload.get("daten"),
+            datenlage=str(payload.get("datenlage") or ""),
         )
 
     def health(self) -> tuple[bool, str]:

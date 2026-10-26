@@ -140,8 +140,10 @@ def test_successful_invoke_sends_context_registers_evidence_and_formats_observat
     obs = reg.execute("broker_invoke", {"vorlage_id": "cve_offen_auf_assets", "parameter": {"cve": "CVE-2026-1"}})
     assert fb.invoke_calls == [("cve_offen_auf_assets", {"cve": "CVE-2026-1"},
                                 {"agent_id": "triage", "lauf_id": "rt-x", "container_id": 4711, "schritt": 3, "schritt_id": "rt-x/3"})]
-    head, body = obs.split("\n", 1)
-    assert head == "BROKER RESULT aufruf_id=tb-1 vorlage=cve_offen_auf_assets v3 katalog=a41c9e2 zeilen=1 gekuerzt=false"
+    head, hint, body = obs.split("\n", 2)
+    assert head == ("BROKER RESULT aufruf_id=tb-1 vorlage=cve_offen_auf_assets v3 katalog=a41c9e2 zeilen=1 "
+                    "gekuerzt=false datenlage=nicht gemeldet")
+    assert hint == ToolRegistry.DATENLAGE_HINTS["unbekannt"]     # an older broker without datenlage (TB-F18)
     assert json.loads(body) == [{"asset": "srv-1", "status": "offen"}]
     assert reg.evidence_ids() == {"tb-1"} and reg.last_call_id == "tb-1"
 
@@ -355,3 +357,21 @@ def test_large_container_payload_is_truncated_at_the_loop_boundary(case_rules):
     obs = llm.seen[1][-1]["content"]
     assert "[...truncated " in obs and obs.endswith("<<<END DATA>>>")
     assert len(loop.step_log[0]["observation"]) > 120  # raw kept for forensics
+
+
+# --- E-12 (1.16.2 / 2.0.0): the broker's datenlage reaches the model ------------------------
+
+@pytest.mark.parametrize("datenlage,expected", [
+    ("vorhanden", "0 rows here is a real negative finding"),
+    ("leer", "datenlage 'blinder_fleck'"),
+    ("unbekannt", "datenlage 'unbekannt'"),
+])
+def test_broker_datenlage_is_in_the_observation_with_its_meaning(datenlage, expected):
+    ok = InvokeResult(ok=True, aufruf_id="tb-5", vorlage_id="cve_offen_auf_assets", vorlage_version=3,
+                      katalog_version="k7", zeilen=0, daten=[], datenlage=datenlage)
+    reg = registry(FakeBroker(invoke=ok))
+    reg.load_broker_tools()
+    obs = reg.execute("broker_invoke", {"vorlage_id": "cve_offen_auf_assets", "parameter": {"cve": "CVE-2026-5678"}})
+    head, hint, _ = obs.split("\n", 2)
+    assert head.endswith(f"zeilen=0 gekuerzt=false datenlage={datenlage}")
+    assert expected in hint
