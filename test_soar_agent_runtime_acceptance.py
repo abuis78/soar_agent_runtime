@@ -11,6 +11,9 @@ AC-12 every step is audited with lauf_id/schritt_id; no effect when audit is not
 AC-15 without airgap_mode the app behaves as before
 Phase 3 adds AC-05..AC-08 (policy gate), Phase 4 adds AC-09 (catalogue sequence),
 RT-W10 (gap report), RT-W04 (service mode without fallback) and E12 (stage filter).
+Phase 5 adds AC-13 (emergency stop before every step, also from the broker and inside a
+sub-agent) and AC-14 (sub-agent beyond the depth limit refused); a guard test checks that
+AC-01..AC-15 each have an end-to-end test here.
 """
 
 from __future__ import annotations
@@ -1097,6 +1100,103 @@ def test_e6_every_artifact_dict_in_the_runtime_sets_the_severity():
     sources = inspect.getsource(utils) + inspect.getsource(audit)
     builders = sources.count('"run_automation": False,')
     assert builders == 3 and sources.count('"severity": RUNTIME_ARTIFACT_SEVERITY') == builders
+
+
+# ============================================================================
+# Phase 5 completion (5.6): AC-13 with broker and sub-agents, AC-14 end to end
+# ============================================================================
+
+BROKER_HALTED = {"aufruf_id": "tb-halt", "abgelehnt": True, "code": "HALTED", "detail": "operator stop"}
+
+
+def sub_agent_call(agent_id, task="check it"):
+    return f'THOUGHT: delegate\nACTION: run_sub_agent\nPARAMS: {json.dumps({"agent_id": agent_id, "task": task})}'
+
+
+def test_ac13_broker_halted_during_the_run_stops_before_the_next_model_call(platform, llm, no_network):
+    define_agent(platform, provider="local", allowed_tools=["get_container_info", "add_note"])
+    stub = BrokerStub(invoke=BROKER_HALTED)
+    params = {"vorlage_id": "cve_offen_auf_assets", "parameter": {"cve": "CVE-2024-12345"}}
+    llm["responses"] = [f"THOUGHT: read\nACTION: broker_invoke\nPARAMS: {json.dumps(params)}", "FINAL_ANSWER: never"]
+    c = airgap_connector(stub)
+    status, result = run(c)
+    assert status is False and llm["calls"] == 1                       # no model call after the halt
+    assert result.message == "ERROR: run halted by Tool Broker (HALTED)"
+    assert len(stub.invokes()) == 1
+    assert [e["action"] for e in step_log(result)] == ["broker_invoke"]
+
+
+def test_ac13_halt_inside_a_sub_agent_ends_the_whole_run(platform, llm, monkeypatch):
+    define_agent(platform, "orchestrator", provider="local", allowed_tools=["run_sub_agent"])
+    define_agent(platform, "specialist", provider="local", allowed_tools=["get_container_info"])
+    # halt queries: orchestrator step 1, specialist step 1, specialist step 2 -> halted
+    llm["responses"] = [sub_agent_call("specialist"), "THOUGHT: look\nACTION: get_container_info",
+                        "FINAL_ANSWER: never", "FINAL_ANSWER: never"]
+    gate = _HaltAfter(2)
+    c = policy_connector(monkeypatch, gate)
+    status, result = run(c, "orchestrator")
+    # the child's halt is handed to the orchestrator, which ends at once: no step 2, no model call
+    assert status is False and llm["calls"] == 2 and gate.queries == 3
+    assert result.message == "ERROR: run halted by Policy Manager (HALTED)"
+    assert [e["action"] for e in step_log(result)] == ["run_sub_agent"]
+    events = audit_events(c)
+    assert [(e["agent_id"], e["schritt_id"]) for e in events if e["phase"] == "angehalten"] == [
+        ("specialist", f"{RUN_ID}/1/2")]
+
+
+def test_ac14_self_recursion_is_refused_at_depth_3_with_audit_phase_abgelehnt(platform, llm, monkeypatch):
+    import hashlib
+    define_agent(platform, "loop", provider="local", allowed_tools=["run_sub_agent"], max_steps=10)
+    llm["responses"] = [sub_agent_call("loop")] * 3 + ["FINAL_ANSWER: depth 2 done", "FINAL_ANSWER: depth 1 done",
+                                                       "FINAL_ANSWER: root done"]
+    monkeypatch.setattr("soar_agent_runtime_connector.new_run_id", lambda: RUN_ID)
+    c = make_connector(audit_enabled=True)
+    status, result = run(c, "loop")
+    assert status is True and result.data[0]["final_answer"] == "root done"
+    refusal = ("ERROR: sub-agent 'loop' refused: depth 3 exceeds max_subagent_depth 2 (RT-B03). "
+               "Nothing was run.")
+    refused = [e for e in audit_events(c) if e["schritt_id"] == f"{RUN_ID}/1/1/1"]
+    assert len(refused) == 1 and refused[0]["phase"] == "abgelehnt"
+    assert refused[0]["ergebnis_hash"] == hashlib.sha256(refusal.encode()).hexdigest()
+    assert llm["calls"] == 6                                           # the refused child never reached the model
+
+
+def test_ac14_max_subagent_depth_zero_refuses_every_sub_agent(platform, llm):
+    define_agent(platform, "orchestrator", provider="local", allowed_tools=["run_sub_agent"])
+    define_agent(platform, "specialist", provider="local", allowed_tools=["get_container_info"])
+    llm["responses"] = [sub_agent_call("specialist"), "FINAL_ANSWER: alone"]
+    c = make_connector(max_subagent_depth=0)
+    status, result = run(c, "orchestrator")
+    log = step_log(result)
+    assert status is True and llm["calls"] == 2
+    assert log[0]["observation"].startswith("ERROR: sub-agent 'specialist' refused: depth 1 exceeds "
+                                            "max_subagent_depth 0")
+
+
+def test_ac14_nesting_within_the_limit_runs_every_level_in_one_run(platform, llm, monkeypatch):
+    define_agent(platform, "lead", provider="local", allowed_tools=["run_sub_agent"])
+    define_agent(platform, "middle", provider="local", allowed_tools=["run_sub_agent"])
+    define_agent(platform, "leaf", provider="local", allowed_tools=["get_container_info"])
+    llm["responses"] = [sub_agent_call("middle"), sub_agent_call("leaf"), "FINAL_ANSWER: leaf done",
+                        "FINAL_ANSWER: middle done", "FINAL_ANSWER: lead done"]
+    monkeypatch.setattr("soar_agent_runtime_connector.new_run_id", lambda: RUN_ID)
+    c = make_connector(audit_enabled=True)
+    status, result = run(c, "lead")
+    assert status is True and result.data[0]["final_answer"] == "lead done"
+    assert [(e["agent_id"], e["schritt_id"]) for e in audit_events(c)] == [
+        ("leaf", f"{RUN_ID}/1/1/1"), ("middle", f"{RUN_ID}/1/1"), ("middle", f"{RUN_ID}/1/2"),
+        ("lead", f"{RUN_ID}/1"), ("lead", f"{RUN_ID}/2")]
+    assert {e["lauf_id"] for e in audit_events(c)} == {RUN_ID}
+    assert result.data[0]["steps_total"] == 5 and result.data[0]["audit_ereignisse"] == 5
+
+
+def test_every_acceptance_criterion_has_an_end_to_end_test():
+    """Spec §6 lists AC-01..AC-15; each needs at least one test_acNN_* in this file."""
+    import re
+    with open(__file__, encoding="utf-8") as fh:
+        source = fh.read()
+    missing = [f"AC-{n:02d}" for n in range(1, 16) if not re.search(rf"^def test_ac{n:02d}_", source, re.MULTILINE)]
+    assert missing == []
 
 
 def test_e13_vollstaendig_after_an_empty_source_gets_a_correction(platform, llm, no_network):
