@@ -184,6 +184,7 @@ def validate_final_answer(
     strict: bool = False,
     required_keys=(),
     valid_beleg_ids=(),
+    data_gaps=(),
 ) -> tuple[dict | None, list[str]]:
     """Check a FINAL_ANSWER against the contract. Returns (parsed object or None, errors).
 
@@ -224,6 +225,10 @@ def validate_final_answer(
                 errors.append("'konfidenz' must be a number between 0 and 1")
         if "datenlage" in data and data["datenlage"] not in DATENLAGE_VALUES:
             errors.append(f"'datenlage' must be one of {list(DATENLAGE_VALUES)}")
+        elif data.get("datenlage") == "vollstaendig" and data_gaps:
+            # E-13 / D16: a run with a data gap never reports a complete picture.
+            errors.append(f"'datenlage' cannot be 'vollstaendig': this run had data gaps ({'; '.join(data_gaps)}); "
+                          "use 'teilweise', 'unbekannt' or 'blinder_fleck' (D16)")
     missing_skill = [k for k in required_keys if k not in data]
     errors += [f"missing skill field '{k}'" for k in missing_skill]
     errors += unknown_key_hints(data, missing_skill, known=(*REQUIRED_ANSWER_FIELDS, *required_keys))
@@ -532,7 +537,9 @@ class ToolRegistry:
     # E-12 / TB-F18: what the broker's datenlage means for the judgement. Without it a
     # model cannot tell "0 rows, data present" from "source empty or no read right".
     DATENLAGE_HINTS = {
-        "vorhanden": "Data state: the source had data in the time window; 0 rows here is a real negative finding.",
+        "vorhanden": ("Data state: the source had data in the time window; 0 rows here is a real negative finding. "
+                      "In the judgement use datenlage 'vollstaendig' only if every source the question needs was "
+                      "read with datenlage=vorhanden, otherwise 'teilweise'."),
         "leer": ("Data state: the source had NO events in the time window (or the broker may not read it); "
                  "0 rows is not evidence of absence - in the judgement this is datenlage 'blinder_fleck'."),
         "unbekannt": ("Data state: could not be determined; an empty result is not a finding - in the "
@@ -570,6 +577,7 @@ class ToolRegistry:
         self.steps_left: int | None = None    # set by the loop before every tool call
         self.sub_steps_used = 0               # model steps spent by sub-agents (shared budget)
         self.sub_audit_written = 0            # audit events written by sub-agents (E-11)
+        self.data_gaps: list[str] = []        # broker reads without data (E-13, D16)
         self.sub_audit_failed = 0
         self.airgap = bool(airgap)
         # RT-L02: free-form SPL does not exist in airgap_mode - not in the
@@ -1108,6 +1116,8 @@ class ToolRegistry:
                     f"katalog={result.katalog_version or 'n/a'} zeilen={result.zeilen} "
                     f"gekuerzt={'true' if result.gekuerzt else 'false'} "
                     f"datenlage={result.datenlage or 'nicht gemeldet'}")
+            if result.datenlage != "vorhanden":
+                self.data_gaps.append(f"{result.vorlage_id or vorlage_id}: datenlage={result.datenlage or 'nicht gemeldet'}")
             hint = self.DATENLAGE_HINTS.get(result.datenlage, self.DATENLAGE_HINTS["unbekannt"])
             return f"{head}\n{hint}\n{json.dumps(result.daten, indent=2, default=str, ensure_ascii=False)}"
         if result.aufruf_id:
@@ -1116,6 +1126,7 @@ class ToolRegistry:
             self.halted = True
             return f"BROKER HALTED code=HALTED aufruf_id={result.aufruf_id or '-'} detail={result.detail}. Run stops."
         if result.code in self.BROKER_GAP_CODES:
+            self.data_gaps.append(f"{vorlage_id}: {result.code}")
             return (f"BROKER UNAVAILABLE code={result.code} detail={result.detail}. "
                     "Data gap: report datenlage 'unbekannt' or 'blinder_fleck'; there is no other access path.")
         return f"BROKER REJECTED code={result.code} aufruf_id={result.aufruf_id or '-'} detail={result.detail}"
@@ -1323,6 +1334,7 @@ class ToolRegistry:
         # E-10: the child's schritt_ids and broker aufruf_ids originated in this run (same
         # lauf_id), so the caller may cite them as belege, as the result line announces.
         self.evidence |= {str(e) for e in result.get("evidence_ids", ()) if e}
+        self.data_gaps += [f"{agent_id}: {g}" for g in result.get("data_gaps", ()) if g]
         if result.get("halted"):
             self.halted, self.halt_source = True, str(result.get("halt_source") or "Tool Broker")
         answer = str(result.get("final_answer") or "")
@@ -1935,7 +1947,8 @@ class ReActLoop:
                         valid_ids |= set(evidence())  # broker aufruf_ids (RT-L04 -> RT-P06)
                     verdict, errors = validate_final_answer(
                         final_answer, strict=self.strict_schema,
-                        required_keys=self.required_keys, valid_beleg_ids=valid_ids)
+                        required_keys=self.required_keys, valid_beleg_ids=valid_ids,
+                        data_gaps=tuple(getattr(self.tools, "data_gaps", ()) or ()))
                     if errors:
                         detail = "; ".join(errors)
                         msg = f"ERROR: FINAL_ANSWER invalid: {detail}"

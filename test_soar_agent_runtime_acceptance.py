@@ -1197,3 +1197,21 @@ def test_every_acceptance_criterion_has_an_end_to_end_test():
         source = fh.read()
     missing = [f"AC-{n:02d}" for n in range(1, 16) if not re.search(rf"^def test_ac{n:02d}_", source, re.MULTILINE)]
     assert missing == []
+
+
+def test_e13_vollstaendig_after_an_empty_source_gets_a_correction(platform, llm, no_network):
+    """D16 end to end: broker datenlage=leer, the judgement may not claim a complete picture."""
+    define_agent(platform, provider="local", allowed_tools=["get_container_info"])
+    empty = INVOKE_OK | {"zeilen": 0, "daten": [], "datenlage": "leer"}
+    params = {"vorlage_id": "cve_offen_auf_assets", "parameter": {"cve": "CVE-2026-5678"}}
+    answer = {"belege": [], "begruendung": "b", "gegenargumente": ["g"], "unsicherheiten": ["u"], "konfidenz": 0.5}
+    llm["responses"] = [f"THOUGHT: read\nACTION: broker_invoke\nPARAMS: {json.dumps(params)}",
+                        "FINAL_ANSWER: " + json.dumps(answer | {"datenlage": "vollstaendig"}),
+                        "FINAL_ANSWER: " + json.dumps(answer | {"datenlage": "blinder_fleck"})]
+    c = airgap_connector(BrokerStub(invoke=empty))
+    status, result = run(c)
+    log = step_log(result)
+    assert status is True and result.data[0]["urteil"]["datenlage"] == "blinder_fleck"
+    assert "Data state: the source had NO events" in log[0]["observation"]
+    assert "cannot be 'vollstaendig': this run had data gaps (cve_offen_auf_assets: datenlage=leer)" in \
+        log[1]["observation"]

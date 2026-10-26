@@ -234,3 +234,19 @@ def test_correction_outside_strict_names_only_the_skill_keys():
                           required_keys=("summary",))
     loop.run("t")
     assert "ALL of these keys: summary." in llm.seen[1][-1]["content"]
+
+
+# --- E-13 (1.16.3): no 'vollstaendig' after a data gap (D16) ------------------------------
+
+def test_vollstaendig_is_refused_when_the_run_had_a_data_gap():
+    _, errors = validate_final_answer(json.dumps(good(datenlage="vollstaendig")), strict=True,
+                                      data_gaps=("cve_offen_auf_assets: datenlage=leer",))
+    assert errors == ["'datenlage' cannot be 'vollstaendig': this run had data gaps "
+                      "(cve_offen_auf_assets: datenlage=leer); use 'teilweise', 'unbekannt' or 'blinder_fleck' (D16)"]
+
+
+@pytest.mark.parametrize("datenlage,gaps", [("teilweise", ("x: UNREACHABLE",)), ("vollstaendig", ()),
+                                            ("blinder_fleck", ("x: datenlage=leer",))])
+def test_datenlage_without_contradiction_is_accepted(datenlage, gaps):
+    _, errors = validate_final_answer(json.dumps(good(datenlage=datenlage)), strict=True, data_gaps=gaps)
+    assert errors == []

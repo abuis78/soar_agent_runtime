@@ -778,6 +778,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
         result["halt_source"] = loop.tools.halt_source
         # E-10: everything the child could cite is evidence of this run for the caller
         result["evidence_ids"] = sorted(loop.tools.evidence | {e["schritt_id"] for e in loop.step_log})
+        result["data_gaps"] = list(loop.tools.data_gaps)   # E-13: the caller's judgement must see them too
         return result
 
     @staticmethod
