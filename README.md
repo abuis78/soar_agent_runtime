@@ -377,242 +377,206 @@ When `run agent` executes, the Runtime:
 
 ## 9. SOC Use Cases & Agent Prompts
 
+Every use case comes as a TOML file for the repository [soar-agent-definitions](https://github.com/abuis78/soar-agent-definitions) (`agents/<agent_id>.toml`, used with `definitions_path`). Without `definitions_path`, enter the same fields with `create agent` (lists become comma-separated strings).
+
+**Rules that apply to every use case:**
+- **Reading.** An agent reads its own case with `get_container_info`. Everything else (Splunk events, CMDB, identity data, other cases) comes from Tool Broker templates via `broker_invoke`. The broker releases templates per `agent_id`, and they appear in the prompt by themselves, so they are not listed in `allowed_tools`. Prompts describe *what* to look up, never template names: the runtime knows none (RT-L03). `splunk_search` does not work in SOAR apps and is left out.
+- **Model.** The templates use the local model `qwen2.5:14b`. In normal mode any provider works, e.g. `provider = "anthropic"`; in air-gap mode only `local`.
+- **Answer.** In air-gap mode the FINAL_ANSWER is the JSON judgement from chapter 5; a skill's keys come on top. Tell the model to cite the `schritt_id` / `aufruf_id` of what it read as `belege`.
+- **Effects.** `update_severity` and catalogue measures go through the Policy Manager in air-gap mode. Pass `stufe` and `domaene` from the playbook, otherwise the policy falls back to its defaults.
+- **Skills.** The skills named here are the examples from chapter 8; put them into `skills/` or the Custom List first.
+
 ### UC-1: Alert Triage (Tier-1)
 
-**Recommended skills:** `structured_triage`, `mitre_mapping`
-
-```
-create agent:
-  agent_id:      triage_agent
-  provider:      anthropic
-  model:         claude-haiku-4-5-20251001
-  allowed_tools: get_container_info,splunk_search,add_note,update_severity
-  max_steps:     15
-  skills:        structured_triage,mitre_mapping
-  system_prompt: |
-    You are a SOC Tier-1 triage analyst. Your job is to assess whether an
-    alert is a true positive, false positive, or requires escalation.
-    For every alert:
-    (1) Get container info and read all artifacts.
-    (2) Search Splunk for related events (same source IP, user, host) in the last 24h.
-    (3) Assess based on frequency, context, and known patterns.
-    (4) Set severity accordingly.
-    (5) Add a structured triage note.
-    Be concise and factual. Never guess — only state what the data shows.
-
-run agent:
-  agent_id:     triage_agent
-  container_id: {{ container.id }}
-  task: |
-    Triage this alert. Determine if it is a true positive or false positive.
-    If true positive: set severity to high or critical, recommend escalation.
-    If false positive: set severity to low, document why.
+```toml
+agent_id = "triage_agent"
+version = "1.0.0"
+provider = "local"
+model = "qwen2.5:14b"
+agent_role = "triage"
+max_steps = 12
+allowed_tools = ["get_container_info", "add_note", "update_severity"]
+skills = ["structured_triage", "mitre_mapping"]
+system_prompt = """
+You are a SOC Tier-1 triage analyst. Decide whether the alert is a true positive,
+a false positive or needs escalation.
+(1) Read the case with get_container_info.
+(2) Look up related events for the same source IP, user and host of the last 24 hours
+    with the broker templates you have.
+(3) Judge by frequency, context and known patterns. State only what the data shows.
+(4) Set the severity when the evidence supports it.
+(5) Write a short triage note.
+"""
 ```
 
----
+```
+run agent:  agent_id triage_agent · container_id {{ container.id }} · stufe 1 · domaene soc
+task:       Triage this alert. True positive: severity high, recommend escalation.
+            False positive: severity low, document why.
+```
 
 ### UC-2: IOC Enrichment
 
-**Recommended skills:** `structured_ioc`, `mitre_mapping`
-
-```
-create agent:
-  agent_id:      ioc_enrichment_agent
-  provider:      openai
-  model:         gpt-4o-mini
-  allowed_tools: get_container_info,splunk_search,add_note
-  max_steps:     20
-  skills:        structured_ioc,mitre_mapping
-  system_prompt: |
-    You are an IOC enrichment specialist. For each IOC (IP, domain, hash, URL)
-    found in the container artifacts:
-    (1) Search Splunk for historical occurrences across all indexes.
-    (2) Check for related IOCs (same subnet, similar domains, related hashes).
-    (3) Determine first seen / last seen.
-    (4) Assess prevalence: isolated vs. widespread.
-    (5) Add an enrichment note per IOC: Type, Value, First/Last Seen,
-        Hit Count, Related IOCs, Risk Assessment.
-    Format each note consistently for downstream automation.
-
-run agent:
-  agent_id:     ioc_enrichment_agent
-  container_id: {{ container.id }}
-  task: |
-    Enrich all IOCs found in this container's artifacts.
-    Search Splunk across all indexes for the last 30 days.
-    Document findings as structured notes.
+```toml
+agent_id = "ioc_enrichment_agent"
+version = "1.0.0"
+provider = "local"
+model = "qwen2.5:14b"
+agent_role = "enrichment"
+max_steps = 15
+allowed_tools = ["get_container_info", "add_note"]
+skills = ["structured_ioc", "mitre_mapping"]
+system_prompt = """
+You are an IOC enrichment specialist. For each IOC (IP, domain, hash, URL) in the case artifacts:
+(1) Look up historical occurrences with the broker templates you have.
+(2) Note first seen, last seen and how often it occurs.
+(3) Judge prevalence: isolated or widespread.
+(4) Write one note per IOC: type, value, first/last seen, hit count, assessment.
+If a template is missing or the broker is unavailable, say so as a data gap; never guess.
+"""
 ```
 
----
+```
+run agent:  agent_id ioc_enrichment_agent · container_id {{ container.id }} · domaene soc
+task:       Enrich every IOC of this case for the last 30 days and document each one as a note.
+```
 
 ### UC-3: User Behaviour Investigation (UEBA)
 
-**Recommended skills:** `structured_ueba`, `mitre_mapping`
-
-```
-create agent:
-  agent_id:      ueba_agent
-  provider:      anthropic
-  model:         claude-sonnet-4-5
-  allowed_tools: get_container_info,splunk_search,add_note,update_severity
-  max_steps:     25
-  skills:        structured_ueba,mitre_mapping
-  system_prompt: |
-    You are a user behaviour analyst. When given a username or user-related alert:
-    (1) Get user activity from Splunk: logins, failed logins, VPN, email,
-        file access, privileged commands in the last 7 days.
-    (2) Identify anomalies: unusual hours, new locations, first-time access
-        to sensitive systems, bulk data access, lateral movement indicators.
-    (3) Build a timeline of significant events.
-    (4) Score risk: Low / Medium / High / Critical with justification.
-    (5) Add a UEBA summary note with timeline and risk score.
-    Use MITRE ATT&CK technique references where applicable.
-
-run agent:
-  agent_id:     ueba_agent
-  container_id: {{ container.id }}
-  task: |
-    Investigate user {{ artifact.cef.userName }} for suspicious behaviour.
-    Build a 7-day activity timeline and assess insider threat risk.
+```toml
+agent_id = "ueba_agent"
+version = "1.0.0"
+provider = "local"
+model = "qwen2.5:14b"
+agent_role = "enrichment"
+max_steps = 15
+allowed_tools = ["get_container_info", "add_note", "update_severity"]
+skills = ["structured_ueba", "mitre_mapping"]
+system_prompt = """
+You are a user behaviour analyst. For the user named in the case:
+(1) Look up logins, failed logins, VPN, e-mail and privileged activity of the last 7 days
+    with the broker templates you have.
+(2) Find anomalies: unusual hours, new locations, first access to sensitive systems, bulk access.
+(3) Build a timeline of the significant events.
+(4) Rate the risk (low, medium, high, critical) with reasons and set the severity if justified.
+(5) Write a note with the timeline and the rating.
+"""
 ```
 
----
+```
+run agent:  agent_id ueba_agent · container_id {{ container.id }} · stufe 1 · domaene soc
+task:       Investigate user {{ artifact.cef.userName }}: 7-day timeline and insider-threat risk.
+```
 
 ### UC-4: Phishing Email Analysis
 
-**Recommended skills:** `structured_triage`, `mitre_mapping`
-
-```
-create agent:
-  agent_id:      phishing_agent
-  provider:      anthropic
-  model:         claude-sonnet-4-5
-  allowed_tools: get_container_info,splunk_search,add_note,update_severity
-  max_steps:     20
-  skills:        structured_triage,mitre_mapping
-  system_prompt: |
-    You are a phishing analysis specialist. For a reported phishing email:
-    (1) Extract all IOCs from artifacts: sender, reply-to, URLs, attachments, IPs.
-    (2) Search Splunk for: other recipients of the same email, URL clicks,
-        file executions from attachments, C2 connections from affected hosts.
-    (3) Determine blast radius: how many users received / opened / clicked.
-    (4) Classify: Credential Harvesting / Malware Delivery / BEC /
-        Spear-Phishing / Mass Phishing.
-    (5) Add analysis note with: Classification, IOCs, Blast Radius,
-        Affected Users, Recommended Containment Actions.
-
-run agent:
-  agent_id:     phishing_agent
-  container_id: {{ container.id }}
-  task: |
-    Analyze this phishing report. Determine the blast radius,
-    classify the attack type, and recommend containment steps.
+```toml
+agent_id = "phishing_agent"
+version = "1.0.0"
+provider = "local"
+model = "qwen2.5:14b"
+agent_role = "triage"
+max_steps = 15
+allowed_tools = ["get_container_info", "add_note", "update_severity"]
+skills = ["structured_triage", "mitre_mapping"]
+system_prompt = """
+You are a phishing analyst. For a reported e-mail:
+(1) Take sender, reply-to, URLs, attachments and IPs from the case artifacts.
+(2) Look up other recipients, clicks and executions with the broker templates you have.
+(3) Determine the blast radius: received, opened, clicked.
+(4) Classify: credential harvesting, malware delivery, BEC, spear phishing or mass phishing.
+(5) Write a note with classification, IOCs, blast radius and the containment you recommend.
+Containment itself is a catalogue measure: propose it with catalog_invoke if it is offered,
+otherwise record it with report_gap.
+"""
 ```
 
----
+```
+run agent:  agent_id phishing_agent · container_id {{ container.id }} · stufe 2 · domaene soc
+task:       Analyse this phishing report: blast radius, attack type, recommended containment.
+```
 
 ### UC-5: Lateral Movement Detection
 
-**Recommended skills:** `mitre_mapping`
-
-```
-create agent:
-  agent_id:      lateral_movement_agent
-  provider:      openai
-  model:         gpt-4o
-  allowed_tools: get_container_info,splunk_search,add_note,update_severity
-  max_steps:     30
-  skills:        mitre_mapping
-  system_prompt: |
-    You are a threat hunter specializing in lateral movement detection.
-    Given a potentially compromised host or user:
-    (1) Search Splunk for authentication events from this source to other
-        internal hosts (WMI, SMB, RDP, PSExec, SSH) in the last 48h.
-    (2) Map the movement graph: Source → Target chains.
-    (3) Check for credential dumping (lsass access, SAM database reads).
-    (4) Check for new service installations, scheduled tasks, or registry
-        persistence on target hosts.
-    (5) Build an attack path narrative.
-    (6) Set severity to critical if lateral movement confirmed.
-    (7) Add note with: Attack Path, MITRE ATT&CK Techniques,
-        Affected Hosts, Recommended Isolation Targets.
-
-run agent:
-  agent_id:     lateral_movement_agent
-  container_id: {{ container.id }}
-  task: |
-    Investigate potential lateral movement from host {{ artifact.cef.sourceAddress }}.
-    Map the full attack path and identify all affected systems.
+```toml
+agent_id = "lateral_movement_agent"
+version = "1.0.0"
+provider = "local"
+model = "qwen2.5:14b"
+agent_role = "response"
+max_steps = 20
+allowed_tools = ["get_container_info", "add_note", "update_severity"]
+skills = ["mitre_mapping"]
+system_prompt = """
+You are a threat hunter for lateral movement. For the host or user in the case:
+(1) Look up authentications from this source to other internal hosts (SMB, RDP, WMI, SSH)
+    of the last 48 hours with the broker templates you have.
+(2) Map source -> target chains.
+(3) Check for credential access and persistence on the targets.
+(4) Set the severity to critical only when lateral movement is confirmed by the data.
+(5) Write a note with the attack path, MITRE techniques and the hosts to isolate.
+Isolation is a catalogue measure: propose it with catalog_invoke if offered, otherwise report_gap.
+"""
 ```
 
----
+```
+run agent:  agent_id lateral_movement_agent · container_id {{ container.id }} · stufe 2 · domaene soc
+task:       Check for lateral movement from host {{ artifact.cef.sourceAddress }} and map the path.
+```
 
 ### UC-6: Incident Summary (Management Report)
 
-**Recommended skills:** `ciso_report`
-
-```
-create agent:
-  agent_id:      report_agent
-  provider:      anthropic
-  model:         claude-sonnet-4-5
-  allowed_tools: get_container_info,splunk_search,add_note
-  max_steps:     15
-  skills:        ciso_report
-  system_prompt: |
-    You are a senior SOC analyst writing executive incident summaries.
-    Your output must be professional, concise, and free of technical jargon.
-    For any incident:
-    (1) Get all container notes and artifacts.
-    (2) Synthesize the incident timeline.
-    (3) Write a structured summary:
-        - Executive Summary (3 sentences max)
-        - Timeline
-        - Impact Assessment
-        - Root Cause (if known)
-        - Actions Taken
-        - Recommended Next Steps
-    (4) Add note titled 'Incident Summary — [date]'.
-    Write for a CISO audience: business impact first, technical detail second.
-
-run agent:
-  agent_id:     report_agent
-  container_id: {{ container.id }}
-  task: |
-    Write a management-ready incident summary for this container.
-    Synthesize all existing notes into a structured report.
-    Include timeline, impact, and recommended next steps.
+```toml
+agent_id = "report_agent"
+version = "1.0.0"
+provider = "local"
+model = "qwen2.5:14b"
+max_steps = 6
+allowed_tools = ["get_container_info", "add_note"]
+skills = ["ciso_report"]
+system_prompt = """
+You are a senior SOC analyst writing executive summaries, without jargon.
+(1) Read the case with get_container_info.
+(2) Write a note titled 'Incident Summary': executive summary (3 sentences), timeline,
+    impact, root cause if known, actions taken, recommended next steps.
+Business impact first, technical detail second.
+"""
 ```
 
----
+```
+run agent:  agent_id report_agent · container_id {{ container.id }}
+task:       Write a management-ready summary of this case.
+```
 
-### UC-7: Multi-Agent Orchestration (Chaining)
+### UC-7: Multi-Agent Orchestration (sub-agents)
+
+The orchestrator delegates with `run_sub_agent(agent_id, task)` (chapter 7). Each specialist runs in the same run with its **own** definition, `allowed_tools` and broker releases, so the orchestrator does not need the specialists' tools. Limits: `max_subagent_depth` (default 2) and the step budget. The orchestrator's `max_steps` covers the whole run including every specialist, so give it enough steps for all of them.
+
+```toml
+agent_id = "orchestrator_agent"
+version = "1.0.0"
+provider = "local"
+model = "qwen2.5:14b"
+max_steps = 40
+allowed_tools = ["get_container_info", "run_sub_agent", "add_note"]
+system_prompt = """
+You are a SOC orchestrator. You do not investigate yourself; you delegate with run_sub_agent:
+- triage_agent           first, for every alert
+- ioc_enrichment_agent   when the case has IOCs
+- ueba_agent             when a user is involved
+- lateral_movement_agent when a host may be compromised
+- report_agent           last, for the summary
+Read the case once, call the specialists in that order, one per step, and pass each a precise
+task. Base your FINAL_ANSWER on their results; cite the schritt_id of each run_sub_agent step.
+"""
+```
 
 ```
-create agent:
-  agent_id:      orchestrator_agent
-  provider:      anthropic
-  model:         claude-sonnet-4-5
-  allowed_tools: get_container_info,run_sub_agent,add_note,update_severity
-  max_steps:     10
-  system_prompt: |
-    You are a SOC orchestrator. You do not investigate directly.
-    Instead, you delegate tasks to specialist agents:
-    - ioc_enrichment_agent  — for IOC lookups and enrichment
-    - ueba_agent            — for user behaviour analysis
-    - lateral_movement_agent — for host-to-host movement
-    - report_agent          — for final summary generation
-    Assess the alert type, invoke the appropriate specialist agents
-    in the right order, then request a final report.
-
-run agent:
-  agent_id:     orchestrator_agent
-  container_id: {{ container.id }}
-  task: |
-    Fully investigate this incident end-to-end.
-    Delegate to the appropriate specialist agents based on alert type.
-    Finish with a management report.
+run agent:  agent_id orchestrator_agent · container_id {{ container.id }} · stufe 1 · domaene soc
+task:       Investigate this incident end to end with the specialists and finish with a summary.
 ```
+
+The specialists' audit events carry their own `agent_id` and `schritt_id`s below the calling step (`<lauf_id>/2/1`, …), all under the orchestrator's `lauf_id`.
 
 ---
 
@@ -629,48 +593,70 @@ The `run agent` action includes a custom Investigation panel widget showing agen
 
 ## 11. Local Testing
 
+**On a workstation** (no SOAR needed): the test suite uses a fake of the SOAR modules (`conftest.py`) and the bundled wheels.
+
+```bash
+uv run --python 3.13 --with pytest --with requests \
+  --with wheels/py3/policy_manager-0.5.2-py3-none-any.whl \
+  --with wheels/py3/ai_soc_telemetry-0.1.0-py3-none-any.whl \
+  --no-project python -m pytest -q
+uvx ruff@0.15.21 check .
+python3 tools/build_app.py --dry-run
+```
+
+Expected: `... passed`, `All checks passed!`, and a file list without `error:`. The mTLS integration tests in `test_soar_agent_runtime_policy_service.py` start the Policy Manager service from the bundled wheel in-process with a throwaway PKI made by the `openssl` CLI; without `openssl` they are skipped.
+
+**On the SOAR host** the connector can run one action from a JSON file (the app directory depends on the installation, e.g. `/opt/apps/soaragentruntime_<uuid>`):
+
 ```json
-// /tmp/test_run_agent.json
 {
   "identifier": "run_agent",
   "asset_id": "1",
-  "parameters": [{
-    "agent_id": "triage_agent",
-    "task": "Triage this alert and determine severity.",
-    "container_id": 1,
-    "max_steps": 3
-  }],
+  "parameters": [{"agent_id": "triage_agent", "task": "Triage this alert.", "container_id": 1, "max_steps": 3}],
   "config": {
-    "anthropic_api_key": "YOUR_KEY",
-    "default_provider": "anthropic",
-    "default_max_steps": 25,
-    "agent_list_name": "agent_definitions",
-    "skill_list_name": "agent_skills"
+    "default_provider": "local",
+    "local_llm_url": "http://<ollama-host>:11434/v1",
+    "local_llm_api_key": "ollama",
+    "local_llm_model": "qwen2.5:14b"
   }
 }
 ```
 
 ```bash
-cd /opt/phantom/apps/soar_agent_runtime_*/
+cd <app directory>
 phenv python3 soar_agent_runtime_connector.py /tmp/test_run_agent.json
 ```
-
-Unit and integration tests run with `uv` and the bundled wheels (see the command in `test_soar_agent_runtime_policy_wheel.py`). The mTLS integration tests in `test_soar_agent_runtime_policy_service.py` start the Policy Manager service from the bundled wheel in-process with a throwaway PKI made by the `openssl` CLI; without `openssl` they are skipped.
 
 ---
 
 ## 12. Troubleshooting
 
-| Error | Fix |
-|---|---|
-| `Agent 'X' not found` | Create Custom List `agent_definitions` + add agent via `create agent` |
-| `Skill 'X' not found` | Create Custom List `agent_skills` + add skill via `create skill` |
-| `Missing required JSON field(s): main_module` | Ensure `main_module` field exists in app JSON |
-| `anthropic not installed` | `phenv pip3 install anthropic` |
-| `openai not installed` | `phenv pip3 install openai` |
-| `Connection refused` (local) | Check Ollama: `systemctl status ollama` and `ollama pull llama3` |
-| `Max steps reached` | Increase `max_steps` in agent definition or asset config |
-| Widget not showing | Activate via **Manage Widgets** in Investigation panel |
+| Message or symptom | Cause | Fix |
+|---|---|---|
+| `Missing app directory detected` on install | tar built without directory entries (before 1.9.1) | Build with `python3 tools/build_app.py` from a current `main` |
+| `test connectivity`: local `Connection error` | wrong `local_llm_url`, or the model is not served | Check the URL (`http://<host>:11434/v1`) and network path; set `local_llm_model` to a tag from `ollama list` |
+| `Custom List '...' is empty; create the agent with 'create agent'.` / list missing | lists not set up | Run `setup app` |
+| `Agent 'X' not found in ...` | wrong id, or the agent is in the other source | `list agents`; with `definitions_path` set, agents come only from the TOML files |
+| `Definitions come from Git (definitions_path ...); nothing was saved.` | `create agent` / `create skill` while `definitions_path` is set (E5) | Add the file in the definitions repository and update the checkout on the host |
+| `agents/X.toml: ...` (e.g. `max_steps must be a positive integer`) | invalid definition file | Fix the named field; `test connectivity` lists every rejected file |
+| `Unknown tool(s) in allowed_tools: ...` | typo or a tool that does not exist | Use the names from `list tools` |
+| `ERROR: Tool 'X' is not in the allowed tools list.` | the agent called a tool it is not allowed to use | Add it to `allowed_tools`, or adjust the prompt |
+| `ERROR: splunk_search is not available in SOAR apps ...` | SOAR has no search API for apps | Read via `broker_invoke` templates |
+| `airgap_mode: provider '...' is not allowed, only 'local'` | cloud provider in air-gap mode, also for a sub-agent | `provider = "local"` in the definition or `default_provider = local` |
+| `ERROR: Tool 'update_severity' has an effect and needs ...` | judgement fields missing or misspelled (the text names them, e.g. `unknown key 'begrün dung' - did you mean 'begruendung'?`) | Usually fixed by the model on the next step; repeated failures: a larger model |
+| `beleg_id '...' did not originate in this run` | the model invented evidence | The message lists the valid ids; repeated failures: a larger model |
+| `FINAL_ANSWER invalid after correction round: ...` | the answer lacks required keys twice | Make sure a skill's `inject` does not suggest its keys are the whole answer (judgement fields stay required); larger model |
+| `POLICY DENIED code=...` | the Policy Manager refused | Read the code; check stage/domain, `[tool_action_kinds]`, `[playbook_categories]` (chapter 4 checklist) |
+| `HELD: 'X' requires APPROVE_...` | the policy wants an approval | Approve in the Policy Manager; the follow-up playbook executes after `consume(freigabe_id)` |
+| `run halted by Policy Manager before step N: ...` | emergency stop active or halt state unknown | Check `halt.json` / the service; `test connectivity` shows the halt reason |
+| `policy embedded: halt file missing (create halt.json ...)` | no `halt.json` in `policy_state_dir` | Create it with `{"angehalten": false, "grund": ""}`, owner `phantom`, mode `0600`, directory `0700` |
+| `Tool Broker is HALTED - run not started (RT-B01)` | the broker reports a halt | Resume in the Tool Broker |
+| `BROKER UNAVAILABLE code=...` | broker or source not reachable | Network, certificates, `broker_timeout_s`; the run treats it as a data gap |
+| `audit not writable ... (fail-closed, RT-P03)` | the audit artifact could not be saved | Check SOAR (database, permissions of the action user); in air-gap mode nothing takes effect without audit |
+| `ERROR: sub-agent 'X' refused: depth N exceeds max_subagent_depth M` | sub-agent nesting too deep (AC-14) | Flatten the delegation or raise `max_subagent_depth` |
+| `Max steps (N) reached without FINAL_ANSWER.` | step limit reached; sub-agents use up the same budget | Raise `max_steps` in the definition or the action |
+| Severity jumps back up after `update_severity` | SOAR raises a container to its highest artifact severity | Fixed since 1.12.2 (runtime artifacts are `low`); other `medium`/`high` artifacts on the case still raise it |
+| Widget not showing | widget not activated | **Manage Widgets** in the Investigation panel |
 
 ---
 
