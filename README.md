@@ -31,7 +31,7 @@ The app runs in two modes:
 The package carries every wheel for SOAR's Python 3.13 under `wheels/` and SOAR installs them offline. Besides the LLM SDKs (`anthropic`, `openai`, `google-generativeai`) and `requests`, two local wheels are bundled: `ai_soc_telemetry` (optional HEC telemetry) and `policy_manager` (the Policy Manager client, chapter 4).
 
 ### System dependencies
-None on the SOAR host. For tests on a workstation: `uv` and, for the mTLS tests, the `openssl` CLI (chapter 10).
+None on the SOAR host. For tests on a workstation: `uv` and, for the mTLS tests, the `openssl` CLI (chapter 11).
 
 ### Network
 | Mode | Outgoing connections from the SOAR host |
@@ -148,7 +148,34 @@ Every item below was learned against the real engine (0.5.1, checked against 0.5
 
 ---
 
-## 5. Test Connectivity
+## 5. Air-gap operation
+
+With `airgap_mode` on, the runtime is one part of a closed system: the model runs on an internal server, the **Tool Broker** is the only way to read data beyond the case, and the **Policy Manager** decides every effect. Nothing leaves the network.
+
+### How a run works
+
+1. **Start.** The agent's provider must be `local`; any other is refused before a model call (`airgap_mode: provider '...' is not allowed, only 'local'`). The runtime loads the broker templates released for the `agent_id` (`GET /v1/tools`) and the catalogue building blocks for its `stufe` (`GET /v1/aktionen`); both appear in the prompt as tools. `splunk_search` is removed.
+2. **Emergency stop before every step.** The halt state is asked before each step, also before the first model call. Halted or undeterminable ends the run with `run halted by Policy Manager before step N: <reason>` and an audit event `angehalten` (RT-B01, AC-13). A `HALTED` answer from the broker ends the run as well.
+3. **Reading.** `get_container_info` reads only the run's own container and leaves out the runtime's own artifacts. `broker_invoke(vorlage_id, parameter)` runs a read-only template; the answer starts with `BROKER RESULT aufruf_id=...`, and that `aufruf_id` is valid evidence. An unreachable broker or source gives `BROKER UNAVAILABLE ...`: a data gap, never a fallback to direct access (RT-L06).
+4. **Everything read is data.** Tool results, the case and `extra_context` reach the model inside `<<<DATA source=... untrusted>>>` blocks, truncated to `max_observation_chars`; the prompt tells the model never to follow instructions found there (RT-B04).
+5. **Taking effect.** `update_severity` and `catalog_invoke` need a judgement in the call: `begruendung`, `gegenargumente`, `unsicherheiten`, `konfidenz` (0..1) and `beleg_ids` from this run. An incomplete call is refused locally and names what is missing, including misspelled keys (RT-W05). A complete call goes to the Policy Manager, and the run never waits for an approval (RT-W06): `ALLOW` runs `update_severity`; `APPROVE_*` records a proposal with a `freigabe_id` and answers `HELD: ...`, a follow-up playbook executes it after `consume(freigabe_id)`; `DENY` comes back as `POLICY DENIED code=...`. Catalogue measures are never executed by the run, only proposed (chapter 7, *Action catalogue and gap report*).
+6. **Audit.** Every step writes an artifact `agent_audit` (severity `low`) with `lauf_id`, `schritt_id`, `agent_id`, the phase (`beabsichtigt`, `erledigt`, `abgelehnt`, `fehler`, `angehalten`), masked parameters, the hash of the result, `aufruf_id`, `entscheidung_id` and `definition_version`. An effecting step is announced (`beabsichtigt`) before it runs. If an artifact cannot be written, the effecting tool is not executed and the run stops (fail-closed, RT-P03).
+7. **FINAL_ANSWER.** One JSON object with six fields: `belege` (`schritt_id`s or `aufruf_id`s of this run), `begruendung`, `gegenargumente`, `unsicherheiten`, `konfidenz` and `datenlage` (`vollstaendig`, `teilweise`, `unbekannt`, `blinder_fleck`). A skill's `output_schema` keys come on top, in the same object. An invalid answer gets exactly one correction round that names every required key; a second invalid answer ends the run with `FINAL_ANSWER invalid after correction round` (RT-P04, RT-P06).
+8. **Summary note.** The note on the case lists the actions that really took effect and warns when the answer claims an effect that did not happen.
+
+### Commissioning checklist
+
+1. **Local model.** An inference server with an OpenAI-compatible API (e.g. Ollama) reachable from the SOAR host. Set `local_llm_url`, `local_llm_model` (exactly as `ollama list` shows it) and `default_provider = local`. Models with 7B parameters work but need the correction round more often; 14B is more reliable (E2E tests, 2026-10-25).
+2. **Tool Broker.** `broker_url` (`https://`), `broker_client_cert`, `broker_client_key`, `broker_ca` as files readable by the user `phantom`. Release templates per `agent_id` in the broker; a sub-agent uses its own `agent_id`.
+3. **Policy Manager.** `policy_mode` plus the fields of its mode, then work through the *Operator checklist: Policy Manager* in chapter 4 (halt file, tool mapping, stage and domain).
+4. **Definitions** (recommended). Put the definitions repository on the host and set `definitions_path`; the audit then names the exact version of every agent and skill.
+5. **Switch on** `airgap_mode`.
+6. **Check.** `test connectivity` must report the local model, `broker` and `policy` as OK (and `definitions` when set). Then `setup app` and `test tools` on a test container; in air-gap mode `test tools` skips the severity effect, because that needs the policy gate.
+7. **Trial run.** `run agent` on a test container with `stufe` and `domaene`. Check the `agent_audit` artifacts (one `lauf_id`, phases as expected) and the summary note.
+
+---
+
+## 6. Test Connectivity
 
 Expected output:
 ```
@@ -164,7 +191,7 @@ With `definitions_path` set, the result also has `definitions`: the number of ag
 
 ---
 
-## 6. Actions
+## 7. Actions
 
 ### `run agent`
 Runs a named agent via the ReAct loop.
@@ -282,7 +309,7 @@ Returns all entries from the respective Custom List, or from `definitions_path` 
 
 ---
 
-## 7. Skills System
+## 8. Skills System
 
 Skills are reusable prompt components stored in the `agent_skills` Custom List.
 One skill can be used by many agents. Agents reference skills by ID.
@@ -348,7 +375,7 @@ When `run agent` executes, the Runtime:
 
 ---
 
-## 8. SOC Use Cases & Agent Prompts
+## 9. SOC Use Cases & Agent Prompts
 
 ### UC-1: Alert Triage (Tier-1)
 
@@ -589,7 +616,7 @@ run agent:
 
 ---
 
-## 9. Widget Display
+## 10. Widget Display
 
 The `run agent` action includes a custom Investigation panel widget showing agent ID, provider, steps taken, final answer, and full step-by-step log.
 
@@ -600,7 +627,7 @@ The `run agent` action includes a custom Investigation panel widget showing agen
 
 ---
 
-## 10. Local Testing
+## 11. Local Testing
 
 ```json
 // /tmp/test_run_agent.json
@@ -632,7 +659,7 @@ Unit and integration tests run with `uv` and the bundled wheels (see the command
 
 ---
 
-## 11. Troubleshooting
+## 12. Troubleshooting
 
 | Error | Fix |
 |---|---|
@@ -647,7 +674,7 @@ Unit and integration tests run with `uv` and the bundled wheels (see the command
 
 ---
 
-## 12. Changelog
+## 13. Changelog
 
 | Version | Date | Changes |
 |---|---|---|
