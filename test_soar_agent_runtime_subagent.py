@@ -9,6 +9,7 @@ via conftest.py; agents come from TOML files (definitions_path) in tmp_path.
 from __future__ import annotations
 
 import json
+import re
 import types
 
 import pytest
@@ -267,3 +268,56 @@ def test_app_json_declares_max_subagent_depth():
 def test_max_subagent_depth_defaults_to_2_and_never_goes_negative():
     assert make_connector()._max_subagent_depth == 2
     assert make_connector(max_subagent_depth=-3)._max_subagent_depth == 0
+
+
+# --- E-10 / E-11 (1.16.1): child evidence counts for the caller, audit totals ----------
+
+def test_child_evidence_becomes_valid_evidence_of_the_caller_and_is_listed():
+    reg = registry(Spawn({"final_answer": "ok", "steps_taken": 2, "evidence_ids": ["rt-x/3/1", "rt-x/3/2", "tb-9"],
+                          "audit_ereignisse": 2, "audit_fehler": 1}))
+    result = reg.execute("run_sub_agent", {"agent_id": "child", "task": "look"})
+    assert "evidence ids you may cite: rt-x/3/1, rt-x/3/2, tb-9:" in result
+    assert {"rt-x/3/1", "rt-x/3/2", "tb-9"} <= reg.valid_evidence()
+    assert {"rt-x/3/1", "rt-x/3/2", "tb-9"} <= reg.evidence_ids()
+    assert (reg.sub_audit_written, reg.sub_audit_failed) == (2, 1)
+
+
+def test_long_evidence_lists_are_shortened_in_the_result_line():
+    ids = [f"rt-x/3/{n}" for n in range(1, 26)]
+    result = registry(Spawn({"final_answer": "ok", "steps_taken": 25, "evidence_ids": ids})).execute(
+        "run_sub_agent", {"agent_id": "child", "task": "look"})
+    assert "(+5 more)" in result
+
+
+def test_e10_parent_may_cite_the_childs_steps_in_its_final_answer(monkeypatch, tmp_path):
+    write_agents(tmp_path, {
+        "orchestrator": agent_toml("orchestrator", "ROLE-ORCH", ["run_sub_agent"]),
+        "specialist": agent_toml("specialist", "ROLE-SPEC", ["get_container_info"]),
+    })
+
+    def verdict(belege):
+        return "FINAL_ANSWER: " + json.dumps({"belege": belege, "begruendung": "b", "gegenargumente": ["g"],
+                                              "unsicherheiten": ["u"], "konfidenz": 0.6, "datenlage": "teilweise"})
+
+    seen = []
+
+    def chat(self, system_prompt, messages):
+        last = messages[-1]["content"]
+        seen.append(last)
+        if "ROLE-SPEC" in system_prompt:
+            return verdict([])
+        if "SUB-AGENT RESULT" in last:
+            child_step = re.search(r"evidence ids you may cite: ([^,:\s]+)", last).group(1)
+            return verdict([child_step])
+        return sub_call("specialist")
+
+    monkeypatch.setattr(connector_module.LLMProvider, "chat", chat)
+    c = make_connector(definitions_path=str(tmp_path), airgap_mode=True)
+    c._policy_client = StubPolicyClient()
+    assert c._handle_run_agent({"agent_id": "orchestrator", "task": "t", "container_id": 7}) is True
+    result = c.action_results[-1].data[0]
+    assert result["urteil"]["belege"] == [f"{result['lauf_id']}/1/1"]     # accepted, no correction round
+    assert result["steps_taken"] == 2
+    # E-11: the summary counts the child's audit events too
+    assert result["audit_ereignisse"] == len(c.artifacts) == 3
+    assert c.action_results[-1].summary["audit_ereignisse"] == 3

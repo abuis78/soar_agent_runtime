@@ -560,6 +560,8 @@ class ToolRegistry:
         self.max_depth = int(max_depth)
         self.steps_left: int | None = None    # set by the loop before every tool call
         self.sub_steps_used = 0               # model steps spent by sub-agents (shared budget)
+        self.sub_audit_written = 0            # audit events written by sub-agents (E-11)
+        self.sub_audit_failed = 0
         self.airgap = bool(airgap)
         # RT-L02: free-form SPL does not exist in airgap_mode - not in the
         # prompt, not callable. Outside airgap it stays, marked deprecated.
@@ -1305,6 +1307,11 @@ class ToolRegistry:
         result = self.spawn(agent_id=agent_id, task=task, depth=depth,
                             step_id=self.current_step_id, max_steps=budget)
         self.sub_steps_used += int(result.get("steps_total", result.get("steps_taken", 0)) or 0)
+        self.sub_audit_written += int(result.get("audit_ereignisse", 0) or 0)
+        self.sub_audit_failed += int(result.get("audit_fehler", 0) or 0)
+        # E-10: the child's schritt_ids and broker aufruf_ids originated in this run (same
+        # lauf_id), so the caller may cite them as belege, as the result line announces.
+        self.evidence |= {str(e) for e in result.get("evidence_ids", ()) if e}
         if result.get("halted"):
             self.halted, self.halt_source = True, str(result.get("halt_source") or "Tool Broker")
         answer = str(result.get("final_answer") or "")
@@ -1312,8 +1319,10 @@ class ToolRegistry:
             return f"Failed sub-agent '{agent_id}': {answer}"
         verdict = result.get("urteil")
         body = json.dumps(verdict, ensure_ascii=False) if isinstance(verdict, dict) else answer
+        cited = sorted(str(e) for e in result.get("evidence_ids", ()) if e)
+        shown = ", ".join(cited[:20]) + (f" (+{len(cited) - 20} more)" if len(cited) > 20 else "")
         return (f"SUB-AGENT RESULT agent_id={agent_id} steps={result.get('steps_taken', 0)} "
-                f"schritt_ids={self.current_step_id}/1..:\n{body}")
+                f"evidence ids you may cite: {shown or 'none'}:\n{body}")
 
 
 # ---------------------------------------------------------------------------
@@ -2032,8 +2041,8 @@ class ReActLoop:
             "steps_total":      steps + self._sub_steps(),   # incl. sub-agents (RT-B03)
             "provider":         self.llm.provider,
             "model":            self.llm.model,
-            "audit_ereignisse": self.audit_written,
-            "audit_fehler":     self.audit_failed,
+            "audit_ereignisse": self.audit_written + int(getattr(self.tools, "sub_audit_written", 0) or 0),
+            "audit_fehler":     self.audit_failed + int(getattr(self.tools, "sub_audit_failed", 0) or 0),
             "urteil":           self.verdict,
             "step_log":         json.dumps(self.step_log, indent=2)
         }
