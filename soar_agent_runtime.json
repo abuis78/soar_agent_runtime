@@ -6,7 +6,7 @@
     "package_name": "phantom_soar_agent_runtime",
     "type": "generic",
     "license": "Copyright 2026 Andreas Buis",
-    "app_version": "2.0.0",
+    "app_version": "2.1.0",
     "product_vendor": "OpenClaw SOC",
     "product_name": "SOAR Agent Runtime",
     "product_version_regex": ".*",
@@ -451,6 +451,12 @@
             "required": false,
             "default": 2,
             "order": 38
+        },
+        "approval_playbook": {
+            "description": "Input playbook started on the run's container when the Policy Manager answers APPROVE_1CLICK or APPROVE_2PERSON (e.g. soar_pm_admin/pm_freigabe, or its numeric ID). It asks the approval group; the follow-up playbook still consumes and executes. Inputs: freigabe_id, noetig, initiator, art, ziel, begruendung_kurz, ablauf. Empty = off",
+            "data_type": "string",
+            "required": false,
+            "order": 39
         }
     },
     "actions": [
