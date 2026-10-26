@@ -529,6 +529,15 @@ class ToolRegistry:
         "unsicherheiten": "What you are unsure about (text or list of strings; write 'keine erkannt' if none)",
         "konfidenz": "Your confidence 0..1 (number)",
     }
+    # E-12 / TB-F18: what the broker's datenlage means for the judgement. Without it a
+    # model cannot tell "0 rows, data present" from "source empty or no read right".
+    DATENLAGE_HINTS = {
+        "vorhanden": "Data state: the source had data in the time window; 0 rows here is a real negative finding.",
+        "leer": ("Data state: the source had NO events in the time window (or the broker may not read it); "
+                 "0 rows is not evidence of absence - in the judgement this is datenlage 'blinder_fleck'."),
+        "unbekannt": ("Data state: could not be determined; an empty result is not a finding - in the "
+                      "judgement this is datenlage 'unbekannt'."),
+    }
     # Broker codes that mean "data gap, no other access path" (RT-L06).
     BROKER_GAP_CODES = frozenset({"UNREACHABLE", "TIMEOUT", "BAD_RESPONSE", "SOURCE_ERROR",
                                   "CATALOG_UNAVAILABLE", "AUDIT_UNAVAILABLE"})
@@ -1097,8 +1106,10 @@ class ToolRegistry:
             head = (f"BROKER RESULT aufruf_id={result.aufruf_id} vorlage={result.vorlage_id} "
                     f"v{result.vorlage_version if result.vorlage_version is not None else '?'} "
                     f"katalog={result.katalog_version or 'n/a'} zeilen={result.zeilen} "
-                    f"gekuerzt={'true' if result.gekuerzt else 'false'}")
-            return f"{head}\n{json.dumps(result.daten, indent=2, default=str, ensure_ascii=False)}"
+                    f"gekuerzt={'true' if result.gekuerzt else 'false'} "
+                    f"datenlage={result.datenlage or 'nicht gemeldet'}")
+            hint = self.DATENLAGE_HINTS.get(result.datenlage, self.DATENLAGE_HINTS["unbekannt"])
+            return f"{head}\n{hint}\n{json.dumps(result.daten, indent=2, default=str, ensure_ascii=False)}"
         if result.aufruf_id:
             self.last_call_id = result.aufruf_id
         if result.code == "HALTED":
