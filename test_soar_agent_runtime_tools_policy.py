@@ -23,7 +23,7 @@ from soar_agent_runtime_policy import (
     PolicyDecision,
     StubPolicyClient,
 )
-from soar_agent_runtime_utils import ReActLoop, ToolRegistry
+from soar_agent_runtime_utils import ReActLoop, ToolRegistry, freigabe_hash
 
 OK = InvokeResult(ok=True, aufruf_id="tb-1", vorlage_id="asset_kontext", vorlage_version=1,
                   katalog_version="k", zeilen=1, daten=[{"asset": "srv-1"}])
@@ -210,14 +210,15 @@ def test_approval_gate_records_proposal_and_does_not_execute(rules):
     reg = registry(policy=StubPolicyClient(APPROVE))
     result = reg.execute("update_severity", GOOD)
     assert result.startswith("HELD: 'update_severity' requires APPROVE_2PERSON (2 approval(s))")
-    assert "freigabe_id=f-2" in result and "entscheidung_id=e-2" in result and "not executed" in result
+    assert f"freigabe_hash={freigabe_hash('f-2')}" in result and "entscheidung_id=e-2" in result and "not executed" in result
+    assert "f-2" not in result                                  # PM-F42: the id never reaches the model
     assert "consume(freigabe_id)" in result and "Do not retry" in result
     assert rules.calls == []                                    # AC-07: nothing executed
     assert reg.last_decision_id == "e-2"
     [artifact] = reg._artifacts
     assert artifact["label"] == "agent_action_proposal" and artifact["container_id"] == 4711
     assert artifact["run_automation"] is False and artifact["name"] == "update_severity -> high"
-    assert artifact["source_data_identifier"] == "f-2:rt-x/2"
+    assert artifact["source_data_identifier"] == f"{freigabe_hash('f-2')}:rt-x/2"
     cef = artifact["cef"]
     assert cef["freigabe_id"] == "f-2" and cef["entscheidung_id"] == "e-2" and cef["gate"] == "APPROVE_2PERSON"
     assert cef["aktion"] == "update_severity" and cef["ziel"] == ["container:4711"]
@@ -227,7 +228,8 @@ def test_approval_gate_records_proposal_and_does_not_execute(rules):
     assert cef["freigaben_noetig"] == 2 and cef["policy_version"] == "v1"
     [note] = rules.notes
     assert note["container"] == 4711 and note["title"] == "Freigabe ausstehend: update_severity -> high"
-    assert "f-2" in note["content"] and "consume(freigabe_id)" in note["content"]
+    assert f"freigabe_hash: `{freigabe_hash('f-2')}`" in note["content"] and "consume(freigabe_id)" in note["content"]
+    assert "f-2" not in note["content"]                         # PM-F42: only cef carries the id
     assert reg._policy.consumed == []                            # the runtime never consumes
 
 
@@ -570,7 +572,7 @@ def test_approval_gate_holds_the_sequence_with_freigabe_id(rules):
     rules.add_note = lambda **kw: rules.notes.append(kw)
     reg = catalog_registry(policy=StubPolicyClient(APPROVE, blocks=CATALOG))
     result = reg.execute("catalog_invoke", SEQ)
-    assert result.startswith("HELD: 'catalog_invoke' requires APPROVE_2PERSON (2 approval(s))") and "freigabe_id=f-2" in result
+    assert result.startswith("HELD: 'catalog_invoke' requires APPROVE_2PERSON (2 approval(s))") and f"freigabe_hash={freigabe_hash('f-2')}" in result
     [artifact] = reg._artifacts
     assert artifact["cef"]["freigabe_id"] == "f-2" and json.loads(artifact["cef"]["schritte"])[0]["baustein"] == "isolate_endpoint"
     assert rules.notes[0]["title"].startswith("Freigabe ausstehend: folge: isolate_endpoint") and "consume(freigabe_id)" in rules.notes[0]["content"]
@@ -708,3 +710,10 @@ def test_tool_parameters_are_not_mistaken_for_misspelled_judgement_keys(rules):
     reg = registry()
     result = reg.execute("update_severity", {"severity": "high"})
     assert "did you mean" not in result
+
+
+def test_freigabe_hash_matches_the_policy_manager_formula():
+    # sha256("f-2")[:16], same as Policy Manager / soar_pm_admin approval_hash (PM-F42)
+    import hashlib
+    assert freigabe_hash("f-2") == hashlib.sha256(b"f-2").hexdigest()[:16]
+    assert len(freigabe_hash("f-2")) == 16 and freigabe_hash("f-2") != freigabe_hash("f-3")
