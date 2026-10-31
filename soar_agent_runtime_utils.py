@@ -255,6 +255,15 @@ def _truncate(text: str, limit: int) -> str:
     return text
 
 
+def freigabe_hash(approval_id: str) -> str:
+    """Short, stable reference to an approval without the id itself (PM-F42).
+
+    Same formula as the Policy Manager / soar_pm_admin approval_hash; the
+    plain freigabe_id stays only in the proposal artifact (cef, RT-W07).
+    """
+    return hashlib.sha256(approval_id.encode("utf-8")).hexdigest()[:16]
+
+
 def _scrub(text: str) -> str:
     """Redact anything resembling a secret before it is surfaced to the LLM/UI."""
     return _SECRET_RE.sub("[REDACTED]", text)
@@ -985,7 +994,7 @@ class ToolRegistry:
                 return (f"ERROR: proposal not recorded ({detail}); '{tool_name}' was not executed "
                         f"and no approval is pending.")
             held = (f"HELD: '{tool_name}' requires {decision.gate} ({decision.approvals_needed or 1} approval(s)). "
-                    f"Proposal recorded with freigabe_id={decision.approval_id} "
+                    f"Proposal recorded with freigabe_hash={freigabe_hash(decision.approval_id)} "
                     f"entscheidung_id={decision.decision_id}; not executed. The run continues; a follow-up "
                     f"playbook executes the action after consume(freigabe_id). Do not retry this action.")
             if not (self.approval_playbook and decision.approval_id):
@@ -994,7 +1003,7 @@ class ToolRegistry:
             if started:
                 return f"{held} Approval prompt started (playbook {self.approval_playbook})."
             # Decision B / B5: nothing runs either way; the hash names the approval, never the id.
-            fhash = hashlib.sha256(decision.approval_id.encode("utf-8")).hexdigest()[:16]
+            fhash = freigabe_hash(decision.approval_id)
             self._note_prompt_failed(tool_name, fhash, detail)
             return (f"Failed - approval prompt not started ({detail}); '{tool_name}' stays HELD "
                     f"(freigabe_hash={fhash}), nothing was executed. Do not retry this action.")
@@ -1085,7 +1094,8 @@ class ToolRegistry:
             "name": name,
             "type": self.PROPOSAL_LABEL,
             "severity": RUNTIME_ARTIFACT_SEVERITY,
-            "source_data_identifier": f"{decision.approval_id or decision.decision_id}:{request.step_id}",
+            "source_data_identifier": (f"{freigabe_hash(decision.approval_id) if decision.approval_id else decision.decision_id}"
+                                       f":{request.step_id}"),
             "cef": cef,
             "run_automation": False,
         }
@@ -1104,7 +1114,7 @@ class ToolRegistry:
                          f"Schritt `{request.step_id}`).\n\n"
                          + ("- Gate: ALLOW\n" if allowed else
                             f"- Gate: {decision.gate} ({decision.approvals_needed or 1} Freigabe(n))\n"
-                            f"- freigabe_id: `{decision.approval_id}`\n")
+                            f"- freigabe_hash: `{freigabe_hash(decision.approval_id)}`\n")
                          + f"- entscheidung_id: `{decision.decision_id}`\n"
                          + (f"- Schritte: `{cef['schritte']}`\n" if request.steps else
                             f"- Parameter: `{cef['parameter']}`\n")
