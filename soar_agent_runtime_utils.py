@@ -576,12 +576,15 @@ class ToolRegistry:
         spawn=None,
         depth: int = 0,
         max_depth: int = DEFAULT_SUBAGENT_DEPTH,
+        approval_playbook: str = "",
     ) -> None:
         self.connector = connector
         self.container_id = container_id
         # RT-B03 (5.4): spawn(agent_id, task, depth, step_id, max_steps) -> child result dict,
         # provided by the connector; depth 0 = the agent the playbook started.
         self.spawn = spawn
+        # PM-F42 / decision B: input playbook that asks the approval group; "" = off
+        self.approval_playbook = str(approval_playbook or "").strip()
         self.depth = int(depth)
         self.max_depth = int(max_depth)
         self.steps_left: int | None = None    # set by the loop before every tool call
@@ -990,16 +993,70 @@ class ToolRegistry:
             if not recorded:
                 return (f"ERROR: proposal not recorded ({detail}); '{tool_name}' was not executed "
                         f"and no approval is pending.")
-            return (f"HELD: '{tool_name}' requires {decision.gate} ({decision.approvals_needed or 1} approval(s)). "
+            held = (f"HELD: '{tool_name}' requires {decision.gate} ({decision.approvals_needed or 1} approval(s)). "
                     f"Proposal recorded with freigabe_hash={freigabe_hash(decision.approval_id)} "
                     f"entscheidung_id={decision.decision_id}; not executed. The run continues; a follow-up "
                     f"playbook executes the action after consume(freigabe_id). Do not retry this action.")
+            if not (self.approval_playbook and decision.approval_id):
+                return held
+            started, detail = self._start_approval_playbook(request, decision)
+            if started:
+                return f"{held} Approval prompt started (playbook {self.approval_playbook})."
+            # Decision B / B5: nothing runs either way; the hash names the approval, never the id.
+            fhash = freigabe_hash(decision.approval_id)
+            self._note_prompt_failed(tool_name, fhash, detail)
+            return (f"Failed - approval prompt not started ({detail}); '{tool_name}' stays HELD "
+                    f"(freigabe_hash={fhash}), nothing was executed. Do not retry this action.")
         if decision.code == POLICY_CODE_HALTED:
             self.halted = True
             self.halt_source = "Policy Manager"
         reason = decision.reason_text()
         return (f"POLICY DENIED code={decision.code or 'DENY'}"
                 f"{' (' + reason + ')' if reason else ''}; '{tool_name}' was not executed.")
+
+    APPROVAL_REASON_MAX = 500
+
+    def _start_approval_playbook(self, request: PolicyRequest, decision) -> tuple[bool, str]:
+        """Decision B (PM-F42): start the input playbook that asks the approval group.
+        Only the playbook input carries the freigabe_id; the playbook approves or rejects,
+        the follow-up playbook still consumes and executes. Not a policy request and not a
+        tool of the model, so agent_denied_kinds is not involved."""
+        reason = next((r for r in decision.reasons if r.get("gate") == decision.gate), {})
+        short = f"{reason.get('regel', '')}: {reason.get('grund', '')}" if reason else ""
+        inputs = {
+            "freigabe_id": decision.approval_id,
+            "noetig": str(decision.approvals_needed or 1),
+            "initiator": request.initiator,
+            "art": request.kind,
+            "ziel": ",".join(request.targets),
+            "begruendung_kurz": short.replace(decision.approval_id, "")[:self.APPROVAL_REASON_MAX],
+            "ablauf": decision.expires_at,
+        }
+        playbook = int(self.approval_playbook) if self.approval_playbook.isdigit() else self.approval_playbook
+        body = {"container_id": self.container_id, "playbook_id": playbook, "scope": "new", "run": True,
+                "inputs": json.dumps(inputs, ensure_ascii=False)}   # 8.7 REST: a JSON-encoded string
+        try:
+            rest = SoarRest(self.connector)
+            if not rest.available():
+                return False, "SOAR REST not available"
+            answer = rest.post("playbook_run", body)
+        except Exception as e:  # SoarRestError names the path, never the body
+            return False, _scrub_exc(e)
+        run_id = answer.get("playbook_run_id") or answer.get("id") or "?"
+        self.connector.save_progress(f"[policy] approval prompt started: playbook run {run_id}")
+        return True, str(run_id)
+
+    def _note_prompt_failed(self, tool_name: str, fhash: str, detail: str) -> None:
+        try:
+            import phantom.rules as ph_rules
+            ph_rules.add_note(
+                container=self.container_id, note_type="general",
+                title=f"Freigabe-Anfrage nicht gestartet: {tool_name}",
+                content=(f"approval prompt not started for `{tool_name}` (freigabe_hash `{fhash}`, "
+                         f"Playbook `{self.approval_playbook}`): {detail}\n\n"
+                         "Die Aktion bleibt angehalten, es wurde nichts ausgefuehrt."))
+        except Exception:
+            pass
 
     def _record_proposal(self, tool_name: str, request: PolicyRequest, decision) -> tuple[bool, str]:
         """Artifact + note with the data a follow-up playbook needs (RT-W07).
