@@ -6,6 +6,7 @@ Python 3.13 compatible.
 
 from __future__ import annotations
 import difflib
+import hashlib
 import json
 import re
 import secrets
@@ -252,6 +253,15 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) > limit:
         return text[:limit] + f"\n[...truncated {len(text) - limit} chars]"
     return text
+
+
+def freigabe_hash(approval_id: str) -> str:
+    """Short, stable reference to an approval without the id itself (PM-F42).
+
+    Same formula as the Policy Manager / soar_pm_admin approval_hash; the
+    plain freigabe_id stays only in the proposal artifact (cef, RT-W07).
+    """
+    return hashlib.sha256(approval_id.encode("utf-8")).hexdigest()[:16]
 
 
 def _scrub(text: str) -> str:
@@ -981,7 +991,7 @@ class ToolRegistry:
                 return (f"ERROR: proposal not recorded ({detail}); '{tool_name}' was not executed "
                         f"and no approval is pending.")
             return (f"HELD: '{tool_name}' requires {decision.gate} ({decision.approvals_needed or 1} approval(s)). "
-                    f"Proposal recorded with freigabe_id={decision.approval_id} "
+                    f"Proposal recorded with freigabe_hash={freigabe_hash(decision.approval_id)} "
                     f"entscheidung_id={decision.decision_id}; not executed. The run continues; a follow-up "
                     f"playbook executes the action after consume(freigabe_id). Do not retry this action.")
         if decision.code == POLICY_CODE_HALTED:
@@ -1027,7 +1037,8 @@ class ToolRegistry:
             "name": name,
             "type": self.PROPOSAL_LABEL,
             "severity": RUNTIME_ARTIFACT_SEVERITY,
-            "source_data_identifier": f"{decision.approval_id or decision.decision_id}:{request.step_id}",
+            "source_data_identifier": (f"{freigabe_hash(decision.approval_id) if decision.approval_id else decision.decision_id}"
+                                       f":{request.step_id}"),
             "cef": cef,
             "run_automation": False,
         }
@@ -1046,7 +1057,7 @@ class ToolRegistry:
                          f"Schritt `{request.step_id}`).\n\n"
                          + ("- Gate: ALLOW\n" if allowed else
                             f"- Gate: {decision.gate} ({decision.approvals_needed or 1} Freigabe(n))\n"
-                            f"- freigabe_id: `{decision.approval_id}`\n")
+                            f"- freigabe_hash: `{freigabe_hash(decision.approval_id)}`\n")
                          + f"- entscheidung_id: `{decision.decision_id}`\n"
                          + (f"- Schritte: `{cef['schritte']}`\n" if request.steps else
                             f"- Parameter: `{cef['parameter']}`\n")

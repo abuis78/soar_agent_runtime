@@ -657,10 +657,11 @@ def test_ac07_approval_gate_records_a_proposal_with_freigabe_id_and_does_not_wai
     assert llm["calls"] == 3 and result.summary["steps_taken"] == 3
     obs = step_log(result)[1]["observation"]
     assert obs.startswith("HELD: 'update_severity' requires APPROVE_2PERSON (2 approval(s)). "
-                          "Proposal recorded with freigabe_id=fg-7 entscheidung_id=pm-7; not executed.")
+                          f"Proposal recorded with freigabe_hash={utils.freigabe_hash('fg-7')} entscheidung_id=pm-7; not executed.")
+    assert "fg-7" not in obs                                          # PM-F42: the id stays in cef only
     proposal, = proposals(c)
     assert proposal["container_id"] == 11 and proposal["run_automation"] is False
-    assert proposal["source_data_identifier"] == f"fg-7:{RUN_ID}/2"
+    assert proposal["source_data_identifier"] == f"{utils.freigabe_hash('fg-7')}:{RUN_ID}/2"
     cef = proposal["cef"]
     assert cef["freigabe_id"] == "fg-7" and cef["entscheidung_id"] == "pm-7" and cef["gate"] == "APPROVE_2PERSON"
     assert cef["aktion"] == "update_severity" and json.loads(cef["parameter"]) == {"severity": "high"}
@@ -792,7 +793,7 @@ def test_ac09_approval_gate_holds_the_sequence_with_freigabe_id(platform, llm, m
     assert status is True, result.message
     proposal, = proposals(c)
     assert proposal["cef"]["freigabe_id"] == "fg-7" and json.loads(proposal["cef"]["schritte"]) == WIRE_SEQUENCE
-    assert proposal["source_data_identifier"] == f"fg-7:{RUN_ID}/2" and stub.consumed == []
+    assert proposal["source_data_identifier"] == f"{utils.freigabe_hash('fg-7')}:{RUN_ID}/2" and stub.consumed == []
     assert [n["title"] for n in agent_notes(platform)] == ["Freigabe ausstehend: folge: isolate_endpoint, disable_account -> srv-1, u-7"]
     assert step_log(result)[1]["observation"].startswith("HELD: 'catalog_invoke' requires APPROVE_2PERSON (2 approval(s))")
 
