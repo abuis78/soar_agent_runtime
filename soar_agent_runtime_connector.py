@@ -159,6 +159,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
         self._llm_seed = None
         self._max_observation_chars = 8000
         self._max_subagent_depth = DEFAULT_SUBAGENT_DEPTH   # RT-B03 (5.4)
+        self._approval_playbook = ""   # PM-F42 / decision B: input playbook for pending approvals
         self._audit_enabled = False
         # RT-L07 (Umsetzungskonzept 2.1): Tool Broker connection, mTLS via file paths
         self._broker_url = ""
@@ -194,6 +195,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
         self._llm_seed = self._cfg_number("llm_seed", None, int)
         self._max_observation_chars = self._cfg_number("max_observation_chars", 8000, int)
         self._max_subagent_depth = max(0, self._cfg_number("max_subagent_depth", DEFAULT_SUBAGENT_DEPTH, int))
+        self._approval_playbook = (self._config.get("approval_playbook") or "").strip()
         self._audit_enabled = bool(self._config.get("audit_enabled", False))
         self._broker_url = (self._config.get("broker_url") or "").strip()
         self._broker_timeout_s = self._cfg_number("broker_timeout_s", 30.0, float)
@@ -707,6 +709,7 @@ class SoarAgentRuntimeConnector(BaseConnector):
             spawn=lambda **kw: self._run_sub_agent(run, **kw),
             depth=depth,
             max_depth=self._max_subagent_depth,
+            approval_playbook=self._approval_playbook,
         )
         tools.load_broker_tools()  # RT-L03: templates once per agent, with its own agent_id
         tools.load_catalog()       # RT-W09: building blocks once per agent (empty outside airgap)
