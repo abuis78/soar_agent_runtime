@@ -1034,7 +1034,7 @@ class ToolRegistry:
         }
         playbook = int(self.approval_playbook) if self.approval_playbook.isdigit() else self.approval_playbook
         body = {"container_id": self.container_id, "playbook_id": playbook, "scope": "new", "run": True,
-                "inputs": json.dumps(inputs, ensure_ascii=False)}   # 8.7 REST: a JSON-encoded string
+                "inputs": inputs}   # a dict; a JSON string gets HTTP 400 on SOAR-Prod 8.7 (B3)
         try:
             rest = SoarRest(self.connector)
             if not rest.available():

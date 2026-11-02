@@ -77,8 +77,8 @@ def test_approval_gate_starts_the_playbook_with_the_input_contract(soar):
     assert method == "post"
     assert {k: v for k, v in body.items() if k != "inputs"} == {
         "container_id": 4711, "playbook_id": "soar_pm_admin/pm_freigabe", "scope": "new", "run": True}
-    assert isinstance(body["inputs"], str)                       # 8.7 REST: JSON-encoded string
-    assert json.loads(body["inputs"]) == {
+    assert isinstance(body["inputs"], dict)                      # B3: SOAR rejects a JSON string with 400
+    assert body["inputs"] == {
         "freigabe_id": "f-secret-2", "noetig": "2", "initiator": "triage", "art": "update_severity",
         "ziel": "container:4711", "begruendung_kurz": "severity_high: high needs two people",
         "ablauf": "2026-10-17T07:20:00+00:00"}
@@ -102,14 +102,14 @@ def test_begruendung_kurz_is_capped_and_never_carries_the_id(soar):
     decision = PolicyDecision(gate=GATE_APPROVE_2PERSON, decision_id="e-3", approval_id="f-secret-2",
                               approvals_needed=2, reasons=(long_reason,))
     registry(decision=decision).execute("update_severity", GOOD)
-    short = json.loads(soar["runs"][0][1]["inputs"])["begruendung_kurz"]
+    short = soar["runs"][0][1]["inputs"]["begruendung_kurz"]
     assert len(short) == 500 and "f-secret-2" not in short
 
 
 def test_no_matching_reason_gives_an_empty_begruendung_kurz(soar):
     decision = PolicyDecision(gate=GATE_APPROVE_2PERSON, decision_id="e-4", approval_id="f-4", approvals_needed=2)
     registry(decision=decision).execute("update_severity", GOOD)
-    assert json.loads(soar["runs"][0][1]["inputs"])["begruendung_kurz"] == ""
+    assert soar["runs"][0][1]["inputs"]["begruendung_kurz"] == ""
 
 
 @pytest.mark.parametrize("answer", [(404, {"failed": True, "message": "playbook not found"}),
