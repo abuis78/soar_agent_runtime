@@ -543,6 +543,8 @@ class ToolRegistry:
         "beleg_ids": "JSON list of evidence ids from this run (aufruf_id of a broker result or schritt_id of an earlier step)",
         "unsicherheiten": "What you are unsure about (text or list of strings; write 'keine erkannt' if none)",
         "konfidenz": "Your confidence 0..1 (number)",
+        "datenlage": "Data state of your evidence: vollstaendig | teilweise | unbekannt | blinder_fleck "
+                     "(optional; missing counts as unbekannt)",
     }
     # E-12 / TB-F18: what the broker's datenlage means for the judgement. Without it a
     # model cannot tell "0 rows, data present" from "source empty or no read right".
@@ -614,6 +616,7 @@ class ToolRegistry:
         self.catalog_hidden: list[CatalogBlock] = []  # released, but need a higher stufe
         self._gated: tuple | None = None      # (request, decision) while an ALLOWed handler runs
         self.evidence: set[str] = set()       # aufruf_ids of this run (RT-L04 -> RT-P06)
+        self.evidence_hits: dict[str, int] = {}  # aufruf_id -> zeilen observed by the runtime (D22)
         self.step_ids: set[str] = set()       # schritt_ids seen so far (own evidence, RT-W05)
         self.halted = False                   # set by a HALTED answer (RT-L05 / RT-B01)
         self.halt_source = ""                 # "Tool Broker" or "Policy Manager"
@@ -780,7 +783,22 @@ class ToolRegistry:
             return (f"ERROR: beleg_id {', '.join(repr(b) for b in bad)} did not originate in this run; "
                     f"'{tool_name}' was not executed and no policy request was made (RT-W05). "
                     f"Valid evidence: {', '.join(sorted(valid)) or 'none yet'}.")
+        datenlage = params.get("datenlage")
+        if datenlage is not None and datenlage not in DATENLAGE_VALUES:
+            return (f"ERROR: 'datenlage' must be one of {list(DATENLAGE_VALUES)}; '{tool_name}' was not "
+                    "executed and no policy request was made.")
+        if datenlage == "vollstaendig" and self.data_gaps:
+            # E-13 / D16, same check as the final answer: a run with a data gap is never complete.
+            return (f"ERROR: 'datenlage' cannot be 'vollstaendig': this run had data gaps "
+                    f"({'; '.join(self.data_gaps)}); use 'teilweise', 'unbekannt' or 'blinder_fleck' (D16). "
+                    f"'{tool_name}' was not executed and no policy request was made.")
         return None
+
+    def _evidence_hits(self, beleg_ids) -> tuple[dict, ...]:
+        """D22 (PolicyManager#16): treffer per beleg_id from the runtime's own observation.
+        Broker aufruf_ids carry their zeilen; schritt_ids have no hit count (None)."""
+        ids = [str(b) for b in beleg_ids] if isinstance(beleg_ids, list) else []
+        return tuple({"beleg_id": b, "treffer": self.evidence_hits.get(b)} for b in ids)
 
     def _is_allowed(self, tool_name: str) -> bool:
         if tool_name == self.BROKER_TOOL:
@@ -911,7 +929,7 @@ class ToolRegistry:
     # -- Policy Manager gate (RT-W06, W07) --------------------------------------
 
     PROPOSAL_LABEL = "agent_action_proposal"
-    META_PARAMS = ("begruendung", "gegenargumente", "beleg_ids", "unsicherheiten", "konfidenz")
+    META_PARAMS = ("begruendung", "gegenargumente", "beleg_ids", "unsicherheiten", "konfidenz", "datenlage")
 
     @staticmethod
     def _text_list(value) -> list[str]:
@@ -944,7 +962,10 @@ class ToolRegistry:
         confidence = self._confidence(params.get("konfidenz"))
         judgement = {"empfehlung": str(params.get("begruendung") or "").strip(),
                      "gegenargumente": self._text_list(params.get("gegenargumente")),
-                     "unsicherheiten": self._text_list(params.get("unsicherheiten"))}
+                     "unsicherheiten": self._text_list(params.get("unsicherheiten")),
+                     # D22: missing datenlage is sent as 'unbekannt'; the runtime never claims completeness.
+                     "datenlage": params.get("datenlage") if params.get("datenlage") in DATENLAGE_VALUES
+                     else "unbekannt"}
         if confidence is not None:
             judgement["konfidenz"] = confidence
         kind, category, targets = tool_name, _ACTION_TELEMETRY.get(tool_name, ""), (f"container:{self.container_id}",)
@@ -969,6 +990,7 @@ class ToolRegistry:
             domain=self.domain,
             confidence=confidence,
             evidence_ids=tuple(str(b) for b in params.get("beleg_ids", [])),
+            evidence_hits=self._evidence_hits(params.get("beleg_ids", [])),
             judgement=judgement,
         )
 
@@ -1178,6 +1200,7 @@ class ToolRegistry:
         result = self.broker.invoke(vorlage_id, parameter, kontext)
         if result.ok:
             self.evidence.add(result.aufruf_id)
+            self.evidence_hits[result.aufruf_id] = max(int(result.zeilen or 0), 0)
             self.last_call_id = result.aufruf_id
             head = (f"BROKER RESULT aufruf_id={result.aufruf_id} vorlage={result.vorlage_id} "
                     f"v{result.vorlage_version if result.vorlage_version is not None else '?'} "
@@ -1402,6 +1425,8 @@ class ToolRegistry:
         # E-10: the child's schritt_ids and broker aufruf_ids originated in this run (same
         # lauf_id), so the caller may cite them as belege, as the result line announces.
         self.evidence |= {str(e) for e in result.get("evidence_ids", ()) if e}
+        self.evidence_hits.update({str(k): int(v) for k, v in (result.get("evidence_hits") or {}).items()
+                                   if k and isinstance(v, int) and not isinstance(v, bool) and v >= 0})
         self.data_gaps += [f"{agent_id}: {g}" for g in result.get("data_gaps", ()) if g]
         if result.get("halted"):
             self.halted, self.halt_source = True, str(result.get("halt_source") or "Tool Broker")

@@ -89,6 +89,7 @@ class PolicyRequest:
     tipping_off: str = ""                       # laut | leise
     confidence: Optional[float] = None          # agent_konfidenz
     evidence_ids: tuple[str, ...] = ()          # beleg_ids (checked locally before decide, OQ-8)
+    evidence_hits: tuple[dict, ...] = ()        # belege: {beleg_id, treffer int|None} per beleg_id (D22)
     judgement: dict = field(default_factory=dict)  # urteil: begruendung, gegenargumente, ...
     artifact_values: tuple[str, ...] = ()       # artefakt_werte
     steps: tuple[dict, ...] = ()                # aktion.schritte, only for kind == ACTION_SEQUENCE
@@ -105,6 +106,9 @@ class PolicyRequest:
             "beleg_ids": list(self.evidence_ids), "urteil": dict(self.judgement),
             "artefakt_werte": list(self.artifact_values),
         }
+        if self.evidence_hits:
+            # D22 (PolicyManager#16): hits come from the runtime's own observation, never the model.
+            context["belege"] = [dict(b) for b in self.evidence_hits]
         if self.stage is not None:
             context["stufe"] = self.stage
         if self.confidence is not None:
