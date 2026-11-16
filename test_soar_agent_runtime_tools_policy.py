@@ -161,6 +161,7 @@ def test_prompt_lists_effect_params_only_in_airgap():
     line = next(ln for ln in airgap.splitlines() if ln.startswith("- update_severity("))
     assert "begruendung:" in line and "gegenargumente:" in line and "beleg_ids:" in line
     assert "aufruf_id" in line and "schritt_id" in line
+    assert "BROKER RESULT" in line and "needs an approval" in line  # Prod run 1010: model cited the schritt_id
     add_note = next(ln for ln in airgap.splitlines() if ln.startswith("- add_note("))
     assert "beleg_ids" not in add_note
     normal = registry(airgap=False).get_tool_descriptions()
