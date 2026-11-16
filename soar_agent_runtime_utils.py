@@ -540,7 +540,9 @@ class ToolRegistry:
     EFFECT_PARAMS = {
         "begruendung": "Why this action is needed (text)",
         "gegenargumente": "What speaks against it (text or list of strings)",
-        "beleg_ids": "JSON list of evidence ids from this run (aufruf_id of a broker result or schritt_id of an earlier step)",
+        "beleg_ids": "JSON list of evidence ids from this run. Cite the aufruf_id from the BROKER RESULT line that "
+                     "supports the action (e.g. tb-...); a schritt_id of an earlier step alone carries no hit "
+                     "count and needs an approval",
         "unsicherheiten": "What you are unsure about (text or list of strings; write 'keine erkannt' if none)",
         "konfidenz": "Your confidence 0..1 (number)",
         "datenlage": "Data state of your evidence: vollstaendig | teilweise | unbekannt | blinder_fleck "
