@@ -544,7 +544,7 @@ class ToolRegistry:
         "unsicherheiten": "What you are unsure about (text or list of strings; write 'keine erkannt' if none)",
         "konfidenz": "Your confidence 0..1 (number)",
         "datenlage": "Data state of your evidence: vollstaendig | teilweise | unbekannt | blinder_fleck "
-                     "(optional; missing counts as unbekannt)",
+                     "(if left out: unbekannt)",
     }
     # E-12 / TB-F18: what the broker's datenlage means for the judgement. Without it a
     # model cannot tell "0 rows, data present" from "source empty or no read right".
