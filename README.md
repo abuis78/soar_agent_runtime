@@ -223,6 +223,11 @@ In `airgap_mode` every effecting tool call (`update_severity`, `catalog_invoke`)
 before the Policy Manager is asked: `begruendung` (text), `gegenargumente` and `unsicherheiten` (text or list of
 strings, `"keine erkannt"` when there is nothing to say), `konfidenz` (0..1) and `beleg_ids` (ids that originated in
 this run). Incomplete calls are refused locally and never reach the Policy Manager (RT-W05, AC-08).
+Optional `datenlage` (`vollstaendig`, `teilweise`, `unbekannt`, `blinder_fleck`; left out = `unbekannt`) goes into
+`urteil`; an invalid value, or `vollstaendig` after a data gap (D16), is refused locally. The runtime also sends
+`kontext.belege = [{beleg_id, treffer}]`: `treffer` is the `zeilen` count of a broker `aufruf_id` observed by the
+runtime itself (also from a sub-agent), `null` for a `schritt_id`; the model cannot set it (D22,
+[PolicyManager#16](https://github.com/abuis78/PolicyManager/issues/16)).
 
 **`catalog_invoke(schritte=[{baustein, ziel, parameter}, ...])`** proposes one or more building blocks from the
 Policy Manager's action catalogue (`GET /v1/aktionen`, RT-W09). The tool appears as soon as the catalogue lists
@@ -700,3 +705,4 @@ phenv python3 soar_agent_runtime_connector.py /tmp/test_run_agent.json
 | 2.0.1 | 2026-10-31 | `freigabe_id` no longer in plain text outside the proposal artifact (PM-F42): the `HELD` observation (model context, `step_log`, audit), the note "Freigabe ausstehend" and the artifact's `source_data_identifier` show `freigabe_hash` = first 16 hex characters of sha256(`freigabe_id`), the Policy Manager formula. `cef.freigabe_id`, `consume` and the follow-up playbook are unchanged |
 | 2.1.0 | 2026-10-31 | Approval prompt (PM-F42, Policy Manager Admin decision B): new asset field `approval_playbook`; after `APPROVE_1CLICK` / `APPROVE_2PERSON` the runtime starts that input playbook on the run's container (`POST /rest/playbook_run` with `inputs` as a JSON object, verified on SOAR-Prod: a JSON string gets HTTP 400) so the approval group is asked. Not a policy request and not a model tool. If the start fails the action stays held, observation and note say `approval prompt not started` with `freigabe_hash`, audit phase `fehler`. Artifact, follow-up playbook and `consume` unchanged; empty field = 2.0.1 behaviour |
 | 2.1.1 | 2026-11-15 | Dependency: bundled wheel `pyasn1` 0.6.4 → 0.6.5 (GHSA-mm57-4v3p-rchx, binary REAL mantissas decoded in linear time). No behaviour change |
+| 2.2.0 | 2026-11-16 | D22 part 1 ([PolicyManager#16](https://github.com/abuis78/PolicyManager/issues/16)): effecting calls send `kontext.belege = [{beleg_id, treffer}]` (`treffer` = broker `zeilen` observed by the runtime, incl. sub-agents; `null` for `schritt_id`s) and `urteil.datenlage` (new optional tool field; left out = `unbekannt`; invalid value or `vollstaendig` after a data gap refused locally, D16). A Policy Manager without the new rule ignores both fields |

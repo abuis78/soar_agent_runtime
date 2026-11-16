@@ -183,7 +183,7 @@ def test_allow_executes_and_sends_the_request_without_meta_params(rules):
     assert req.targets == ("container:4711",) and req.initiator == "triage" and req.agent_id == "triage"
     assert req.run_id == "rt-x" and req.step_id == "rt-x/2" and req.evidence_ids == ("rt-x/1",)
     assert req.judgement == {"empfehlung": "beacon confirmed", "gegenargumente": ["could be a scanner"],
-                             "unsicherheiten": ["keine erkannt"], "konfidenz": 0.8}
+                             "unsicherheiten": ["keine erkannt"], "konfidenz": 0.8, "datenlage": "unbekannt"}
     assert req.category == "Triage"
     assert req.stage is None and req.domain == "" and req.confidence == 0.8
     wire = req.to_wire()["kontext"]
@@ -291,7 +291,8 @@ def test_request_carries_stage_domain_and_full_judgement(rules):
     assert req.stage == 2 and req.domain == "soc" and req.confidence == 0.85
     assert req.params == {"severity": "high"}                   # meta fields never reach the action
     assert req.judgement == {"empfehlung": "beacon confirmed", "gegenargumente": ["could be a scanner", "or a backup job"],
-                             "unsicherheiten": ["only one sensor"], "konfidenz": 0.85}   # lists are passed through, cleaned
+                             "unsicherheiten": ["only one sensor"], "konfidenz": 0.85,
+                             "datenlage": "unbekannt"}   # lists are passed through, cleaned
     wire = req.to_wire()
     assert wire["kontext"]["stufe"] == 2 and wire["kontext"]["agent_konfidenz"] == 0.85
     assert wire["kontext"]["domaene"] == "soc" and wire["kontext"]["principal_type"] == "agent"
@@ -323,6 +324,78 @@ def test_prompt_marks_every_judgement_field_mandatory():
     assert "optional" not in line
     assert "unsicherheiten: What you are unsure about (text or list of strings; write 'keine erkannt' if none)" in line
     assert "konfidenz: Your confidence 0..1 (number)" in line and "gegenargumente: What speaks against it (text or list of strings)" in line
+
+
+# --- D22 (PolicyManager#16): belege with treffer and urteil.datenlage ---------------------
+
+class CountingBroker(FakeBroker):
+    """Broker answering with a given row count and datenlage."""
+    def __init__(self, zeilen, datenlage="vorhanden"):
+        self.result = InvokeResult(ok=True, aufruf_id="tb-1", vorlage_id="asset_kontext", vorlage_version=1,
+                                   katalog_version="k", zeilen=zeilen, daten=[], datenlage=datenlage)
+
+    def invoke(self, vorlage_id, parameter, kontext):
+        return self.result
+
+
+def broker_registry(zeilen, datenlage="vorhanden"):
+    reg = registry(broker=CountingBroker(zeilen, datenlage), steps=3)
+    reg.load_broker_tools()
+    reg.execute("broker_invoke", {"vorlage_id": "asset_kontext"})
+    reg.set_step(4, "rt-x/4")
+    return reg
+
+
+def test_broker_beleg_with_zero_rows_is_sent_as_treffer_0(rules):
+    reg = broker_registry(zeilen=0)
+    assert reg.execute("update_severity", {**GOOD, "beleg_ids": ["tb-1"], "datenlage": "vollstaendig"}) \
+        .startswith("Container severity updated to: high")
+    wire = reg._policy.requests[0].to_wire()["kontext"]
+    assert wire["belege"] == [{"beleg_id": "tb-1", "treffer": 0}]
+    assert wire["urteil"]["datenlage"] == "vollstaendig" and wire["beleg_ids"] == ["tb-1"]
+
+
+def test_schritt_beleg_has_no_treffer_and_order_follows_beleg_ids(rules):
+    reg = broker_registry(zeilen=7)
+    assert reg.execute("update_severity", {**GOOD, "beleg_ids": ["rt-x/1", "tb-1"], "datenlage": "teilweise"}) \
+        .startswith("Container severity updated to: high")
+    wire = reg._policy.requests[0].to_wire()["kontext"]
+    assert wire["belege"] == [{"beleg_id": "rt-x/1", "treffer": None}, {"beleg_id": "tb-1", "treffer": 7}]
+    assert wire["urteil"]["datenlage"] == "teilweise"
+
+
+def test_model_cannot_supply_treffer(rules):
+    reg = broker_registry(zeilen=0)
+    reg.execute("update_severity", {**GOOD, "beleg_ids": ["tb-1"], "belege": [{"beleg_id": "tb-1", "treffer": 99}]})
+    assert reg._policy.requests[0].to_wire()["kontext"]["belege"] == [{"beleg_id": "tb-1", "treffer": 0}]
+
+
+@pytest.mark.parametrize("value", ["lueckenhaft", "", 1, True])
+def test_invalid_datenlage_is_refused_before_any_policy_request(rules, value):
+    reg = registry()
+    result = reg.execute("update_severity", {**GOOD, "datenlage": value})
+    assert result.startswith("ERROR: 'datenlage' must be one of")
+    assert reg._policy.requests == [] and rules.calls == []
+
+
+def test_vollstaendig_after_a_data_gap_is_refused(rules):
+    reg = broker_registry(zeilen=0, datenlage="leer")
+    result = reg.execute("update_severity", {**GOOD, "beleg_ids": ["tb-1"], "datenlage": "vollstaendig"})
+    assert result.startswith("ERROR: 'datenlage' cannot be 'vollstaendig'") and "D16" in result
+    assert reg._policy.requests == [] and rules.calls == []
+
+
+def test_sub_agent_treffer_reach_the_caller():
+    connector = types.SimpleNamespace(save_progress=lambda *a, **k: None)
+    child = {"final_answer": "done", "steps_taken": 1, "evidence_ids": ["tb-c", "rt-x/3/1"],
+             "evidence_hits": {"tb-c": 4, "bad": -1, "flag": True}}
+    reg = ToolRegistry(connector, 7, ["run_sub_agent"], agent_id="parent", run_id="rt-x",
+                       spawn=lambda **kw: child)
+    reg.set_step(3, "rt-x/3")
+    reg.execute("run_sub_agent", {"agent_id": "child", "task": "look"})
+    assert reg.evidence_hits == {"tb-c": 4}
+    assert reg._evidence_hits(["tb-c", "rt-x/3/1"]) == ({"beleg_id": "tb-c", "treffer": 4},
+                                                         {"beleg_id": "rt-x/3/1", "treffer": None})
 
 
 # --- RT-W11: no path around the gate ------------------------------------------------------
