@@ -41,7 +41,7 @@ python3 tools/update_wheels.py [--dry-run]               # download pinned wheel
 - An install/upgrade on SOAR-Prod is done by the setup session `augmenteic-soc-setup` and needs Andreas' go there.
 
 ## Status (2026-11-16)
-- main = v2.2.1 (D22 belege + datenlage, bundled policy_manager 0.6.0); SOAR-Prod runs 2.1.0, upgrade awaits Andreas in the setup session.
+- main = v2.2.1 (D22 belege + datenlage, bundled policy_manager 0.6.0); SOAR-Prod runs 2.1.1 (installed 2026-11-16, [setup PR #79](https://github.com/abuis78/augmenteic_soc_setup/pull/79)); upgrade to 2.2.1 (rule `beleg_inhalt`: schritt_id-only belege need APPROVE_1CLICK) awaits Andreas in the setup session.
 - Next: stage 2 E2E of the four-eyes approval. Needs ≥ 2 test persons in SOC role `SOC-Freigabe` (Andreas);
   then the setup session sets `approval_playbook = dev/pm_freigabe`, PolicyManager runs the E2E, `pm_approve` is deactivated afterwards.
 - Before production: granular Asset Access Control for `pm_approve` (tested on non-prod first) and CRL (QS F11).
