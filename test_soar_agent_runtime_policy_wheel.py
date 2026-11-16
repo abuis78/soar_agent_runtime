@@ -1,7 +1,7 @@
 """Integration tests against the bundled policy_manager wheel (3.1b, 4.1b; RT-W01, W03, W06, W09).
 
 Run with the wheel on the path, e.g.
-  uv run --with pytest --with ./wheels/py3/policy_manager-0.5.2-py3-none-any.whl ... -m pytest
+  uv run --with pytest --with ./wheels/py3/policy_manager-0.6.0-py3-none-any.whl ... -m pytest
 Without the package the module is skipped; the stub-based tests cover the gate logic.
 """
 
@@ -24,6 +24,10 @@ from soar_agent_runtime_policy import (
     sequence_step,
 )
 from test_soar_agent_runtime_acceptance import (  # noqa: F401  (pytest fixtures: platform, llm)
+    BROKER_FIELDS,
+    INVOKE_OK,
+    VALID_VERDICT,
+    BrokerStub,
     RUN_ID,
     define_agent,
     effect_script,
@@ -61,13 +65,15 @@ POLICY = {
 }
 PM_ID = re.compile(r"^pm-[0-9a-f]{16}$")
 JUDGEMENT = {"empfehlung": "beacon confirmed", "gegenargumente": ["could be a scanner"],
-             "unsicherheiten": ["keine erkannt"], "konfidenz": 0.8}
+             "unsicherheiten": ["keine erkannt"], "konfidenz": 0.8, "datenlage": "vollstaendig"}
 
 
 def request(kind="update_severity", initiator="triage", **extra) -> PolicyRequest:
+    """A request that passes beleg_inhalt (0.6.0, D22): a broker beleg with hits and a complete datenlage."""
     fields = dict(kind=kind, params={"severity": "high"}, targets=("container:11",), initiator=initiator,
                   agent_id="triage", run_id="rt-wheel", step_id="rt-wheel/2", stage=2, domain="cyber",
-                  evidence_ids=("rt-wheel/1",), judgement=dict(JUDGEMENT))
+                  evidence_ids=("tb-wheel-1",), evidence_hits=({"beleg_id": "tb-wheel-1", "treffer": 3},),
+                  judgement=dict(JUDGEMENT))
     fields.update(extra)
     return PolicyRequest(**fields)
 
@@ -103,6 +109,19 @@ def test_mapped_tool_is_allowed_with_a_pm_decision_id(state):
     assert d.allowed and PM_ID.match(d.decision_id), d
     assert re.fullmatch(r"[0-9a-f]{12}", d.policy_version)      # sha256 prefix of the policy file
     assert "fall_aenderung" in d.reason_text() and "complete" in d.reason_text()
+
+
+@pytest.mark.parametrize("extra, why", [
+    ({"evidence_ids": ("rt-wheel/1",), "evidence_hits": ({"beleg_id": "rt-wheel/1", "treffer": None},)},
+     "no beleg with treffer>=1"),
+    ({"evidence_hits": ({"beleg_id": "tb-wheel-1", "treffer": 0},)}, "no beleg with treffer>=1"),
+    ({"judgement": {**JUDGEMENT, "datenlage": "teilweise"}}, "datenlage=teilweise"),
+    ({"evidence_hits": ()}, "no beleg with treffer>=1"),
+])
+def test_beleg_without_content_needs_one_click(state, extra, why):
+    """0.6.0 rule beleg_inhalt (D22): no hit or an incomplete datenlage -> at least APPROVE_1CLICK."""
+    d = gate_for(state).decide(request(**extra))
+    assert d.needs_approval and d.gate == GATE_APPROVE_1CLICK and why in d.reason_text(), d
 
 
 def test_unmapped_tool_falls_to_the_default_gate_deny(state):
@@ -212,12 +231,30 @@ def test_sequence_is_decided_as_one_request_with_the_catalogue_gate(state):
 
 # --- through the connector: asset fields -> real gate -> effecting tool ---------------
 
+def broker_effect_run(platform, llm):  # noqa: F811
+    """Script for an ALLOW under beleg_inhalt (0.6.0): read via the broker (1 row, datenlage vorhanden),
+    then update_severity citing that aufruf_id with datenlage vollstaendig. Returns (asset fields, stub)."""
+    define_agent(platform, provider="local",
+                 allowed_tools=["add_note", "update_severity", "get_container_info", "broker_invoke"])
+    stub = BrokerStub(invoke={**INVOKE_OK, "datenlage": "vorhanden"})
+    effect = {"severity": "high", "begruendung": "open CVE on the asset", "gegenargumente": "could be patched",
+              "unsicherheiten": "keine erkannt", "konfidenz": 0.8, "beleg_ids": [INVOKE_OK["aufruf_id"]],
+              "datenlage": "vollstaendig"}
+    llm["responses"] = [
+        'THOUGHT: look up\nACTION: broker_invoke\nPARAMS: {"vorlage_id": "cve_offen_auf_assets", '
+        '"parameter": {"cve": "CVE-2026-12345"}}',
+        f"THOUGHT: act\nACTION: update_severity\nPARAMS: {json.dumps(effect)}",
+        f"FINAL_ANSWER: {VALID_VERDICT}"]
+    return BROKER_FIELDS, stub
+
+
 def test_airgap_run_executes_update_severity_through_the_real_gate(platform, llm, monkeypatch, state):  # noqa: F811 (imported fixtures)
     define_agent(platform, provider="local")
     monkeypatch.setattr("soar_agent_runtime_connector.new_run_id", lambda: RUN_ID)
-    llm["responses"] = effect_script("update_severity")
+    broker, stub = broker_effect_run(platform, llm)
     c = make_connector(airgap_mode=True, policy_mode="embedded", policy_path=state["policy_path"],
-                       policy_state_dir=state["policy_state_dir"])
+                       policy_state_dir=state["policy_state_dir"], **broker)
+    c._broker_transport = stub
     status, result = run(c, stufe=2, domaene="cyber")
     assert status is True, result.message
     assert platform["severity"] == [(11, "high")]

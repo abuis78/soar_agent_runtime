@@ -30,14 +30,13 @@ from soar_agent_runtime_policy import (
 from test_soar_agent_runtime_acceptance import (  # noqa: F401  (pytest fixtures: platform, llm)
     RUN_ID,
     define_agent,
-    effect_script,
     llm,
     make_connector,
     platform,
     run,
     step_log,
 )
-from test_soar_agent_runtime_policy_wheel import POLICY, request
+from test_soar_agent_runtime_policy_wheel import POLICY, broker_effect_run, request
 
 pytest.importorskip("policy_service.server", reason="policy_manager wheel without policy_service")
 OPENSSL = shutil.which("openssl")
@@ -196,8 +195,9 @@ def _service_asset(service, pki, **extra):
 def test_airgap_run_executes_update_severity_through_the_real_service(platform, llm, monkeypatch, service, pki):  # noqa: F811
     define_agent(platform, provider="local")
     monkeypatch.setattr("soar_agent_runtime_connector.new_run_id", lambda: RUN_ID)
-    llm["responses"] = effect_script("update_severity")
-    c = make_connector(**_service_asset(service, pki))
+    broker, stub = broker_effect_run(platform, llm)
+    c = make_connector(**_service_asset(service, pki, **broker))
+    c._broker_transport = stub
     status, result = run(c, stufe=2, domaene="cyber")
     assert status is True, result.message
     assert platform["severity"] == [(11, "high")]
