@@ -130,7 +130,7 @@ Every run also calls the SOAR REST API of its own instance (Custom Lists, contai
 | `telemetry_index` | Splunk index for the events | `ai_soc_audit` |
 | `telemetry_verify_tls` | Verify the HEC certificate; disable only for a self-signed test instance | on |
 
-The bundled wheel `wheels/py3/policy_manager-0.5.2-py3-none-any.whl` is Policy Manager 0.5.2, the release asset of PolicyManager tag `v0.5.2` (commit `c9e5982`, SHA-256 `b710eda193d9f2b6c58bc33e6eb267bfae0e05e2445f070f7a86327f2ab92f8e`): `embedded`, `service` and the action catalogue work with it. Breaking changes against 0.5.1 are listed in the PolicyManager [MIGRATION.md](https://github.com/abuis78/PolicyManager/blob/v0.5.2/docs/MIGRATION.md). Refresh it with `scripts/build_wheel.sh --copy-to wheels/py3` from the PolicyManager repo, then `python3 tools/update_wheels.py`.
+The bundled wheel `wheels/py3/policy_manager-0.6.0-py3-none-any.whl` is Policy Manager 0.6.0, the release asset of PolicyManager tag `v0.6.0` (commit `9d245e1`, SHA-256 `7b5b8740ebed2ad057a4917981bd25391e608d0fe306f48139f5d760c994d15e`): `embedded`, `service` and the action catalogue work with it, and it evaluates `kontext.belege` / `urteil.datenlage` (D22). Breaking changes are listed in the PolicyManager [MIGRATION.md](https://github.com/abuis78/PolicyManager/blob/v0.6.0/docs/MIGRATION.md). Refresh it with `scripts/build_wheel.sh --copy-to wheels/py3` from the PolicyManager repo, then `python3 tools/update_wheels.py`.
 
 
 ### Operator checklist: Policy Manager
@@ -603,7 +603,7 @@ The `run agent` action includes a custom Investigation panel widget showing agen
 
 ```bash
 uv run --python 3.13 --with pytest --with requests \
-  --with wheels/py3/policy_manager-0.5.2-py3-none-any.whl \
+  --with wheels/py3/policy_manager-0.6.0-py3-none-any.whl \
   --with wheels/py3/ai_soc_telemetry-0.1.0-py3-none-any.whl \
   --no-project python -m pytest -q
 uvx ruff@0.15.21 check .
@@ -706,3 +706,4 @@ phenv python3 soar_agent_runtime_connector.py /tmp/test_run_agent.json
 | 2.1.0 | 2026-10-31 | Approval prompt (PM-F42, Policy Manager Admin decision B): new asset field `approval_playbook`; after `APPROVE_1CLICK` / `APPROVE_2PERSON` the runtime starts that input playbook on the run's container (`POST /rest/playbook_run` with `inputs` as a JSON object, verified on SOAR-Prod: a JSON string gets HTTP 400) so the approval group is asked. Not a policy request and not a model tool. If the start fails the action stays held, observation and note say `approval prompt not started` with `freigabe_hash`, audit phase `fehler`. Artifact, follow-up playbook and `consume` unchanged; empty field = 2.0.1 behaviour |
 | 2.1.1 | 2026-11-15 | Dependency: bundled wheel `pyasn1` 0.6.4 → 0.6.5 (GHSA-mm57-4v3p-rchx, binary REAL mantissas decoded in linear time). No behaviour change |
 | 2.2.0 | 2026-11-16 | D22 part 1 ([PolicyManager#16](https://github.com/abuis78/PolicyManager/issues/16)): effecting calls send `kontext.belege = [{beleg_id, treffer}]` (`treffer` = broker `zeilen` observed by the runtime, incl. sub-agents; `null` for `schritt_id`s) and `urteil.datenlage` (new optional tool field; left out = `unbekannt`; invalid value or `vollstaendig` after a data gap refused locally, D16). A Policy Manager without the new rule ignores both fields |
+| 2.2.1 | 2026-11-16 | Bundled `policy_manager` 0.5.2 → 0.6.0 (PolicyManager tag [`v0.6.0`](https://github.com/abuis78/PolicyManager/releases/tag/v0.6.0), commit `9d245e1`, SHA-256 checked against the release). 0.6.0 adds rule `beleg_inhalt` (D22): agent requests need at least `APPROVE_1CLICK` unless one `beleg` has `treffer >= 1` and `datenlage` is `vollstaendig`; 0.5.3 changed the API restart after a halt to three admin certificates (F7), which the runtime does not use. Policy file unchanged. No runtime code change |
