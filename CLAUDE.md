@@ -40,10 +40,15 @@ python3 tools/update_wheels.py [--dry-run]               # download pinned wheel
 - AWS/SSM access to SOAR-Prod always with `--profile janus-env2`.
 - An install/upgrade on SOAR-Prod is done by the setup session `augmenteic-soc-setup` and needs Andreas' go there.
 
-## Status (2026-11-16)
-- main = v2.2.1 (D22 belege + datenlage, bundled policy_manager 0.6.0); SOAR-Prod runs 2.2.1 (installed by Andreas 2026-11-16, app ID 371; rule `beleg_inhalt`: schritt_id-only belege need APPROVE_1CLICK); the setup session runs the two acceptance cases (broker beleg + vollstaendig → ALLOW, schritt_id only → APPROVE_1CLICK).
-- Next: stage 2 E2E of the four-eyes approval. Test persons `max` and `moritz` are in SOC role `SOC-Freigabe` (verified 2026-11-16);
-  once both acceptance cases pass, the setup session sets `approval_playbook = dev/pm_freigabe` (Andreas' go 2026-11-16), PolicyManager runs the E2E, `pm_approve` is deactivated afterwards.
+## Status (2026-11-17)
+- main = v2.2.2 (2.2.1 + prompt hint: cite the broker `aufruf_id` as beleg, PR #61); not installed on prod.
+- SOAR-Prod: runtime 2.2.1 (app ID 371, asset 51 `ollama`, `policy_mode = service`), PM service 0.6.0 (rule `beleg_inhalt`
+  is always active, no policy.toml entry), `approval_playbook = dev/pm_freigabe`. D22 acceptance passed on container 238
+  ([setup PR #82](https://github.com/abuis78/augmenteic_soc_setup/pull/82)): schritt_id only → APPROVE_1CLICK (run 1009),
+  broker aufruf_id → ALLOW (run 1011). Lesson: in service mode the PM service version decides, not the bundled wheel.
+- Next: stage 2 four-eyes E2E, run by the setup session, Andreas votes as `max` and `moritz` (role `SOC-Freigabe`).
+  Needs APPROVE_2PERSON (e.g. `tipping_off = laut`); approvals expire after 10 min; negative test: same person twice →
+  DUPLICATE (SELF_APPROVAL never applies to agent runs). Afterwards deactivate `pm_approve`, then decide on 2.2.2 for prod.
 - Before production: granular Asset Access Control for `pm_approve` (tested on non-prod first) and CRL (QS F11).
 - Dependencies: PolicyManager (wheel, `pm_freigabe`), augmented-soc (concept doc), soar-agent-definitions, setup repo.
 
